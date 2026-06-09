@@ -3,9 +3,9 @@
 跑仿真 → 自动保存真实渲染图 + YOLO bbox 标签 → 给 AutoDL 训练用
 
 用法:
-    conda activate isaaclab
+    conda activate isaaclab   (或 taskb_data)
     cd ATEC2026_Simulation_Challenge
-    python collect_real_data.py --num_images 500 --output datasets/real
+    python taskb_perception/collect_real_data.py --num_images 500 --output datasets/real
 
 输出:
     datasets/real/images/train/   — RGB 图 (PNG)
@@ -49,20 +49,13 @@ from isaaclab_tasks.utils import parse_env_cfg
 import atec_rl_lab.tasks
 from atec_rl_lab.tasks.task_base.action_base import apply_safe_action_spec
 
-# 导入感知层的坐标变换（直接 import，避免与 Isaac Sim 自带的 cv2/config.py 冲突）
-import importlib.util
-_perc_dir = os.path.join(os.path.dirname(__file__), 'taskb_perception')
-_spec = importlib.util.spec_from_file_location("taskb_config", os.path.join(_perc_dir, "config.py"))
-_taskb_config = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_taskb_config)
-
-HEAD_CAM_MATRIX = _taskb_config.HEAD_CAM_MATRIX
-IMG_W = _taskb_config.IMG_W
-IMG_H = _taskb_config.IMG_H
-HEAD_CAM_POS_ROBOT = _taskb_config.HEAD_CAM_POS_ROBOT
-HEAD_CAM_ROT_MATRIX_INV = _taskb_config.HEAD_CAM_ROT_MATRIX_INV
-OBJECT_SIZES = _taskb_config.OBJECT_SIZES
-CLASS_NAMES = _taskb_config.CLASS_NAMES
+# 导入感知层参数 (同目录, 直接用)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from config import (
+    HEAD_CAM_MATRIX, IMG_W, IMG_H,
+    HEAD_CAM_POS_ROBOT, HEAD_CAM_ROT_MATRIX_INV,
+    OBJECT_SIZES, CLASS_NAMES,
+)
 
 # ═══════════════════════════════════════════════════════
 # 类别映射: Object1-6=sugar_box, 7-12=mustard_bottle, 13-18=banana
@@ -137,7 +130,7 @@ def main():
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array")
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
-    
+
     dt = env.unwrapped.step_dt if hasattr(env.unwrapped, "step_dt") else 0.02
 
     # ---- 主循环 ----
@@ -161,7 +154,7 @@ def main():
             if collected >= num_images:
                 break
 
-            # 使用师姐的移动控制逻辑（如果有的话），否则回退到随机动作
+            # 师姐的移动控制器（有则用，没有则回退随机动作）
             try:
                 from motion_controller import get_action as controller_get_action
                 action = controller_get_action(obs, env)
@@ -276,7 +269,7 @@ names:
     print("=" * 70)
     print("\n下一步:")
     print(f"  1. 下载 {output_dir}/ 到本地或传到 AutoDL")
-    print(f"  2. 在 taskb_perception 运行: python train_yolo.py --data ../{output_dir.replace('datasets/', '')}.yaml")
+    print(f"  2. 在 taskb_perception 运行: python train_yolo.py --data ../{os.path.basename(output_dir)}/{os.path.basename(output_dir)}.yaml")
     print(f"  3. 部署: cp runs/train/*/weights/best.pt taskb_perception/taskb_ycb.pt")
 
 
