@@ -98,11 +98,25 @@ _spec_proj = importlib.util.spec_from_file_location(
     "projection_utils", os.path.join(_perc_dir, "projection_utils.py"))
 _proj = importlib.util.module_from_spec(_spec_proj)
 _spec_proj.loader.exec_module(_proj)
-compute_bbox_3d = _proj.compute_bbox_3d
+compute_bbox_3d_cam_pose = _proj.compute_bbox_3d_cam_pose
 bbox_to_yolo_line = _proj.bbox_to_yolo_line
 obj_index_to_class_id = _proj.obj_index_to_class_id
 yaw_from_quat_wxyz = _proj.yaw_from_quat_wxyz
 class_id_to_size = _proj.class_id_to_size
+
+
+def get_head_camera_pose(env):
+    """从仿真 head_camera 读取世界位姿 (w,x,y,z)"""
+    cam = env.unwrapped.scene["head_camera"]
+    cam_pos_w = cam.data.pos_w[0].cpu().numpy()
+    quat = None
+    for attr in ("quat_w_world", "quat_w_ros", "quat_w"):
+        if hasattr(cam.data, attr):
+            quat = getattr(cam.data, attr)[0].cpu().numpy()
+            break
+    if quat is None:
+        raise AttributeError("head_camera quat not found on sensor data")
+    return cam_pos_w, quat
 
 
 def obj_to_class(obj_index: int) -> int:
@@ -305,22 +319,38 @@ class ManualKeyboardController:
 
 
 def project_labels(env, robot_pos, robot_yaw):
+    """用仿真 head_camera 真实位姿 + 物体姿态投影 YOLO 框"""
     labels = []
     visible = 0
     found = 0
+    try:
+        cam_pos_w, cam_quat_w = get_head_camera_pose(env)
+        use_cam_pose = True
+    except (AttributeError, KeyError, TypeError):
+        use_cam_pose = False
+        cam_pos_w, cam_quat_w = None, None
+
     for obj_idx in range(1, 19):
         try:
-            obj_pos = env.unwrapped.scene[f"object_{obj_idx}"].data.root_pos_w[0].cpu().numpy()
+            obj = env.unwrapped.scene[f"object_{obj_idx}"]
+            obj_pos = obj.data.root_pos_w[0].cpu().numpy()
+            obj_quat = obj.data.root_quat_w[0].cpu().numpy()
             found += 1
         except (AttributeError, KeyError):
             continue
 
         cid = obj_to_class(obj_idx)
         size_3d = class_id_to_size(cid)
-        bbox = compute_bbox_3d(
-            obj_pos, size_3d, robot_pos, robot_yaw,
-            HEAD_CAM_MATRIX, HEAD_CAM_POS_ROBOT, HEAD_CAM_ROT_MATRIX_INV,
-        )
+        if use_cam_pose:
+            bbox = compute_bbox_3d_cam_pose(
+                obj_pos, obj_quat, size_3d, cam_pos_w, cam_quat_w, HEAD_CAM_MATRIX,
+            )
+        else:
+            bbox = _proj.compute_bbox_3d(
+                obj_pos, size_3d, robot_pos, robot_yaw,
+                HEAD_CAM_MATRIX, HEAD_CAM_POS_ROBOT, HEAD_CAM_ROT_MATRIX_INV,
+                obj_quat_wxyz=obj_quat,
+            )
         if bbox is None:
             continue
         visible += 1

@@ -55,7 +55,7 @@ HEAD_CAM_POS_ROBOT = np.array([0.422, 0.025, 0.062], dtype=np.float32)
 
 # 相机俯仰角 (度): 负值=朝下
 # Isaac Lab b2.py 中 UsdCameraCfg 的 pitch=30° 朝下
-HEAD_CAM_PITCH_DEG = -30.0  # 负值=光轴朝下 (OpenCV R_x(-30): cam_Y↓转向cam_Z前→光轴下倾)
+HEAD_CAM_PITCH_DEG = -30.0  # 离线回退路径；采集时请用仿真 head_camera 真实位姿
 HEAD_CAM_PITCH_RAD = np.deg2rad(HEAD_CAM_PITCH_DEG)
 
 EE_CAM_POS_ROBOT = np.array([-0.05, 0.0, 0.06], dtype=np.float32)

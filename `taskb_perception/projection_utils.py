@@ -40,6 +40,26 @@ from config import (
 MIN_CAM_Z = 0.05
 
 
+def quat_wxyz_to_rot(quat_wxyz: Sequence[float]) -> np.ndarray:
+    """四元数 (w,x,y,z) → 3×3 旋转矩阵 (将相机/物体局部坐标旋到世界系)"""
+    w, x, y, z = [float(v) for v in quat_wxyz]
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ], dtype=np.float32)
+
+
+def axis_aligned_box_corners(size_3d: Sequence[float]) -> np.ndarray:
+    """物体局部坐标系下的 8 个角点 → (3, 8)"""
+    lx, ly, lz = size_3d
+    hx, hy, hz = lx / 2, ly / 2, lz / 2
+    return np.array([
+        [-hx, -hy, -hz], [hx, -hy, -hz], [hx, hy, -hz], [-hx, hy, -hz],
+        [-hx, -hy, hz], [hx, -hy, hz], [hx, hy, hz], [-hx, hy, hz],
+    ], dtype=np.float32).T
+
+
 def yaw_from_quat_wxyz(quat_wxyz: Sequence[float]) -> float:
     """root 四元数 (w,x,y,z) → 绕世界 Z 的 yaw (rad)"""
     w, x, y, z = [float(v) for v in quat_wxyz]
@@ -76,6 +96,32 @@ def camera_to_pixel(cam_x: float, cam_y: float, cam_z: float, cam_matrix: np.nda
     return float(u), float(v)
 
 
+def world_to_camera_pixel_cam_pose(
+    point_world: np.ndarray,
+    cam_pos_w: np.ndarray,
+    cam_quat_w: Sequence[float],
+    cam_matrix: np.ndarray = HEAD_CAM_MATRIX,
+    img_w: int = IMG_W,
+    img_h: int = IMG_H,
+) -> Optional[Tuple[int, int]]:
+    """
+    世界坐标 → 像素，使用仿真 head_camera 的真实位姿 (推荐)。
+    cam_quat_w: Isaac Lab Camera.data.quat_w_world，(w,x,y,z)，ROS 光学系。
+    """
+    p_world = np.asarray(point_world, dtype=np.float32).reshape(3)
+    cam_pos = np.asarray(cam_pos_w, dtype=np.float32).reshape(3)
+    r_c2w = quat_wxyz_to_rot(cam_quat_w)
+    p_cam = r_c2w.T @ (p_world - cam_pos)
+    if p_cam[2] <= MIN_CAM_Z:
+        return None
+
+    u, v = camera_to_pixel(float(p_cam[0]), float(p_cam[1]), float(p_cam[2]), cam_matrix)
+    ui, vi = int(round(u)), int(round(v))
+    if 0 <= ui < img_w and 0 <= vi < img_h:
+        return ui, vi
+    return None
+
+
 def world_to_camera_pixel(
     point_world: np.ndarray,
     robot_pos: np.ndarray,
@@ -102,6 +148,51 @@ def world_to_camera_pixel(
     return None
 
 
+def _bbox_from_projected_pixels(
+    pixels: List[Tuple[int, int]],
+    img_w: int,
+    img_h: int,
+) -> Optional[Tuple[int, int, int, int]]:
+    if len(pixels) < 2:
+        return None
+    arr = np.array(pixels)
+    x1 = max(0, int(arr[:, 0].min()))
+    y1 = max(0, int(arr[:, 1].min()))
+    x2 = min(img_w - 1, int(arr[:, 0].max()))
+    y2 = min(img_h - 1, int(arr[:, 1].max()))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return x1, y1, x2, y2
+
+
+def compute_bbox_3d_cam_pose(
+    point_world: np.ndarray,
+    obj_quat_wxyz: Sequence[float],
+    size_3d: Sequence[float],
+    cam_pos_w: np.ndarray,
+    cam_quat_w: Sequence[float],
+    cam_matrix: np.ndarray = HEAD_CAM_MATRIX,
+    img_w: int = IMG_W,
+    img_h: int = IMG_H,
+) -> Optional[Tuple[int, int, int, int]]:
+    """
+    物体中心 + 姿态 + 尺寸 → 2D bbox。
+    使用仿真 head_camera 世界位姿投影 (采集脚本推荐路径)。
+    """
+    center = np.asarray(point_world, dtype=np.float32).reshape(3, 1)
+    corners_local = axis_aligned_box_corners(size_3d)
+    corners_world = quat_wxyz_to_rot(obj_quat_wxyz) @ corners_local + center
+
+    pixels: List[Tuple[int, int]] = []
+    for i in range(8):
+        pix = world_to_camera_pixel_cam_pose(
+            corners_world[:, i], cam_pos_w, cam_quat_w, cam_matrix, img_w, img_h,
+        )
+        if pix is not None:
+            pixels.append(pix)
+    return _bbox_from_projected_pixels(pixels, img_w, img_h)
+
+
 def compute_bbox_3d(
     point_world: np.ndarray,
     size_3d: Sequence[float],
@@ -112,22 +203,18 @@ def compute_bbox_3d(
     robot2cam: np.ndarray = HEAD_CAM_ROT_MATRIX_INV,
     img_w: int = IMG_W,
     img_h: int = IMG_H,
+    obj_quat_wxyz: Optional[Sequence[float]] = None,
 ) -> Optional[Tuple[int, int, int, int]]:
     """
-    物体中心 + 轴对齐尺寸 (lx, ly, lz) → 2D 像素 bbox (x1,y1,x2,y2)。
-
-    将 3D 盒 8 角点投影到图像，取可见角点的外接矩形。
-    注意: 未建模物体绕 Z 的旋转，与仿真初始姿态有偏差时框可能略偏。
+    物体中心 + 尺寸 → 2D bbox (机器人基座近似外参，离线回退用)。
+    优先在采集时使用 compute_bbox_3d_cam_pose。
     """
-    lx, ly, lz = size_3d
-    hx, hy, hz = lx / 2, ly / 2, lz / 2
-
-    corners_local = np.array([
-        [-hx, -hx,  hx,  hx, -hx, -hx,  hx,  hx],
-        [-hy,  hy,  hy, -hy, -hy,  hy,  hy, -hy],
-        [-hz, -hz, -hz, -hz,  hz,  hz,  hz,  hz],
-    ], dtype=np.float32)
-    corners_world = corners_local + np.asarray(point_world, dtype=np.float32).reshape(3, 1)
+    center = np.asarray(point_world, dtype=np.float32).reshape(3, 1)
+    corners_local = axis_aligned_box_corners(size_3d)
+    if obj_quat_wxyz is not None:
+        corners_world = quat_wxyz_to_rot(obj_quat_wxyz) @ corners_local + center
+    else:
+        corners_world = corners_local + center
 
     pixels: List[Tuple[int, int]] = []
     for i in range(8):
@@ -137,18 +224,7 @@ def compute_bbox_3d(
         )
         if pix is not None:
             pixels.append(pix)
-
-    if len(pixels) < 2:
-        return None
-
-    arr = np.array(pixels)
-    x1 = max(0, int(arr[:, 0].min()))
-    y1 = max(0, int(arr[:, 1].min()))
-    x2 = min(img_w - 1, int(arr[:, 0].max()))
-    y2 = min(img_h - 1, int(arr[:, 1].max()))
-    if x2 <= x1 or y2 <= y1:
-        return None
-    return x1, y1, x2, y2
+    return _bbox_from_projected_pixels(pixels, img_w, img_h)
 
 
 def bbox_to_yolo(
@@ -194,12 +270,17 @@ def project_object_labels(
     object_positions: Iterable[Tuple[int, np.ndarray]],
     robot_pos: np.ndarray,
     robot_yaw: float,
+    cam_pos_w: Optional[np.ndarray] = None,
+    cam_quat_w: Optional[Sequence[float]] = None,
+    object_quats: Optional[dict] = None,
 ) -> Tuple[List[str], int]:
     """
     批量投影多个物体 → YOLO 标签行列表。
 
     Args:
         object_positions: [(obj_index, world_pos(3,)), ...]
+        cam_pos_w / cam_quat_w: 仿真 head_camera 位姿 (优先)
+        object_quats: {obj_index: quat_wxyz} 物体姿态
     Returns:
         (label_lines, visible_count)
     """
@@ -208,7 +289,15 @@ def project_object_labels(
     for obj_idx, obj_pos in object_positions:
         cid = obj_index_to_class_id(obj_idx)
         size = class_id_to_size(cid)
-        bbox = compute_bbox_3d(obj_pos, size, robot_pos, robot_yaw)
+        obj_q = None if object_quats is None else object_quats.get(obj_idx)
+        if cam_pos_w is not None and cam_quat_w is not None and obj_q is not None:
+            bbox = compute_bbox_3d_cam_pose(
+                obj_pos, obj_q, size, cam_pos_w, cam_quat_w,
+            )
+        else:
+            bbox = compute_bbox_3d(
+                obj_pos, size, robot_pos, robot_yaw, obj_quat_wxyz=obj_q,
+            )
         if bbox is None:
             continue
         visible += 1
