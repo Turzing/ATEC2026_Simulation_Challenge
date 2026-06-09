@@ -10,6 +10,7 @@
     ../datasets/rgbd_verify/verify.png  (RGB | 深度 | 饱和度 | relief)
 """
 
+import argparse
 import os
 import sys
 
@@ -18,9 +19,9 @@ import numpy as np
 import torch
 from isaaclab.app import AppLauncher
 
-parser = AppLauncher.add_app_launcher_args(
-    __import__("argparse").ArgumentParser(description="Verify head RGB-D from official obs")
-)
+parser = argparse.ArgumentParser(description="Verify head RGB-D from official obs")
+parser.add_argument("--task", type=str, default="ATEC-TaskB-B2Piper")
+AppLauncher.add_app_launcher_args(parser)
 args_cli, _ = parser.parse_known_args()
 if not getattr(args_cli, "enable_cameras", False):
     args_cli.enable_cameras = True
@@ -42,9 +43,9 @@ OUT = os.path.join(os.path.dirname(__file__), "..", "datasets", "rgbd_verify")
 
 def main():
     os.makedirs(OUT, exist_ok=True)
-    env_cfg = parse_env_cfg("ATEC-TaskB-B2Piper", device=args_cli.device, num_envs=1)
+    env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=1)
     env_cfg = apply_safe_action_spec(env_cfg, "{}")
-    env = gym.make("ATEC-TaskB-B2Piper", cfg=env_cfg, render_mode="rgb_array")
+    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array")
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
 
