@@ -50,6 +50,11 @@ SAT_ABOVE_GROUND = 22
 VAL_MIN = 55
 VAL_ABOVE_GROUND = 15
 
+# 极近 (<1.15m) 占满视野、sat 偏低
+VERY_NEAR_DEPTH_M = 1.15
+SAT_RELAX_VERY_NEAR = 18
+VAL_RELAX_VERY_NEAR = 24
+
 # 远距离 (2m+) 物体更小、饱和度略低 → 单独放宽
 FAR_DEPTH_M = 2.0
 SAT_RELAX_FAR = 16          # 远距 sat 阈值降低
@@ -215,12 +220,16 @@ class RgbdDetectPipeline:
         sat_far = max(40, self._sat_thresh - SAT_RELAX_FAR)
         val_far = max(48, val_thresh - VAL_RELAX_FAR)
 
-        near = depth < FAR_DEPTH_M
+        very_near = depth < VERY_NEAR_DEPTH_M
+        near = (depth >= VERY_NEAR_DEPTH_M) & (depth < FAR_DEPTH_M)
         far = depth >= FAR_DEPTH_M
+        sat_vnear = max(32, self._sat_thresh - SAT_RELAX_VERY_NEAR)
+        val_vnear = max(42, val_thresh - VAL_RELAX_VERY_NEAR)
 
+        sat_vnear_m = (sat >= sat_vnear) & (val >= val_vnear) & very_near
         sat_near = (sat >= self._sat_thresh) & (val >= val_thresh) & near
         sat_far_m = (sat >= sat_far) & (val >= val_far) & far
-        sat_mask = (sat_near | sat_far_m) & roi & valid
+        sat_mask = (sat_vnear_m | sat_near | sat_far_m) & roi & valid
 
         detect = sat_mask.astype(np.uint8)
         if FAR_MASK_DILATE > 0:
@@ -238,8 +247,8 @@ class RgbdDetectPipeline:
         )
         detect = cv2.bitwise_or(detect, yellow.astype(np.uint8))
 
-        # 近距不做 open; 远距 open 去噪
-        near_u8 = cv2.bitwise_and(detect, near.astype(np.uint8))
+        # 近/极近不做 open; 远距 open 去噪
+        near_u8 = cv2.bitwise_and(detect, (very_near | near).astype(np.uint8))
         far_u8 = cv2.bitwise_and(detect, far.astype(np.uint8))
         near_u8 = cv2.morphologyEx(near_u8, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
         far_u8 = cv2.morphologyEx(far_u8, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
@@ -503,26 +512,43 @@ class RgbdDetectPipeline:
     def _classify_blob_2d_shape(
         self, bbox: List[int], sat: np.ndarray, ys: np.ndarray, xs: np.ndarray,
     ) -> Tuple[str, float]:
-        """俯视时 3D 太薄 → 用 2D 框形状 + 填充度"""
+        """俯视 3D 太薄时用 2D: 竖长=立瓶, 横长=躺蕉, 近方=糖盒"""
         x1, y1, x2, y2 = bbox
         bw, bh = max(1, x2 - x1 + 1), max(1, y2 - y1 + 1)
         aspect = max(bw, bh) / min(bw, bh)
         fill = float(len(ys)) / max(bw * bh, 1)
+        mean_sat = float(np.mean(sat[ys, xs])) if len(ys) else 0.0
+        vert = bh >= bw * 1.20
+        horiz = bw >= bh * 1.20
 
-        if aspect >= 1.75:
-            conf = float(min(0.84, 0.52 + 0.14 * (aspect - 1.75)))
+        # 立瓶在图里是竖长条 (截图里常被误认成 banana)
+        if vert and aspect >= 1.32:
+            conf = float(min(0.82, 0.56 + 0.11 * (aspect - 1.32)))
+            if fill > 0.32:
+                conf = min(0.86, conf + 0.06)
+            return "mustard_bottle", conf
+
+        # 躺蕉在图里是横长条
+        if horiz and aspect >= 1.28:
+            conf = float(min(0.84, 0.54 + 0.13 * (aspect - 1.28)))
             return "banana", conf
 
-        if aspect < 1.18:
-            return "mustard_bottle", 0.58
+        if aspect >= 1.72:
+            return ("mustard_bottle", 0.64) if vert else ("banana", 0.66)
 
-        if aspect < 1.55:
-            return "sugar_box", 0.62 if fill < 0.42 else 0.56
+        if aspect < 1.16:
+            if mean_sat > self._sat_thresh + 14 and fill > 0.40:
+                return "mustard_bottle", 0.56
+            return "sugar_box", 0.60
 
-        mean_sat = float(np.mean(sat[ys, xs])) if len(ys) else 0.0
-        if mean_sat > self._sat_thresh + 8:
-            return "mustard_bottle", 0.55
-        return "sugar_box", 0.54
+        if aspect < 1.38:
+            return "sugar_box", 0.62 if fill < 0.50 else 0.56
+
+        if horiz:
+            return "banana", 0.58
+        if vert and mean_sat > self._sat_thresh + 6:
+            return "mustard_bottle", 0.57
+        return "sugar_box", 0.55
 
     def _classify_blob_2d_fallback(self, bbox: List[int], depth: np.ndarray, ys, xs) -> Tuple[str, float]:
         x1, y1, x2, y2 = bbox
