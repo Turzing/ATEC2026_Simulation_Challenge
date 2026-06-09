@@ -22,7 +22,8 @@ parser.add_argument("--out", type=str, default="../datasets/rgbd_detect_debug")
 parser.add_argument("--live", action="store_true", default=True)
 parser.add_argument("--no-live", action="store_false", dest="live")
 parser.add_argument("--preview_every", type=int, default=3)
-parser.add_argument("--fast", action="store_true", help="MIN_TRACK_HITS=1 for quicker boxes")
+parser.add_argument("--fast", action="store_true", help="MIN_TRACK_HITS=1 (default pipeline already uses 1)")
+parser.add_argument("--sat-min", type=int, default=None, help="Override SAT_MIN_ABSOLUTE (e.g. 40)")
 parser.add_argument("--policy", type=str, default="", help="RL policy.pt (default: ../demo/policy.pt)")
 AppLauncher.add_app_launcher_args(parser)
 args_cli, _ = parser.parse_known_args()
@@ -50,8 +51,8 @@ import rgbd_detect_pipeline as rdp
 from rgbd_detect_pipeline import RgbdDetectPipeline
 from rgbd_utils import depth_to_vis, format_stats_line
 
-if args_cli.fast:
-    rdp.MIN_TRACK_HITS = 1
+if args_cli.sat_min is not None:
+    rdp.SAT_MIN_ABSOLUTE = args_cli.sat_min
 
 
 def resolve_policy():
@@ -187,9 +188,11 @@ def draw_vis(rgb, out, pipeline, depth):
 
     pw, ph = w // 4, h // 4
     mini = np.zeros((ph, pw * 4, 3), dtype=np.uint8)
-    dvis = cv2.resize(depth_to_vis(depth), (pw, ph))
-    draw_panel(mini, dvis, 0, 0, "depth")
-    for i, key in enumerate(["valid_depth", "color", "relief", "rgbd"]):
+    draw_panel(mini, cv2.resize(depth_to_vis(depth), (pw, ph)), 0, 0, "depth")
+    sat = pipeline.get_debug("saturation")
+    if sat is not None:
+        draw_panel(mini, cv2.applyColorMap(cv2.resize(sat, (pw, ph)), cv2.COLORMAP_JET), pw, 0, "S")
+    for i, key in enumerate(["sat_mask", "rgbd"], start=2):
         m = pipeline.get_debug(key)
         if m is not None:
             c = cv2.cvtColor(cv2.resize(m, (pw, ph)), cv2.COLOR_GRAY2BGR)
@@ -208,8 +211,9 @@ def draw_vis(rgb, out, pipeline, depth):
 
     st = out.get("depth_stats", {})
     cv2.putText(vis, f"objects={n}  {format_stats_line(st)}", (8, 22), 0, 0.5, (0, 255, 255), 1)
-    cv2.putText(vis, f"max_relief={out.get('max_relief', 0):.3f}", (8, 44), 0, 0.45, (0, 255, 255), 1)
-    cv2.putText(vis, "RGB+D fusion | WASD P Q", (8, 66), 0, 0.4, (200, 200, 200), 1)
+    cv2.putText(vis, f"sat_thresh={out.get('sat_thresh', 0):.0f} ground_S={out.get('sat_ground_ref', 0):.0f}",
+                (8, 44), 0, 0.42, (0, 255, 255), 1)
+    cv2.putText(vis, "SATURATION detect | WASD P Q", (8, 66), 0, 0.4, (200, 200, 200), 1)
     return vis
 
 
@@ -227,9 +231,9 @@ def main():
     pipeline = RgbdDetectPipeline()
     kb = ManualKeyboard(device, resolve_policy())
 
-    print("\n=== RGB-D fusion detect (official head_rgb + head_depth) ===", flush=True)
-    print("  Step 1: python verify_rgbd.py  if depth valid_ratio=0", flush=True)
-    print("  Step 2: walk to objects 1-3m, watch bottom row 'rgbd' panel\n", flush=True)
+    print("\n=== Saturation detect (S channel + depth distance) ===", flush=True)
+    print("  Bottom: depth | S heatmap | sat_mask | detect", flush=True)
+    print("  Walk to objects 1-3m — sat_mask should match verify.png Saturation\n", flush=True)
 
     obs, _ = env.reset()
     for _ in range(20):

@@ -1,32 +1,27 @@
 """
-Task B 识别 — 官方 RGB-D 融合 (head_rgb + head_depth)
+Task B 识别 — 饱和度 (Saturation) 为主 + depth 测距
 
-官网给的观测:
-    obs['image']['head_rgb']    uint8  RGB
-    obs['image']['head_depth']  float32 米
+Task B 特点: 灰地面(低饱和) vs 黄物体(高饱和) → verify.png 里 Saturation 一眼能分清
 
-检测逻辑 (不用 YOLO):
-    1. depth → 局部地面 + relief (比地面近的凸起)
-    2. rgb   → 比灰地面更饱和 (Task B 物体有颜色、地面灰)
-    3. 两者 AND → 连通域 → bbox
-    4. bbox 内 depth 中值 → 距离
+流程:
+    head_rgb  → HSV 的 S 通道 → 比地面饱和度高 → 连通域 → bbox
+    head_depth → bbox 内中值 → 距离 d (米)
 
-仿真测试:
-    python test_rgbd_detect.py
+depth 不参与「有没有物体」, 只参与距离.
 """
 
 from __future__ import annotations
 
 import os
 import sys
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import cv2
 import numpy as np
 from scipy import ndimage
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import HEAD_CAM, ROBOT_INIT_POS, ROBOT_INIT_YAW, TOTAL_OBJECTS
+from config import ROBOT_INIT_POS, ROBOT_INIT_YAW, TOTAL_OBJECTS
 from rgbd_utils import (
     bbox_center_depth,
     depth_stats,
@@ -36,29 +31,28 @@ from rgbd_utils import (
 )
 
 # =============================================================================
-# 可调参数
+# 可调参数 — 不对就改这里
 # =============================================================================
-DEPTH_MIN = 0.35
+DEPTH_MIN = 0.40
 DEPTH_MAX = 12.0
-GROUND_OPEN_K = 25
-RELIEF_MIN = 0.022          # 比周围地面近 2.2cm+
 
-ROI_V_MIN, ROI_V_MAX = 0.18, 0.86
-ROI_U_MARGIN = 0.05
+ROI_V_MIN, ROI_V_MAX = 0.12, 0.90
+ROI_U_MARGIN = 0.04
 
-# RGB: 地面灰、物体有颜色 — 饱和度高于地面参考
-SAT_MIN_ABSOLUTE = 22
-SAT_ABOVE_GROUND = 12       # 比 ROI 地面 sat 分位数高多少
+# 饱和度: 比「地面参考」高多少才算物体 (灰地 S~20~40, 黄物体 S~80~180)
+SAT_MIN_ABSOLUTE = 50          # 绝对下限
+SAT_ABOVE_GROUND = 25          # 比地面参考高多少
+VAL_MIN = 45                   # 太暗的像素不要 (阴影)
 
-MIN_BLOB_AREA = 120
-MAX_BLOB_AREA = 35000
-MIN_BLOB_SIDE = 6
-MAX_BLOB_SIDE = 300
+MIN_BLOB_AREA = 60
+MAX_BLOB_AREA = 45000
+MIN_BLOB_SIDE = 5
+MAX_BLOB_SIDE = 340
 MAX_DETECTIONS = 12
 
 TRACK_MATCH_PX = 90
 TRACK_MAX_AGE = 15
-MIN_TRACK_HITS = 2          # 识别阶段可改为 1
+MIN_TRACK_HITS = 1
 
 
 class Tracker2D:
@@ -102,14 +96,16 @@ class Tracker2D:
 
 
 class RgbdDetectPipeline:
-    """官方 RGB + D 融合 2D 检测"""
+    """饱和度检测 + depth 距离"""
 
     def __init__(self):
         self.tracker = Tracker2D()
         self.frame_count = 0
         self._debug: Dict[str, np.ndarray] = {}
         self._depth_stats: Dict[str, float] = {}
-        print("[RgbdDetectPipeline] head_rgb + head_depth fusion")
+        self._sat_thresh = 0.0
+        self._sat_ground_ref = 0.0
+        print("[RgbdDetectPipeline] SATURATION-primary + depth distance")
 
     def reset(self):
         self.tracker.reset()
@@ -119,59 +115,51 @@ class RgbdDetectPipeline:
     def _roi(self, h: int, w: int) -> np.ndarray:
         u0, u1 = int(w * ROI_U_MARGIN), int(w * (1 - ROI_U_MARGIN))
         v0, v1 = int(h * ROI_V_MIN), int(h * ROI_V_MAX)
-        m = np.zeros((h, w), dtype=np.uint8)
-        m[v0:v1, u0:u1] = 255
+        m = np.zeros((h, w), dtype=bool)
+        m[v0:v1, u0:u1] = True
         return m
 
-    def _ground_depth(self, depth: np.ndarray, valid: np.ndarray) -> np.ndarray:
-        d = depth.copy()
-        d[~valid] = DEPTH_MAX
-        k = GROUND_OPEN_K
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-        g = cv2.morphologyEx(d, cv2.MORPH_OPEN, kernel)
-        g[~valid] = 0
-        return g
+    def _ground_sat_reference(self, sat: np.ndarray, roi: np.ndarray, h: int) -> float:
+        """用画面下半部估计灰地面饱和度"""
+        v_mid = int(h * 0.48)
+        ground_region = roi.copy()
+        ground_region[:v_mid, :] = False
+        vals = sat[ground_region]
+        if vals.size > 80:
+            return float(np.percentile(vals, 55))
+        vals = sat[roi]
+        return float(np.percentile(vals, 40)) if vals.size else 30.0
 
-    def build_masks(self, rgb: np.ndarray, depth: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def build_saturation_mask(self, rgb: np.ndarray, depth: np.ndarray) -> np.ndarray:
         h, w = depth.shape
         valid = (depth > DEPTH_MIN) & (depth < DEPTH_MAX)
-        roi = self._roi(h, w) > 0
-
-        ground = self._ground_depth(depth, valid)
-        relief = np.zeros_like(depth, dtype=np.float32)
-        ok_g = ground > 0
-        relief[ok_g] = ground[ok_g] - depth[ok_g]
-        relief_mask = (relief >= RELIEF_MIN) & valid & roi
+        roi = self._roi(h, w)
 
         hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
-        sat = hsv[:, :, 1].astype(np.float32)
-        roi_sat = sat[roi & valid]
-        if roi_sat.size > 100:
-            ground_sat = float(np.percentile(roi_sat, 35))
-        else:
-            ground_sat = 30.0
-        sat_thresh = max(SAT_MIN_ABSOLUTE, ground_sat + SAT_ABOVE_GROUND)
-        color_mask = (sat >= sat_thresh) & roi
+        sat = hsv[:, :, 1]
+        val = hsv[:, :, 2]
 
-        # 核心: depth 凸起 AND (有颜色 OR 凸起很强)
-        strong_relief = relief >= (RELIEF_MIN * 2.2)
-        rgbd_mask = (relief_mask & (color_mask | strong_relief)).astype(np.uint8)
-        rgbd_mask = cv2.morphologyEx(rgbd_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-        rgbd_mask = cv2.morphologyEx(rgbd_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+        self._sat_ground_ref = self._ground_sat_reference(sat, roi, h)
+        self._sat_thresh = max(SAT_MIN_ABSOLUTE, self._sat_ground_ref + SAT_ABOVE_GROUND)
+
+        sat_mask = (sat >= self._sat_thresh) & (val >= VAL_MIN) & roi & valid
+
+        detect = sat_mask.astype(np.uint8)
+        detect = cv2.morphologyEx(detect, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        detect = cv2.morphologyEx(detect, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
 
         self._debug = {
-            "relief": np.clip(relief / 0.15 * 255, 0, 255).astype(np.uint8),
-            "color": color_mask.astype(np.uint8) * 255,
-            "rgbd": rgbd_mask * 255,
+            "saturation": sat,
+            "sat_mask": sat_mask.astype(np.uint8) * 255,
+            "rgbd": detect * 255,
             "valid_depth": (valid & roi).astype(np.uint8) * 255,
         }
         self._depth_stats = depth_stats(depth)
-        self._max_relief = float(np.max(relief[roi & valid])) if np.any(roi & valid) else 0.0
-        return rgbd_mask, relief_mask.astype(np.uint8), color_mask.astype(np.uint8)
+        return detect
 
     def detect(self, rgb: np.ndarray, depth: np.ndarray) -> List[dict]:
         depth = sanitize_depth(depth)
-        mask, _, _ = self.build_masks(rgb, depth)
+        mask = self.build_saturation_mask(rgb, depth)
         labeled, n = ndimage.label(mask > 0)
         if n == 0:
             return []
@@ -194,7 +182,8 @@ class RgbdDetectPipeline:
                 d_m = median_depth_in_mask(depth, (labeled == cid).astype(np.uint8))
 
             cx, cy = float(np.mean(xs)), float(np.mean(ys))
-            conf = float(min(0.95, 0.5 + area / 3000.0 + (0.1 if d_m else 0)))
+            patch_sat = float(np.mean(self._debug["saturation"][ys, xs]))
+            conf = float(min(0.97, 0.5 + (patch_sat - self._sat_thresh) / 128.0 + area / 3000.0))
 
             dets.append({
                 "class": "object",
@@ -203,20 +192,25 @@ class RgbdDetectPipeline:
                 "centroid": (cx, cy),
                 "depth_m": d_m,
                 "area": area,
-                "source": "rgbd_fusion",
+                "mean_sat": patch_sat,
+                "source": "saturation",
             })
 
         dets.sort(key=lambda x: (x["depth_m"] if x["depth_m"] is not None else 999, -x["area"]))
         return dets[:MAX_DETECTIONS]
 
     def get_debug(self, name: str) -> Optional[np.ndarray]:
+        if name == "saturation":
+            sat = self._debug.get("saturation")
+            if sat is not None:
+                return sat
         return self._debug.get(name)
 
     def get_depth_stats(self) -> Dict[str, float]:
         return dict(self._depth_stats)
 
-    def get_max_relief(self) -> float:
-        return getattr(self, "_max_relief", 0.0)
+    def get_sat_info(self) -> Dict[str, float]:
+        return {"thresh": self._sat_thresh, "ground_ref": self._sat_ground_ref}
 
     def process(self, obs, dt: float = 0.02) -> dict:
         self.frame_count += 1
@@ -241,18 +235,20 @@ class RgbdDetectPipeline:
                 "dist_to_robot": t.get("depth_m"),
                 "pos_world": None,
                 "grasp_pos_world": None,
-                "source": "rgbd_fusion",
+                "source": "saturation",
             }
             objects.append(obj)
             if target is None or (obj["depth_m"] or 999) < (target.get("depth_m") or 999):
                 target = obj
 
+        sat_info = self.get_sat_info()
         return {
             "target": target,
             "objects_detailed": objects,
             "objects_remaining": [{"id": o["id"], "class": o["class"], "dist": o["depth_m"]} for o in objects],
             "depth_stats": self.get_depth_stats(),
-            "max_relief": self.get_max_relief(),
+            "sat_thresh": sat_info["thresh"],
+            "sat_ground_ref": sat_info["ground_ref"],
             "gripper": {"is_holding": False, "width": 0.04},
             "progress": {"total": TOTAL_OBJECTS, "inside_bin": 0, "remaining": TOTAL_OBJECTS},
             "robot": {"pos_world": ROBOT_INIT_POS.tolist(), "yaw": float(ROBOT_INIT_YAW)},
