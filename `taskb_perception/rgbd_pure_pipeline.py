@@ -78,8 +78,9 @@ CAMERA_CFG = {
         "max_shadow_area": 1500,
         "max_depth_std": 0.088,
         "min_track_hits": 2,
-        "near_strong_sat": 44,
-        "near_strong_val": 64,
+        "near_strong_sat": 42,
+        "near_strong_val": 60,
+        "near_fb_depth_m": 1.55,
     },
     "ee": {
         "cam": EE_CAM,
@@ -409,20 +410,24 @@ class RgbdPureCamera:
             d_bg = float(np.percentile(roi_d, 58))
             closer = valid & (depth < d_bg - CLOSER_THAN_BG_M)
 
-        depth_ok = self._depth_gate(depth, relief, valid, roi, near)
-        fused = (rgb_fg & depth_ok).astype(np.uint8)
-
         if self.camera_name == "head" and near:
-            # 极近真物体: relief 失效时, 仅高饱和亮黄 + 合法深度 (影子 sat/val 偏低)
-            ss = int(c.get("near_strong_sat", 44))
-            sv = int(c.get("near_strong_val", 64))
+            # 近距双通道: (1)有 relief/closer (2)中近距高饱和黄 — 修 debug(3) rgb_fg有/fusion无
+            has_cue = depth_fg | closer | (relief >= rmin * 0.32)
+            fused_main = (rgb_fg & valid & has_cue).astype(np.uint8)
+            ss = int(c.get("near_strong_sat", 42))
+            sv = int(c.get("near_strong_val", 60))
+            fb_d = float(c.get("near_fb_depth_m", 1.55))
             strong = (
                 (hue >= HEAD_HUE_LO) & (hue <= HEAD_HUE_HI)
                 & (sat >= ss) & (val >= sv)
             )
-            very_near = valid & (depth < VERY_NEAR_DEPTH_M) & (depth > self._depth_min())
-            near_fb = (rgb_fg & very_near & strong).astype(np.uint8)
-            fused = cv2.bitwise_or(fused, near_fb)
+            mid_near = valid & (depth > self._depth_min()) & (depth < fb_d)
+            fused_fb = (rgb_fg & mid_near & strong).astype(np.uint8)
+            fused = cv2.bitwise_or(fused_main, fused_fb)
+            depth_ok = has_cue | (mid_near & strong)
+        else:
+            depth_ok = self._depth_gate(depth, relief, valid, roi, near)
+            fused = (rgb_fg & depth_ok).astype(np.uint8)
 
         ck = int(c.get("mask_close_k", 5))
         fused = self._close_components(fused, ck)
@@ -475,10 +480,24 @@ class RgbdPureCamera:
                 ys, xs = ys[keep], xs[keep]
         if self.camera_name == "head" and val is not None and len(ys) > 8:
             v = val[ys, xs]
-            v_cut = float(np.percentile(v, self._cfg.get("val_refine_p", 28)))
-            keep = v >= max(48, v_cut)
+            v_cut = float(np.percentile(v, self._cfg.get("val_refine_p", 32)))
+            keep = v >= max(52, v_cut)
             if int(np.sum(keep)) >= max(5, len(ys) // 4):
                 ys, xs = ys[keep], xs[keep]
+            # 横长块: 影子在侧面/下方, 保留更亮一侧
+            bw = int(xs.max() - xs.min() + 1)
+            bh = int(ys.max() - ys.min() + 1)
+            if bw > bh * 1.35 and len(ys) > 60:
+                cx = float(np.median(xs))
+                bright = v >= float(np.percentile(v, 55))
+                left, right = xs < cx, xs >= cx
+                n_l = int(np.sum(bright & left))
+                n_r = int(np.sum(bright & right))
+                if n_l > 12 and n_r > 12:
+                    keep_side = left if n_l >= n_r else right
+                    keep2 = bright & keep_side
+                    if int(np.sum(keep2)) >= max(8, len(ys) // 5):
+                        ys, xs = ys[keep2], xs[keep2]
         return ys, xs
 
     def _is_shadow_shape(
@@ -515,13 +534,15 @@ class RgbdPureCamera:
         if area < 160 and mean_s >= 40 and mean_v >= 62 and mean_r >= 0.006:
             return False
 
-        if mean_r < 0.007 and mean_v < 84:
+        if mean_r < 0.007 and mean_v < 82:
             return True
         if mean_r < 0.009 and mean_s < 44:
             return True
-        if mean_r < 0.010 and area > 240 and aspect > 1.45 and mean_v < 90:
+        if mean_r < 0.010 and area > 200 and aspect > 1.35 and mean_v < 88:
             return True
-        if cy > h * 0.46 and mean_r < 0.011 and aspect > 1.65 and area > 200:
+        if cy > h * 0.44 and mean_r < 0.011 and aspect > 1.45 and area > 160:
+            return True
+        if area > 320 and aspect > 1.55 and mean_v < 86 and mean_s < 46:
             return True
         if area > int(self._cfg.get("max_shadow_area", 1500)) and mean_r < 0.011:
             return True
@@ -611,14 +632,30 @@ class RgbdPureCamera:
     def _merge_dets(self, dets: List[dict]) -> List[dict]:
         if len(dets) < 2:
             return dets
-        dets = sorted(dets, key=lambda x: x.get("depth_m") or 999.0)
+        dets = sorted(
+            dets,
+            key=lambda x: (
+                -(float(x.get("blob_sat_mean", 0)) * 0.5 + float(x.get("blob_val_mean", 0)) * 0.3),
+                x.get("depth_m") or 999.0,
+            ),
+        )
         kept: List[dict] = []
         for d in dets:
             dup = False
             for k in kept:
-                if abs((d.get("depth_m") or 0) - (k.get("depth_m") or 0)) > 0.35:
+                if abs((d.get("depth_m") or 0) - (k.get("depth_m") or 0)) > 0.42:
                     continue
-                if self._bbox_iou(d["bbox"], k["bbox"]) > 0.15:
+                iou = self._bbox_iou(d["bbox"], k["bbox"])
+                if iou > 0.12:
+                    dup = True
+                    break
+                ax1, ay1, ax2, ay2 = d["bbox"]
+                bx1, by1, bx2, by2 = k["bbox"]
+                cx_d = (ax1 + ax2) * 0.5
+                cy_d = (ay1 + ay2) * 0.5
+                cx_k = (bx1 + bx2) * 0.5
+                cy_k = (by1 + by2) * 0.5
+                if float(np.hypot(cx_d - cx_k, cy_d - cy_k)) < 72 and iou > 0.04:
                     dup = True
                     break
             if not dup:
