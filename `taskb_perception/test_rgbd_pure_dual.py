@@ -19,6 +19,7 @@ from isaaclab.app import AppLauncher
 parser = argparse.ArgumentParser(description="RGBD dual: ee far + head near")
 parser.add_argument("--task", type=str, default="ATEC-TaskB-B2Piper")
 parser.add_argument("--out", type=str, default="../datasets/rgbd_pure_dual_debug")
+parser.add_argument("--fresh", action="store_true", help="清空输出目录后再存图")
 parser.add_argument("--live", action="store_true", default=True)
 parser.add_argument("--no-live", action="store_false", dest="live")
 parser.add_argument("--preview_every", type=int, default=5)
@@ -59,7 +60,10 @@ def draw_boxes(vis, objects, prefix="", thick=2):
         dm = obj.get("depth_m")
         lab = f"{prefix}{obj['id']} {cls}"
         if dm:
-            lab += f" {dm:.2f}m"
+            lab += f" z={dm:.2f}"
+        dr = obj.get("dist_to_robot")
+        if dr is not None:
+            lab += f" d={dr:.2f}"
         cv2.putText(vis, lab, (x1, max(14, y1 - 4)), 0, 0.4, c, 1)
 
 
@@ -116,7 +120,7 @@ def draw_vis(head_rgb, ee_rgb, out, pipeline, head_depth):
     cv2.putText(vis, f"RGBD-dual phase={phase} NAV({nav_cam}) GRASP({grasp_cam})",
                 (8, 22), 0, 0.5, (0, 255, 255), 2)
     cv2.putText(vis, format_stats_line(out.get("depth_stats", {})), (8, 44), 0, 0.42, (0, 255, 255), 1)
-    cv2.putText(vis, f"far=NAV(ee only)  head<{GRASP_PHASE_DIST_M:.1f}m=grasp | WASD P Q",
+    cv2.putText(vis, f"松开键=站立(需policy) | P随时存图 | WASD Q",
                 (8, 64), 0, 0.38, (180, 180, 180), 1)
     if phase == "approach" and len(ee_objs) == 0:
         cv2.putText(vis, "NAV: ee=0 (tune EE, not head)", (8, 144), 0, 0.4, (0, 80, 255), 1)
@@ -135,6 +139,11 @@ def draw_vis(head_rgb, ee_rgb, out, pipeline, head_depth):
 
 def main():
     out_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), args_cli.out))
+    if args_cli.fresh and os.path.isdir(out_dir):
+        for fn in os.listdir(out_dir):
+            if fn.startswith("pure_dual_") and fn.endswith(".png"):
+                os.remove(os.path.join(out_dir, fn))
+        print(f"[fresh] cleared {out_dir}", flush=True)
     os.makedirs(out_dir, exist_ok=True)
 
     env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=1)
@@ -147,7 +156,12 @@ def main():
     pipeline = RgbdPureDualPipeline()
     kb = ManualKeyboard(device, resolve_policy(_root, args_cli.policy))
 
-    print("\n=== RGB-D 双摄: ee远距导航 head近距抓取 ===\n", flush=True)
+    pol = resolve_policy(_root, args_cli.policy)
+    print("\n=== RGB-D 双摄: ee远距导航 head近距抓取 ===", flush=True)
+    if pol:
+        print("  已加载 policy.pt — 松开 WASD 会原地站立, 可直接按 P 存图\n", flush=True)
+    else:
+        print("  建议: --policy ../demo/policy.pt (原地站立更稳)\n", flush=True)
 
     obs, _ = env.reset()
     for _ in range(20):
@@ -156,6 +170,10 @@ def main():
             camera_follow(env)
 
     step = saved = 0
+    if not simulation_app.is_running():
+        print("[warn] Isaac app 未在运行 — 请保持 Isaac Sim 窗口打开后再跑", flush=True)
+    print("[run] 主循环开始 | OpenCV 窗: RGBD-Pure-Dual | Isaac 窗获焦后 WASD / P存图 / Q退出",
+          flush=True)
     try:
         while simulation_app.is_running():
             if kb.quit:
@@ -194,6 +212,8 @@ def main():
                 obs, _ = env.reset()
                 pipeline.reset()
     finally:
+        why = "quit" if kb.quit else ("isaac_closed" if not simulation_app.is_running() else "break")
+        print(f"[exit] steps={step} saved={saved} reason={why}", flush=True)
         cv2.destroyAllWindows()
         env.close()
         simulation_app.close()

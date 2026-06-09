@@ -77,10 +77,13 @@ CAMERA_CFG = {
         "min_relief_med": 0.007,
         "max_shadow_area": 1500,
         "max_depth_std": 0.088,
-        "min_track_hits": 2,
-        "near_strong_sat": 42,
-        "near_strong_val": 60,
-        "near_fb_depth_m": 1.55,
+        "min_track_hits": 1,
+        "near_strong_sat": 40,
+        "near_strong_val": 58,
+        "near_fb_depth_m": 1.65,
+        "sat_min": 40,
+        "sat_relax_far": 12,
+        "val_relax_far": 10,
     },
     "ee": {
         "cam": EE_CAM,
@@ -95,18 +98,21 @@ CAMERA_CFG = {
         "ground_k": 11,
         "sat_extra": 4,
         "sat_relax": 22,
-        "min_area": 14,
+        "min_area": 12,
         "min_side": 3,
-        "min_track_hits": 2,
-        "far_mask_dilate": 3,
-        "rgb_dilate_far": 2,
+        "min_track_hits": 1,
+        "far_mask_dilate": 5,
+        "rgb_dilate_far": 3,
         "mask_close_k": 7,
-        "fusion_mode": "ee_nav",
-        "val_refine_p": 38,
-        "min_blob_sat": 42,
-        "max_depth_std": 0.058,
-        "max_ee_blob_area": 1900,
-        "min_relief_med": 0.006,
+        "fusion_mode": "ee_sat",
+        "val_refine_p": 34,
+        "min_blob_sat": 36,
+        "max_depth_std": 0.062,
+        "max_ee_blob_area": 2400,
+        "sat_min": 40,
+        "sat_relax_far": 22,
+        "val_relax_far": 14,
+        "hue_sat_relax": 24,
     },
 }
 
@@ -128,7 +134,9 @@ ROI_U_MARGIN = 0.05
 NEAR_SCENE_P10 = 1.08
 NEAR_SCENE_MIN = 0.95
 VERY_NEAR_DEPTH_M = 1.15
+FAR_DEPTH_M = 2.0
 HEAD_HUE_LO, HEAD_HUE_HI = 12, 50
+EE_HUE_LO, EE_HUE_HI = 12, 50
 
 # ── RGB ──────────────────────────────────────────────────────────
 HUE_LO, HUE_HI = 10, 52
@@ -261,6 +269,82 @@ class RgbdPureCamera:
         m[v0:v1, u0:u1] = True
         return m
 
+    def _ground_refs(
+        self, sat: np.ndarray, val: np.ndarray, roi: np.ndarray, h: int,
+    ) -> Tuple[float, float]:
+        v_mid = int(h * 0.50)
+        ground = roi.copy()
+        ground[:v_mid, :] = False
+        s_vals = sat[ground]
+        v_vals = val[ground]
+        if s_vals.size > 80:
+            return float(np.percentile(s_vals, 55)), float(np.percentile(v_vals, 50))
+        s_vals = sat[roi]
+        v_vals = val[roi]
+        return (
+            float(np.percentile(s_vals, 40)) if s_vals.size else 30.0,
+            float(np.percentile(v_vals, 45)) if v_vals.size else 80.0,
+        )
+
+    def _build_sat_mask(
+        self,
+        hue: np.ndarray,
+        sat: np.ndarray,
+        val: np.ndarray,
+        depth: np.ndarray,
+        roi: np.ndarray,
+        valid: np.ndarray,
+    ) -> np.ndarray:
+        """分深度段饱和度掩码 — EE 远距检出主路径 (对齐 rgbd_detect)"""
+        c = self._cfg
+        h = depth.shape[0]
+        g_sat, g_val = self._ground_refs(sat, val, roi, h)
+        sat_min = float(c.get("sat_min", 40))
+        sat_thr = max(sat_min, g_sat + (18 if self.camera_name == "ee" else 14))
+        val_thr = max(48 if self.camera_name == "ee" else 52, g_val + (12 if self.camera_name == "ee" else 10))
+
+        relax_far = int(c.get("sat_relax_far", 16))
+        relax_far_v = int(c.get("val_relax_far", 10))
+        sat_far = max(34 if self.camera_name == "ee" else 36, sat_thr - relax_far)
+        val_far = max(42 if self.camera_name == "ee" else 46, val_thr - relax_far_v)
+
+        very_near = depth < VERY_NEAR_DEPTH_M
+        near = (depth >= VERY_NEAR_DEPTH_M) & (depth < FAR_DEPTH_M)
+        far = depth >= FAR_DEPTH_M
+
+        relax_vn = int(c.get("sat_relax_very_near", 18))
+        relax_vn_v = int(c.get("val_relax_very_near", 20))
+        sat_vn = max(26 if self.camera_name == "ee" else 28, sat_thr - relax_vn)
+        val_vn = max(38 if self.camera_name == "ee" else 42, val_thr - relax_vn_v)
+
+        hue_lo = EE_HUE_LO if self.camera_name == "ee" else HEAD_HUE_LO
+        hue_hi = EE_HUE_HI if self.camera_name == "ee" else HEAD_HUE_HI
+
+        m_vn = (sat >= sat_vn) & (val >= val_vn) & very_near
+        m_near = (sat >= sat_thr) & (val >= val_thr) & near
+        m_far = (sat >= sat_far) & (val >= val_far) & far
+        sat_mask = (m_vn | m_near | m_far) & roi & valid
+
+        hue_relax = int(c.get("hue_sat_relax", 22))
+        sat_hue = max(20, sat_thr - hue_relax)
+        yellow = (
+            (hue >= hue_lo) & (hue <= hue_hi)
+            & (sat >= sat_hue) & (val >= val_thr - 18)
+            & roi & valid
+        )
+        detect = (sat_mask | yellow).astype(np.uint8)
+
+        if self.camera_name == "head":
+            shadow = (val < 70) & (sat < 40)
+            detect = (detect.astype(bool) & ~shadow).astype(np.uint8)
+
+        near_u8 = cv2.bitwise_and(detect, (very_near | near).astype(np.uint8))
+        far_u8 = cv2.bitwise_and(detect, far.astype(np.uint8))
+        near_u8 = cv2.morphologyEx(near_u8, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+        far_u8 = cv2.morphologyEx(far_u8, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        far_u8 = cv2.morphologyEx(far_u8, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+        return cv2.bitwise_or(near_u8, far_u8)
+
     def _ground_depth(self, depth: np.ndarray, valid: np.ndarray) -> np.ndarray:
         d = depth.copy()
         d[~valid] = DEPTH_MAX
@@ -337,14 +421,8 @@ class RgbdPureCamera:
         if mode == "rgb_depth":
             return valid & (depth > 0.38) & (depth < 10.5)
 
-        if mode == "ee_nav":
-            # EE 远距: 必须有一点 depth 线索, 不能纯 RGB (垃圾箱影子)
-            depth_cue = depth_fg | closer | (valid & (relief >= rmin * 0.50))
-            if not near:
-                depth_cue = depth_cue | (
-                    valid & (depth > 1.0) & (depth < 9.5) & (relief >= rmin * 0.38)
-                )
-            return valid & depth_cue & (depth > 0.38) & (depth < 10.5)
+        if mode in ("ee_nav", "ee_sat"):
+            return valid & (depth > 0.35) & (depth < 10.8)
 
         if mode == "head_grasp":
             dmin = float(c.get("depth_min", DEPTH_MIN))
@@ -396,11 +474,7 @@ class RgbdPureCamera:
         hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
         hue, sat, val = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
         rgb_fg = self._rgb_foreground(hue, sat, val, roi, valid, near, depth=depth)
-
-        rd = int(c.get("rgb_dilate_far", 0))
-        if self.camera_name == "ee" and not near and rd > 0:
-            rk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (rd, rd))
-            rgb_fg = cv2.dilate(rgb_fg.astype(np.uint8), rk, 1).astype(bool)
+        sat_mask = self._build_sat_mask(hue, sat, val, depth, roi, valid)
 
         rmin = c["relief_min_near"] if near else c["relief_min"]
         depth_fg = (relief >= rmin) & (relief <= RELIEF_MAX) & valid
@@ -410,32 +484,37 @@ class RgbdPureCamera:
             d_bg = float(np.percentile(roi_d, 58))
             closer = valid & (depth < d_bg - CLOSER_THAN_BG_M)
 
-        if self.camera_name == "head" and near:
-            # 近距双通道: (1)有 relief/closer (2)中近距高饱和黄 — 修 debug(3) rgb_fg有/fusion无
-            has_cue = depth_fg | closer | (relief >= rmin * 0.32)
-            fused_main = (rgb_fg & valid & has_cue).astype(np.uint8)
-            ss = int(c.get("near_strong_sat", 42))
-            sv = int(c.get("near_strong_val", 60))
-            fb_d = float(c.get("near_fb_depth_m", 1.55))
+        if self.camera_name == "ee":
+            fused = sat_mask.copy()
+            fd = int(c.get("far_mask_dilate", 5))
+            if fd > 0:
+                far = (depth >= FAR_DEPTH_M) & valid & roi
+                k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (fd, fd))
+                far_u8 = cv2.dilate((sat_mask > 0).astype(np.uint8) & far.astype(np.uint8), k, 1)
+                fused = cv2.bitwise_or(fused, far_u8)
+            depth_ok = valid & (depth > 0.35) & (depth < 10.8)
+            rgb_fg = (sat_mask > 0) | rgb_fg
+        elif near:
+            has_cue = depth_fg | closer | (relief >= rmin * 0.28)
+            relief_f = (rgb_fg & valid & has_cue).astype(np.uint8)
+            ss = int(c.get("near_strong_sat", 40))
+            sv = int(c.get("near_strong_val", 58))
+            fb_d = float(c.get("near_fb_depth_m", 1.65))
             strong = (
                 (hue >= HEAD_HUE_LO) & (hue <= HEAD_HUE_HI)
                 & (sat >= ss) & (val >= sv)
             )
             mid_near = valid & (depth > self._depth_min()) & (depth < fb_d)
             fused_fb = (rgb_fg & mid_near & strong).astype(np.uint8)
-            fused = cv2.bitwise_or(fused_main, fused_fb)
-            depth_ok = has_cue | (mid_near & strong)
+            fused = cv2.bitwise_or(sat_mask, relief_f)
+            fused = cv2.bitwise_or(fused, fused_fb)
+            depth_ok = (sat_mask > 0) | has_cue | (mid_near & strong)
         else:
             depth_ok = self._depth_gate(depth, relief, valid, roi, near)
-            fused = (rgb_fg & depth_ok).astype(np.uint8)
+            fused = cv2.bitwise_or(sat_mask, (rgb_fg & depth_ok).astype(np.uint8))
 
         ck = int(c.get("mask_close_k", 5))
         fused = self._close_components(fused, ck)
-
-        fd = int(c.get("far_mask_dilate", 0))
-        if self.camera_name == "ee" and not near and fd > 0:
-            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (fd, fd))
-            fused = cv2.dilate(fused, k, iterations=1)
 
         self._debug = {
             "relief": np.clip(relief / RELIEF_MAX * 255, 0, 255).astype(np.uint8),
@@ -564,21 +643,23 @@ class RgbdPureCamera:
         h: int,
         w: int,
     ) -> bool:
-        """EE 远距: 垃圾箱/地面大块扁影"""
+        """EE: 只剔垃圾箱级大扁影, 不杀远处小目标"""
         c = self._cfg
-        if area > int(c.get("max_ee_blob_area", 1900)):
+        if area < 420:
+            return False
+        if mean_s >= 44 and mean_v >= 72:
+            return False
+        if area > int(c.get("max_ee_blob_area", 2400)):
             return True
-        if img_frac > 0.075 and mean_r < 0.011:
+        if img_frac > 0.09 and mean_r < 0.009 and mean_s < 46:
             return True
-        if area > 620 and mean_r < 0.008:
+        if area > 1100 and mean_r < 0.007 and mean_v < 95:
             return True
-        if area > 480 and mean_r < 0.010 and mean_v < 98:
+        if bw > w * 0.34 and bh < h * 0.12 and mean_r < 0.009 and area > 800:
             return True
-        if bw > w * 0.32 and bh < h * 0.14 and mean_r < 0.011:
+        if aspect > 2.3 and area > 1000 and mean_r < 0.008 and mean_s < 48:
             return True
-        if aspect > 2.1 and area > 700 and mean_r < 0.010 and mean_v < 102:
-            return True
-        if cy > h * 0.58 and area > 550 and mean_r < 0.009 and mean_s < 52:
+        if cy > h * 0.60 and area > 900 and mean_r < 0.007 and mean_s < 46:
             return True
         return False
 
@@ -687,9 +768,7 @@ class RgbdPureCamera:
             return None
         if self.camera_name == "ee" and relief is not None:
             rm = float(np.median(relief[ys, xs]))
-            if depth_m > 2.2 and len(ys) > 750 and rm < 0.011:
-                return None
-            if depth_m > 3.5 and len(ys) > 450 and rm < 0.013:
+            if len(ys) > 1200 and rm < 0.007 and float(np.mean(val[ys, xs])) < 90:
                 return None
         d_vals = depth[ys, xs]
         d_vals = d_vals[(d_vals > self._depth_min()) & (d_vals < DEPTH_MAX)]
@@ -703,15 +782,10 @@ class RgbdPureCamera:
             return None
         if relief is not None and self.camera_name == "head":
             rm = float(np.median(relief[ys, xs]))
-            rmin_med = float(self._cfg.get("min_relief_med", 0.007))
-            if rm < rmin_med and vm < 86 and sm < 50:
+            asp = max(bw, bh) / max(min(bw, bh), 1)
+            if rm < 0.006 and vm < 78 and sm < 44 and len(ys) > 500:
                 return None
-            if rm < rmin_med * 1.4 and len(ys) > 380 and vm < 82:
-                return None
-        if relief is not None and self.camera_name == "ee":
-            rm = float(np.median(relief[ys, xs]))
-            rmin_med = float(self._cfg.get("min_relief_med", 0.006))
-            if rm < rmin_med and len(ys) > 520:
+            if rm < 0.007 and len(ys) > 700 and asp > 1.8 and vm < 84:
                 return None
         cx, cy = float(np.median(xs)), float(np.median(ys))
         cls, cls_conf = RgbdPureCamera._classify_2d(bbox, len(ys), depth_m)

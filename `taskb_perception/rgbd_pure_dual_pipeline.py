@@ -115,21 +115,28 @@ def _nav_quality(obj: dict) -> float:
 
 
 def _best_nav_target(objs: List[dict]) -> Optional[dict]:
-    """EE 导航: 近 + 质量高; 深度接近时优先真小物体"""
+    """EE 导航: 默认最近; 仅在大块低饱和影子上改选"""
     if not objs:
         return None
-    ranked = sorted(objs, key=lambda o: (_obj_dist(o), -_nav_quality(o)))
+    ranked = sorted(objs, key=_obj_dist)
     best = ranked[0]
     bd = _obj_dist(best)
     bq = _nav_quality(best)
+    area0 = int((best["bbox"][2] - best["bbox"][0] + 1) * (best["bbox"][3] - best["bbox"][1] + 1))
+    sm0 = float(best.get("blob_sat_mean", 50))
+    if area0 > 1100 and sm0 < 46:
+        for o in ranked[1:6]:
+            if _nav_quality(o) > bq + 20:
+                return o
     for o in ranked[1:]:
-        if _obj_dist(o) - bd > 0.35:
+        if _obj_dist(o) - bd > 0.40:
             break
         oq = _nav_quality(o)
-        if oq > bq + 12.0 and _obj_dist(o) < bd + 0.55:
+        area = int((o["bbox"][2] - o["bbox"][0] + 1) * (o["bbox"][3] - o["bbox"][1] + 1))
+        if area > 1200 and float(o.get("blob_sat_mean", 0)) < 46:
+            continue
+        if oq > bq + 18.0 and _obj_dist(o) < bd + 0.65:
             best, bq = o, oq
-        elif float(o.get("conf", 0)) > float(best.get("conf", 0)) + 0.10 and _obj_dist(o) < bd + 0.25:
-            best = o
     return best
 
 
