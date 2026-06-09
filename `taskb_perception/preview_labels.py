@@ -70,8 +70,14 @@ def draw_labels_on_image(img_bgr, labels, img_w, img_h):
     return out
 
 
-def find_image_label_pairs(data_root: Path):
-    """支持 images/train + labels/train 或 images/ + labels/"""
+def find_image_label_pairs(data_root: Path, split: str = "train"):
+    """split: train | val | all(legacy flat)"""
+    if split in ("train", "val"):
+        img_dir = data_root / "images" / split
+        lbl_dir = data_root / "labels" / split
+        if img_dir.is_dir():
+            return img_dir, lbl_dir
+        return None, None
     candidates = [
         (data_root / "images" / "train", data_root / "labels" / "train"),
         (data_root / "images", data_root / "labels"),
@@ -86,6 +92,8 @@ def main():
     parser = argparse.ArgumentParser(description="Preview YOLO auto-labels on collected images")
     parser.add_argument("--data", type=str, default="../datasets/real",
                         help="Dataset root (contains images/ and labels/)")
+    parser.add_argument("--split", type=str, default="train", choices=["train", "val", "both"],
+                        help="Preview train, val, or both splits")
     parser.add_argument("--out", type=str, default="",
                         help="Preview output dir (default: <data>/preview)")
     parser.add_argument("--max", type=int, default=50,
@@ -99,13 +107,19 @@ def main():
     args = parser.parse_args()
 
     data_root = Path(args.data).resolve()
-    img_dir, lbl_dir = find_image_label_pairs(data_root)
+    splits = ["train", "val"] if args.split == "both" else [args.split]
+
+    for split_name in splits:
+        _run_preview_split(data_root, split_name, args)
+
+
+def _run_preview_split(data_root: Path, split_name: str, args):
+    img_dir, lbl_dir = find_image_label_pairs(data_root, split_name)
     if img_dir is None:
-        print(f"ERROR: no images folder under {data_root}")
-        print("  Expected: images/train/*.png  +  labels/train/*.txt")
+        print(f"ERROR: no images/{split_name} under {data_root}")
         sys.exit(1)
 
-    out_dir = Path(args.out).resolve() if args.out else (data_root / "preview")
+    out_dir = Path(args.out).resolve() if args.out else (data_root / "preview" / split_name)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     images = sorted(list(img_dir.glob("*.png")) + list(img_dir.glob("*.jpg")))
@@ -125,7 +139,7 @@ def main():
     preview_written = 0
 
     print("=" * 60)
-    print("  YOLO Label Preview")
+    print(f"  YOLO Label Preview — {split_name}")
     print(f"  Data:    {data_root}")
     print(f"  Images:  {img_dir}  ({stats['total']} files)")
     print(f"  Labels:  {lbl_dir}")

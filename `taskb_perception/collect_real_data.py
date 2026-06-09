@@ -4,36 +4,59 @@
 用法:
     conda activate isaaclab
     cd ATEC2026_Simulation_Challenge
-    python collect_real_data.py --num_images 500 --output datasets/real
 
-    有 GUI 时镜头会跟随机器人；若有 demo/policy.pt 会自动用 RL 行走，否则用内置简易步态。
+    # 推荐: 手动控制，采 1000 张后自动 800 训练 / 200 验证
+    python collect_real_data.py --mode manual
 
-输出:
-    datasets/real/images/train/*.png
-    datasets/real/labels/train/*.txt
+    # 自定义数量与划分
+    python collect_real_data.py --num_images 1000 --train_count 800 --val_count 200
+
+手动模式按键 (先点一下 Isaac Sim 窗口):
+    W / S     前进 / 后退
+    A / D     左转 / 右转
+    SPACE     立刻拍一张 (仅当视野里有物体时)
+    松开键    站立
+
+输出 (采满后自动划分):
+    datasets/real/images/train/   800 张
+    datasets/real/images/val/     200 张
+    datasets/real/labels/train/
+    datasets/real/labels/val/
     datasets/real/dataset.yaml
 """
 
 import argparse
 import os
+import random
+import shutil
 import sys
 import numpy as np
 import cv2
+from pathlib import Path
 
 from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description="Collect real rendering data for YOLO training")
-parser.add_argument("--num_images", type=int, default=500)
+parser.add_argument("--num_images", type=int, default=1000,
+                    help="Total images to collect (default 1000)")
+parser.add_argument("--train_count", type=int, default=800,
+                    help="Train split size after collection (default 800)")
+parser.add_argument("--val_count", type=int, default=200,
+                    help="Val/test split size after collection (default 200)")
+parser.add_argument("--split_seed", type=int, default=42,
+                    help="Random seed for train/val shuffle split")
 parser.add_argument("--output", type=str, default="datasets/real")
 parser.add_argument("--task", type=str, default="ATEC-TaskB-B2Piper")
-parser.add_argument("--save_every", type=int, default=4,
-                    help="Save every N sim steps (default 4 ≈ 0.08s)")
-parser.add_argument("--min_visible", type=int, default=0,
-                    help="0=always save RGB; 1=only save frames with >=1 projected label")
+parser.add_argument("--save_every", type=int, default=8,
+                    help="Auto-save every N steps when visible>=min_visible (manual/auto)")
+parser.add_argument("--min_visible", type=int, default=1,
+                    help="Only save when >=N objects projected in head camera (default 1)")
+parser.add_argument("--mode", type=str, default="manual", choices=["manual", "auto", "rl"],
+                    help="manual=keyboard, auto=scripted walk, rl=RL policy walk")
 parser.add_argument("--policy", type=str, default="",
                     help="RL policy.pt path (default: demo/policy.pt if exists)")
 parser.add_argument("--forward_speed", type=float, default=0.5,
-                    help="RL forward cmd [vx, vy, wz] when using policy.pt")
+                    help="RL forward cmd when W held in manual+rl mode")
 AppLauncher.add_app_launcher_args(parser)
 args_cli, _ = parser.parse_known_args()
 if not getattr(args_cli, "enable_cameras", False):
@@ -86,19 +109,23 @@ def obj_to_class(obj_index: int) -> int:
     return obj_index_to_class_id(obj_index)
 
 
+def print_manual_help():
+    print("\n  --- Manual controls (click Isaac Sim window first) ---", flush=True)
+    print("  W / S     forward / backward", flush=True)
+    print("  A / D     turn left / right", flush=True)
+    print("  SPACE     snapshot now (only if objects visible)", flush=True)
+    print("  release   stand still", flush=True)
+    print("  Auto-save every N steps when visible >= min_visible", flush=True)
+    print("  ----------------------------------------------------\n", flush=True)
+
+
 class SimpleWalkController:
-    """
-    数据采集专用移动控制器（不依赖师姐的 motion_controller）:
-      1. 若存在 policy.pt → 用与 demo/solution_rl.py 相同的 RL 行走
-      2. 否则 → 内置对角步态 + 周期性转向（幅度足够大，能明显移动）
-    """
+    """自动走路: RL policy 或内置步态"""
 
-    LEG_DIM = 12
-    ARM_DIM = 8
     LEG_IDX = list(range(12))
-    ARM_IDX = list(range(12, 20))
 
-    def __init__(self, device: str, policy_path: str = "", forward_speed: float = 0.5):
+    def __init__(self, device: str, policy_path: str = "", forward_speed: float = 0.5,
+                 force_rl: bool = False):
         self.device = device
         self.mode = "scripted"
         self.policy = None
@@ -114,6 +141,9 @@ class SimpleWalkController:
             [forward_speed, 0.0, 0.0], device=device, dtype=torch.float32
         ).view(1, 3)
 
+        if not force_rl:
+            return
+
         candidates = [
             policy_path,
             os.path.join(os.path.dirname(__file__), "demo", "policy.pt"),
@@ -124,11 +154,15 @@ class SimpleWalkController:
                 self.policy = torch.jit.load(p, map_location=device)
                 self.policy.eval()
                 self.mode = "rl"
-                print(f"[WalkController] RL mode — loaded {p}", flush=True)
+                print(f"[WalkController] RL — {p}", flush=True)
                 break
         if self.mode == "scripted":
-            print("[WalkController] Scripted trot mode (place demo/policy.pt for RL walk)",
-                  flush=True)
+            print("[WalkController] Scripted trot (no policy.pt)", flush=True)
+
+    def set_velocity_cmd(self, vx: float, vy: float, wz: float):
+        self.velocity_cmd = torch.tensor(
+            [vx, vy, wz], device=self.device, dtype=torch.float32
+        ).view(1, 3)
 
     def _rl_action(self, obs) -> torch.Tensor:
         proprio = obs["proprio"].to(self.device)
@@ -136,32 +170,22 @@ class SimpleWalkController:
             proprio = proprio.unsqueeze(0)
         action_dim = (int(proprio.shape[-1]) - 12) // 3
 
-        idx = 0
-        idx += 3  # base_lin_vel
-        base_ang_vel = proprio[:, idx:idx + 3]
-        idx += 3
-        idx += 3  # velocity_commands from env
-        projected_gravity = proprio[:, idx:idx + 3]
-        idx += 3
+        idx = 12
+        base_ang_vel = proprio[:, 3:6]
+        projected_gravity = proprio[:, 9:12]
         joint_pos = proprio[:, idx:idx + action_dim]
-        idx += action_dim
-        joint_vel = proprio[:, idx:idx + action_dim]
-        idx += action_dim
-        actions_all = proprio[:, idx:idx + action_dim]
+        joint_vel = proprio[:, idx + action_dim:idx + 2 * action_dim]
+        actions_all = proprio[:, idx + 2 * action_dim:idx + 3 * action_dim]
 
         leg_pos = joint_pos[:, self.LEG_IDX]
         leg_vel = joint_vel[:, self.LEG_IDX]
         leg_act = actions_all[:, self.LEG_IDX]
         leg_act_train = leg_act * self.env_to_train.to(dtype=proprio.dtype)
-
         cmd = self.velocity_cmd.to(dtype=proprio.dtype)
+
         policy_obs = torch.cat([
-            base_ang_vel * 0.25,
-            projected_gravity,
-            cmd,
-            leg_pos,
-            leg_vel * 0.05,
-            leg_act_train,
+            base_ang_vel * 0.25, projected_gravity, cmd,
+            leg_pos, leg_vel * 0.05, leg_act_train,
         ], dim=-1)
 
         with torch.inference_mode():
@@ -175,41 +199,109 @@ class SimpleWalkController:
         full[:, self.LEG_IDX] = act_train * self.train_to_env
         return full
 
-    def _scripted_action(self, step_count: int) -> torch.Tensor:
-        """对角小跑步态 + 每 ~8s 换向，保证扫到更多物体"""
+    def _scripted_action(self, step_count: int, turn_bias: float = 0.0) -> torch.Tensor:
         a = torch.zeros(1, 20, dtype=torch.float32, device=self.device)
         t = step_count * 0.02
         phase = t * 3.0
-
-        # 对角腿对: (FR,RL) vs (FL,RR)
-        s1 = np.sin(phase)
-        s2 = np.sin(phase + np.pi)
+        s1, s2 = np.sin(phase), np.sin(phase + np.pi)
 
         def leg(i_hip, i_thigh, i_calf, s):
             a[0, i_hip] = 0.25 * s
             a[0, i_thigh] = 0.55 + 0.45 * s
             a[0, i_calf] = -1.35 - 0.35 * abs(s)
 
-        leg(0, 1, 2, s1)   # FR
-        leg(3, 4, 5, s2)   # FL
-        leg(6, 7, 8, s2)   # RR
-        leg(9, 10, 11, s1)  # RL
+        leg(0, 1, 2, s1)
+        leg(3, 4, 5, s2)
+        leg(6, 7, 8, s2)
+        leg(9, 10, 11, s1)
 
-        # 周期性转向: 4s 直走 + 4s 左转
-        cycle = int(step_count // 200) % 2
-        if cycle == 1:
-            turn = 0.55
-            a[0, 0] += turn
-            a[0, 6] += turn
-            a[0, 3] -= turn
-            a[0, 9] -= turn
-
+        if turn_bias != 0.0:
+            a[0, 0] += turn_bias
+            a[0, 6] += turn_bias
+            a[0, 3] -= turn_bias
+            a[0, 9] -= turn_bias
         return a
 
-    def get_action(self, obs, step_count: int) -> torch.Tensor:
+    def get_action(self, obs, step_count: int, turn_bias: float = 0.0) -> torch.Tensor:
         if self.mode == "rl":
             return self._rl_action(obs)
-        return self._scripted_action(step_count)
+        return self._scripted_action(step_count, turn_bias)
+
+
+class ManualKeyboardController:
+    """键盘手动控制 + SPACE 触发拍照"""
+
+    def __init__(self, device: str, policy_path: str = "", forward_speed: float = 0.5):
+        self.device = device
+        self._keyboard = None
+        self._input = None
+        self._ki = None
+        self._space_was_down = False
+        self.snap_now = False
+
+        self._walk = SimpleWalkController(device, policy_path, forward_speed, force_rl=True)
+        if self._walk.mode != "rl":
+            print("[Manual] No policy.pt — using keyed scripted gait", flush=True)
+
+        self._init_keyboard()
+
+    def _init_keyboard(self):
+        try:
+            import carb.input
+            import omni.appwindow
+            self._input = carb.input.acquire_input_interface()
+            self._keyboard = omni.appwindow.get_default_app_window().get_keyboard()
+            self._ki = carb.input.KeyboardInput
+            print("[Manual] Keyboard ready", flush=True)
+        except Exception as e:
+            print(f"[Manual] WARN: keyboard unavailable ({e})", flush=True)
+            print("  Use --mode auto if headless", flush=True)
+
+    def _key_down(self, key) -> bool:
+        if self._input is None or self._keyboard is None:
+            return False
+        return self._input.get_keyboard_value(self._keyboard, key) > 0
+
+    def poll(self):
+        """每帧调用: 更新 snap_now (SPACE 边沿触发)"""
+        self.snap_now = False
+        if self._ki is None:
+            return
+
+        space = self._key_down(self._ki.SPACE)
+        if space and not self._space_was_down:
+            self.snap_now = True
+        self._space_was_down = space
+
+    def get_motion(self):
+        """返回 (moving, turn_bias, vx, wz)"""
+        if self._ki is None:
+            return False, 0.0, 0.0, 0.0
+
+        w = self._key_down(self._ki.W)
+        s = self._key_down(self._ki.S)
+        a = self._key_down(self._ki.A)
+        d = self._key_down(self._ki.D)
+
+        vx = 0.5 if w else (-0.25 if s else 0.0)
+        wz = 0.45 if a else (-0.45 if d else 0.0)
+        if w and (a or d):
+            vx = 0.35
+        turn_bias = 0.5 if a else (-0.5 if d else 0.0)
+        moving = w or s or a or d
+        return moving, turn_bias, vx, wz
+
+    def get_action(self, obs, step_count: int) -> torch.Tensor:
+        self.poll()
+        moving, turn_bias, vx, wz = self.get_motion()
+
+        if not moving:
+            return torch.zeros(1, 20, dtype=torch.float32, device=self.device)
+
+        if self._walk.mode == "rl":
+            self._walk.set_velocity_cmd(vx, 0.0, wz)
+            return self._walk.get_action(obs, step_count)
+        return self._walk.get_action(obs, step_count, turn_bias=turn_bias)
 
 
 def project_labels(env, robot_pos, robot_yaw):
@@ -236,28 +328,126 @@ def project_labels(env, robot_pos, robot_yaw):
     return labels, visible, found
 
 
+def split_train_val(output_dir: str, train_count: int, val_count: int, seed: int = 42):
+    """将 _staging 中的图片随机划分为 train / val"""
+    root = Path(output_dir)
+    staging_img = root / "images" / "_staging"
+    staging_lbl = root / "labels" / "_staging"
+    dirs = {
+        "train_img": root / "images" / "train",
+        "val_img": root / "images" / "val",
+        "train_lbl": root / "labels" / "train",
+        "val_lbl": root / "labels" / "val",
+    }
+    for d in dirs.values():
+        d.mkdir(parents=True, exist_ok=True)
+        for old in d.glob("*"):
+            if old.is_file():
+                old.unlink()
+
+    pairs = []
+    for img in sorted(staging_img.glob("*.png")):
+        lbl = staging_lbl / f"{img.stem}.txt"
+        if lbl.is_file():
+            pairs.append((img, lbl))
+
+    total = len(pairs)
+    if total == 0:
+        print("  WARN: no images in _staging to split", flush=True)
+        return 0, 0
+
+    rng = random.Random(seed)
+    rng.shuffle(pairs)
+
+    n_val = min(val_count, total)
+    n_train = min(train_count, total - n_val)
+    val_pairs = pairs[:n_val]
+    train_pairs = pairs[n_val:n_val + n_train]
+
+    for img, lbl in train_pairs:
+        shutil.move(str(img), str(dirs["train_img"] / img.name))
+        shutil.move(str(lbl), str(dirs["train_lbl"] / lbl.name))
+    for img, lbl in val_pairs:
+        shutil.move(str(img), str(dirs["val_img"] / img.name))
+        shutil.move(str(lbl), str(dirs["val_lbl"] / lbl.name))
+
+    for staging in (staging_img, staging_lbl):
+        try:
+            staging.rmdir()
+        except OSError:
+            pass
+
+    print(f"  Split: train={len(train_pairs)}  val={len(val_pairs)}  "
+          f"(total collected={total}, seed={seed})", flush=True)
+    return len(train_pairs), len(val_pairs)
+
+
+def write_dataset_yaml(output_dir: str):
+    yaml_path = os.path.join(output_dir, "dataset.yaml")
+    with open(yaml_path, "w", encoding="utf-8") as f:
+        f.write(f"""# Auto-generated by collect_real_data.py
+path: {os.path.abspath(output_dir)}
+train: images/train
+val: images/val
+nc: 3
+names:
+  0: sugar_box
+  1: mustard_bottle
+  2: banana
+""")
+    return yaml_path
+
+
+def try_save_frame(img_dir, lbl_dir, rgb_np, labels, visible_count, collected, num_images):
+    if visible_count < 1:
+        return collected, False
+
+    fname = f"render_{collected:06d}"
+    cv2.imwrite(
+        os.path.join(img_dir, f"{fname}.png"),
+        cv2.cvtColor(rgb_np, cv2.COLOR_RGB2BGR),
+    )
+    with open(os.path.join(lbl_dir, f"{fname}.txt"), "w") as f:
+        f.write("\n".join(labels) + "\n")
+
+    collected += 1
+    print(f"  [{collected}/{num_images}] {fname}.png — {visible_count} labels", flush=True)
+    return collected, True
+
+
 def main():
     num_images = args_cli.num_images
     output_dir = args_cli.output
     save_every = args_cli.save_every
     min_visible = args_cli.min_visible
+    mode = args_cli.mode
     sim_device = getattr(args_cli, "device", None) or (
         "cuda:0" if torch.cuda.is_available() else "cpu")
     use_gui = not getattr(args_cli, "headless", False)
 
-    img_dir = os.path.join(output_dir, "images", "train")
-    lbl_dir = os.path.join(output_dir, "labels", "train")
+    if mode == "manual" and not use_gui:
+        print("ERROR: --mode manual requires GUI (do not use --headless)", flush=True)
+        sys.exit(1)
+
+    img_dir = os.path.join(output_dir, "images", "_staging")
+    lbl_dir = os.path.join(output_dir, "labels", "_staging")
     os.makedirs(img_dir, exist_ok=True)
     os.makedirs(lbl_dir, exist_ok=True)
 
+    train_n = args_cli.train_count
+    val_n = args_cli.val_count
+    if train_n + val_n != num_images:
+        print(f"  NOTE: train({train_n})+val({val_n}) != num_images({num_images}), "
+              f"will split best-effort after collection", flush=True)
+
     print("=" * 70, flush=True)
-    print("  ATEC Task B — Real Data Collector (walk + save)", flush=True)
-    print(f"  Target: {num_images} frames, save every {save_every} steps", flush=True)
-    print(f"  min_visible={min_visible}  (0=save all RGB, 1+=need labels)", flush=True)
-    print(f"  Output: {os.path.abspath(output_dir)}", flush=True)
-    print(f"  GUI follow cam: {'yes' if use_gui and camera_follow else 'no (headless)'}",
+    print("  ATEC Task B — Real Data Collector", flush=True)
+    print(f"  Mode: {mode}  |  target={num_images}  ->  train={train_n}  val={val_n}",
           flush=True)
-    print("=" * 70, flush=True)
+    print(f"  min_visible={min_visible}  (only save frames with objects)", flush=True)
+    print(f"  Output: {os.path.abspath(output_dir)}", flush=True)
+    if mode == "manual":
+        print_manual_help()
 
     env_cfg = parse_env_cfg(
         args_cli.task, device=sim_device, num_envs=1,
@@ -268,17 +458,25 @@ def main():
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
 
-    walk = SimpleWalkController(sim_device, args_cli.policy, args_cli.forward_speed)
+    if mode == "manual":
+        controller = ManualKeyboardController(
+            sim_device, args_cli.policy, args_cli.forward_speed)
+        walk = None
+    else:
+        controller = None
+        walk = SimpleWalkController(
+            sim_device, args_cli.policy, args_cli.forward_speed,
+            force_rl=(mode == "rl"))
 
     collected = 0
-    labeled = 0
     step_count = 0
+    skipped_empty = 0
     episode = 0
-    max_steps_per_ep = 3000
 
     while collected < num_images:
         episode += 1
-        print(f"\n[Episode {episode}] reset...", flush=True)
+        print(f"\n[Episode {episode}] reset...  (collected {collected}/{num_images})",
+              flush=True)
         obs, _ = env.reset()
 
         for _ in range(20):
@@ -288,19 +486,22 @@ def main():
             if use_gui and camera_follow:
                 camera_follow(env)
 
-        diag_once = True
-        for _ in range(max_steps_per_ep):
-            if collected >= num_images:
-                break
+        while collected < num_images:
+            if mode == "manual":
+                action = controller.get_action(obs, step_count)
+            else:
+                action = walk.get_action(obs, step_count)
 
-            action = walk.get_action(obs, step_count)
             obs, _, terminated, truncated, _ = env.step(action)
             step_count += 1
 
             if use_gui and camera_follow:
                 camera_follow(env)
 
-            if step_count % save_every != 0:
+            # 检查是否该尝试保存
+            periodic = (step_count % save_every == 0)
+            space_snap = mode == "manual" and controller.snap_now
+            if not (periodic or space_snap):
                 if terminated or truncated:
                     break
                 continue
@@ -308,8 +509,6 @@ def main():
             try:
                 rgb = obs["image"]["head_rgb"].squeeze(0)
             except (KeyError, TypeError):
-                if step_count % 100 == 0:
-                    print("  WARN: head_rgb missing — need --enable_cameras", flush=True)
                 continue
 
             rgb_np = (rgb.cpu() if rgb.device.type == "cuda" else rgb).numpy().astype(np.uint8)
@@ -325,68 +524,45 @@ def main():
             labels, visible_count, objects_found = project_labels(
                 env, robot_pos, robot_yaw)
 
-            if diag_once:
-                print(f"  [DIAG] objects={objects_found}/18  visible={visible_count}  "
-                      f"pos={robot_pos[:2]}  yaw={robot_yaw:.2f}  walk={walk.mode}",
-                      flush=True)
-                diag_once = False
-
             if visible_count < min_visible:
-                if step_count % 100 == 0:
-                    print(f"  [Step {step_count}] visible={visible_count} "
-                          f"(need>={min_visible}), robot moving...", flush=True)
+                skipped_empty += 1
+                if space_snap:
+                    print(f"  [SPACE] no objects in view (visible=0), not saved",
+                          flush=True)
+                elif step_count % 100 == 0:
+                    print(f"  [Step {step_count}] visible=0, move to find objects "
+                          f"(skipped {skipped_empty} empty checks)", flush=True)
                 if terminated or truncated:
                     break
                 continue
 
-            fname = f"render_{collected:06d}"
-            cv2.imwrite(
-                os.path.join(img_dir, f"{fname}.png"),
-                cv2.cvtColor(rgb_np, cv2.COLOR_RGB2BGR),
-            )
-            with open(os.path.join(lbl_dir, f"{fname}.txt"), "w") as f:
-                if labels:
-                    f.write("\n".join(labels) + "\n")
-
-            collected += 1
-            if visible_count > 0:
-                labeled += 1
-            tag = f"{visible_count} labels" if visible_count else "RGB only"
-            print(f"  [{collected}/{num_images}] {fname}.png — {tag}", flush=True)
+            collected, saved = try_save_frame(
+                img_dir, lbl_dir, rgb_np, labels, visible_count, collected, num_images)
+            if not saved:
+                if terminated or truncated:
+                    break
+                continue
 
             if terminated or truncated:
                 break
 
     env.close()
 
-    yaml_path = os.path.join(output_dir, "dataset.yaml")
-    with open(yaml_path, "w") as f:
-        f.write(f"""# Auto-generated by collect_real_data.py
-path: {os.path.abspath(output_dir)}
-train: images/train
-nc: 3
-names:
-  0: sugar_box
-  1: mustard_bottle
-  2: banana
-""")
+    print("\n  Splitting into train / val ...", flush=True)
+    n_train, n_val = split_train_val(
+        output_dir, train_n, val_n, seed=args_cli.split_seed)
+    yaml_path = write_dataset_yaml(output_dir)
 
     print("\n" + "=" * 70, flush=True)
-    print(f"  Done: {collected} images ({labeled} with labels)", flush=True)
-    print(f"  Images: {img_dir}", flush=True)
-    print(f"  Labels: {lbl_dir}", flush=True)
+    print(f"  Done: collected {collected}  ->  train {n_train}  val {n_val}", flush=True)
+    print(f"  Skipped empty checks: {skipped_empty}", flush=True)
     print(f"  Config: {yaml_path}", flush=True)
-    if labeled == 0 and collected > 0:
-        print("\n  TIP: got RGB but no labels — try:", flush=True)
-        print("    1. Copy demo/policy.pt here for RL walk", flush=True)
-        print("    2. Run without --headless to verify robot moves", flush=True)
-        print("    3. Train on labeled subset after more collection", flush=True)
-    elif collected > 0:
-        print("\n  Next:", flush=True)
-        print("    1. Copy datasets/real back to your PC", flush=True)
-        print("    2. Check labels:  cd taskb_perception && python preview_labels.py --data ../datasets/real",
-              flush=True)
-        print("    3. Train YOLO:     python train_yolo.py", flush=True)
+    print(f"  Preview train: python taskb_perception/preview_labels.py "
+          f"--data {output_dir} --split train", flush=True)
+    print(f"  Preview val:   python taskb_perception/preview_labels.py "
+          f"--data {output_dir} --split val", flush=True)
+    print(f"  Train YOLO:    cd taskb_perception && "
+          f"python train_yolo.py --data ../{output_dir}/dataset.yaml", flush=True)
     print("=" * 70, flush=True)
 
 
