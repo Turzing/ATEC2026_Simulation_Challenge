@@ -63,21 +63,23 @@ CAMERA_CFG = {
         "ground_k": 13,
         "sat_extra": 10,
         "sat_relax": 10,
-        "sat_relax_very_near": 24,
-        "val_relax_very_near": 28,
-        "min_area": 22,
+        "sat_relax_very_near": 16,
+        "val_relax_very_near": 18,
+        "min_area": 24,
         "min_side": 5,
         "mask_close_k": 7,
         "fusion_mode": "head_grasp",
         "depth_min": 0.14,
         "depth_max_near": 2.25,
-        "val_refine_p": 28,
-        "min_blob_sat": 36,
-        "min_blob_val": 56,
-        "min_relief_med": 0.0,
-        "max_shadow_area": 2200,
-        "max_depth_std": 0.095,
-        "min_track_hits": 1,
+        "val_refine_p": 32,
+        "min_blob_sat": 42,
+        "min_blob_val": 62,
+        "min_relief_med": 0.007,
+        "max_shadow_area": 1500,
+        "max_depth_std": 0.088,
+        "min_track_hits": 2,
+        "near_strong_sat": 44,
+        "near_strong_val": 64,
     },
     "ee": {
         "cam": EE_CAM,
@@ -294,15 +296,15 @@ class RgbdPureCamera:
                 vn = valid & (depth < VERY_NEAR_DEPTH_M)
                 rs = int(c.get("sat_relax_very_near", 24))
                 rv = int(c.get("val_relax_very_near", 28))
-                sat_vn = max(22, sat_thr - rs)
-                val_vn = max(38, val_lo - rv)
+                sat_vn = max(30, sat_thr - rs)
+                val_vn = max(50, val_lo - rv)
                 vn_y = (
                     vn & roi
                     & (hue >= HEAD_HUE_LO) & (hue <= HEAD_HUE_HI)
                     & (sat >= sat_vn) & (val >= val_vn)
                 )
                 fg = fg | vn_y
-            shadow = (val < 68) & (sat < 36)
+            shadow = (val < 72) & (sat < 42)
             fg = fg & ~shadow
         else:
             sat_lo = max(16, sat_thr - relax)
@@ -346,11 +348,11 @@ class RgbdPureCamera:
         if mode == "head_grasp":
             dmin = float(c.get("depth_min", DEPTH_MIN))
             dmax_near = float(c.get("depth_max_near", 2.25))
+            has_cue = depth_fg | closer | (valid & (relief >= rmin * 0.38))
             if near:
-                # 近距: 物体占满画面时 relief/closer 会失效, 只要求合法深度
-                return valid & (depth > dmin) & (depth < dmax_near)
-            obj_depth = depth_fg | closer | (valid & (relief >= rmin * 0.35))
-            return valid & obj_depth & (depth > dmin) & (depth < DEPTH_MAX)
+                # 近距: 有 depth 线索的像素优先; 纯 RGB 兜底在 _build_fusion_mask 里单独加
+                return valid & (depth > dmin) & (depth < dmax_near) & has_cue
+            return valid & has_cue & (depth > dmin) & (depth < DEPTH_MAX)
 
         if mode in ("head_strict", "head_balanced"):
             soft = 0.65 if mode == "head_strict" else 0.42
@@ -411,13 +413,16 @@ class RgbdPureCamera:
         fused = (rgb_fg & depth_ok).astype(np.uint8)
 
         if self.camera_name == "head" and near:
-            strip = self._bottom_strip_roi(h, w)
-            strip_y = (
-                strip & valid
-                & (hue >= HEAD_HUE_LO) & (hue <= HEAD_HUE_HI)
-                & (sat >= 20) & (val >= 38)
+            # 极近真物体: relief 失效时, 仅高饱和亮黄 + 合法深度 (影子 sat/val 偏低)
+            ss = int(c.get("near_strong_sat", 44))
+            sv = int(c.get("near_strong_val", 64))
+            strong = (
+                (hue >= HEAD_HUE_LO) & (hue <= HEAD_HUE_HI)
+                & (sat >= ss) & (val >= sv)
             )
-            fused = cv2.bitwise_or(fused, strip_y.astype(np.uint8))
+            very_near = valid & (depth < VERY_NEAR_DEPTH_M) & (depth > self._depth_min())
+            near_fb = (rgb_fg & very_near & strong).astype(np.uint8)
+            fused = cv2.bitwise_or(fused, near_fb)
 
         ck = int(c.get("mask_close_k", 5))
         fused = self._close_components(fused, ck)
@@ -503,19 +508,24 @@ class RgbdPureCamera:
                 area, bw, bh, aspect, cy, mean_v, mean_s, mean_r, img_frac, h, w,
             )
 
-        # head: 真黄物体优先保留; 只剔大块机身影
-        if mean_s >= 48 and mean_v >= 72:
+        # head: sat+val+relief 联合判影子 (不靠面积一刀切)
+        obj_score = mean_s * 0.55 + mean_v * 0.25 + mean_r * 1200.0
+        if obj_score >= 62.0 and mean_s >= 46 and mean_v >= 68:
             return False
-        if area < 520:
+        if area < 160 and mean_s >= 40 and mean_v >= 62 and mean_r >= 0.006:
             return False
 
-        if mean_v < 62 and mean_s < 40:
+        if mean_r < 0.007 and mean_v < 84:
             return True
-        if area > int(self._cfg.get("max_shadow_area", 2200)) and mean_r < 0.010:
+        if mean_r < 0.009 and mean_s < 44:
             return True
-        if area > 1400 and aspect > 2.2 and mean_v < 88 and mean_s < 46:
+        if mean_r < 0.010 and area > 240 and aspect > 1.45 and mean_v < 90:
             return True
-        if cy > h * 0.50 and area > 1200 and aspect > 2.4 and mean_v < 90 and mean_s < 44:
+        if cy > h * 0.46 and mean_r < 0.011 and aspect > 1.65 and area > 200:
+            return True
+        if area > int(self._cfg.get("max_shadow_area", 1500)) and mean_r < 0.011:
+            return True
+        if area > 900 and aspect > 2.0 and mean_r < 0.012 and mean_s < 48:
             return True
         return False
 
@@ -652,8 +662,15 @@ class RgbdPureCamera:
         sm = float(np.mean(sat[ys, xs])) if sat is not None else 64.0
         if sm < self._cfg.get("min_blob_sat", MIN_BLOB_SAT_MEAN):
             return None
-        if self.camera_name == "head" and vm < self._cfg.get("min_blob_val", 78):
+        if self.camera_name == "head" and vm < self._cfg.get("min_blob_val", 62):
             return None
+        if relief is not None and self.camera_name == "head":
+            rm = float(np.median(relief[ys, xs]))
+            rmin_med = float(self._cfg.get("min_relief_med", 0.007))
+            if rm < rmin_med and vm < 86 and sm < 50:
+                return None
+            if rm < rmin_med * 1.4 and len(ys) > 380 and vm < 82:
+                return None
         if relief is not None and self.camera_name == "ee":
             rm = float(np.median(relief[ys, xs]))
             rmin_med = float(self._cfg.get("min_relief_med", 0.006))
@@ -739,7 +756,7 @@ class RgbdPureCamera:
         mask = (
             strip & valid
             & (hue >= HEAD_HUE_LO) & (hue <= HEAD_HUE_HI)
-            & (sat >= 18) & (val >= 36)
+            & (sat >= 32) & (val >= 52)
         ).astype(np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
         self._debug["bottom_strip"] = mask * 255

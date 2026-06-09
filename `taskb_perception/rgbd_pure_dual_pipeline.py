@@ -83,7 +83,7 @@ def _obj_dist(obj: Optional[dict]) -> float:
 
 
 def _best_head_grasp_target(objs: List[dict]) -> Optional[dict]:
-    """head 抓取: 优先高饱和真物体, 剔除影子大块后选最近"""
+    """head 抓取: 优先高饱和真物体, 影子块降权/跳过"""
     if not objs:
         return None
     scored = []
@@ -91,8 +91,14 @@ def _best_head_grasp_target(objs: List[dict]) -> Optional[dict]:
         sm = float(o.get("blob_sat_mean", 0))
         vm = float(o.get("blob_val_mean", 0))
         area = int((o["bbox"][2] - o["bbox"][0] + 1) * (o["bbox"][3] - o["bbox"][1] + 1))
+        if sm < 42 and vm < 68:
+            continue
+        if area > 900 and sm < 48 and vm < 82:
+            continue
         q = sm * 0.6 + vm * 0.25 - min(area, 4000) * 0.004
         scored.append((q, o))
+    if not scored:
+        return None
     scored.sort(key=lambda x: (-x[0], _obj_dist(x[1])))
     return scored[0][1]
 
