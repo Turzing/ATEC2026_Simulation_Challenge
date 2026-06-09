@@ -20,7 +20,7 @@ parser.add_argument("--task", type=str, default="ATEC-TaskB-B2Piper")
 parser.add_argument("--out", type=str, default="../datasets/rgbd_dual_debug")
 parser.add_argument("--live", action="store_true", default=True)
 parser.add_argument("--no-live", action="store_false", dest="live")
-parser.add_argument("--preview_every", type=int, default=3)
+parser.add_argument("--preview_every", type=int, default=6)
 parser.add_argument("--sat-min", type=int, default=None)
 parser.add_argument("--policy", type=str, default="")
 AppLauncher.add_app_launcher_args(parser)
@@ -48,7 +48,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import rgbd_detect_pipeline as rdp
 from rgbd_dual_pipeline import GRASP_PHASE_DEPTH_M, RgbdDualPipeline
 from rgbd_utils import depth_to_vis, format_stats_line, parse_ee_rgbd, parse_head_rgbd
-from test_rgbd_detect import CLASS_COLORS_BGR, ManualKeyboard, draw_panel, resolve_policy
+from sim_test_common import CLASS_COLORS_BGR, ManualKeyboard, draw_panel, resolve_policy
 
 if args_cli.sat_min is not None:
     rdp.SAT_MIN_ABSOLUTE = args_cli.sat_min
@@ -133,9 +133,10 @@ def main():
 
     device = env.unwrapped.device
     pipeline = RgbdDualPipeline()
-    kb = ManualKeyboard(device, resolve_policy())
+    kb = ManualKeyboard(device, resolve_policy(_root, args_cli.policy))
 
-    print("\n=== head=NAV  ee=GRASP  (parallel, no fusion) ===\n", flush=True)
+    print("\n=== head=NAV  ee=GRASP  (parallel, no fusion) ===", flush=True)
+    print("  (若仍慢: --preview_every 10 或 --no-live)\n", flush=True)
 
     obs, _ = env.reset()
     for _ in range(20):
