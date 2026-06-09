@@ -174,11 +174,16 @@ TOTAL_OBJECTS = 18  # 3 类 × 6 个
 # 物体物理尺寸 (基于 YCB 实物 + Isaac Lab USD 模型尺度)
 # 单位: 米, 用于抓取规划去夹爪开合控制
 # =============================================================================
+# YCB 实物尺寸 (米), 与 task_b USD 模型 1:1 尺度; 用于自动标注 bbox
+# 旧值偏大 ~2x, 会导致框明显套不准
 OBJECT_SIZES = {
-    "sugar_box":       {"lx": 0.21, "ly": 0.12, "lz": 0.07},   # 扁盒
-    "mustard_bottle":  {"lx": 0.22, "ly": 0.09, "lz": 0.05},   # 细瓶
-    "banana":          {"lx": 0.20, "ly": 0.04, "lz": 0.04},   # 细长
+    "sugar_box":       {"lx": 0.175, "ly": 0.098, "lz": 0.039},   # 004_sugar_box
+    "mustard_bottle":  {"lx": 0.189, "ly": 0.082, "lz": 0.057},   # 006_mustard_bottle
+    "banana":          {"lx": 0.195, "ly": 0.040, "lz": 0.040},   # 011_banana
 }
+
+# 自动标注在投影框外再留一点边 (YOLO 训练更稳)
+LABEL_BBOX_MARGIN = 1.12
 
 # 默认尺寸（未知物体回退）
 DEFAULT_OBJECT_SIZE = {"lx": 0.15, "ly": 0.10, "lz": 0.10}
