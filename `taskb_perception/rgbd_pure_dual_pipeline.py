@@ -97,17 +97,32 @@ def _best_head_grasp_target(objs: List[dict]) -> Optional[dict]:
     return scored[0][1]
 
 
+def _nav_quality(obj: dict) -> float:
+    """EE 导航打分: 小物体、高饱和优先, 大块低饱和降权 (垃圾箱影)"""
+    sm = float(obj.get("blob_sat_mean", 50))
+    vm = float(obj.get("blob_val_mean", 90))
+    area = int((obj["bbox"][2] - obj["bbox"][0] + 1) * (obj["bbox"][3] - obj["bbox"][1] + 1))
+    q = sm * 0.5 + vm * 0.2 - min(area, 3500) * 0.003
+    if area > 1200 and sm < 50:
+        q -= 80.0
+    return q
+
+
 def _best_nav_target(objs: List[dict]) -> Optional[dict]:
-    """EE 导航: 最近目标; 深度接近时取 conf 更高"""
+    """EE 导航: 近 + 质量高; 深度接近时优先真小物体"""
     if not objs:
         return None
-    ranked = sorted(objs, key=_obj_dist)
+    ranked = sorted(objs, key=lambda o: (_obj_dist(o), -_nav_quality(o)))
     best = ranked[0]
     bd = _obj_dist(best)
+    bq = _nav_quality(best)
     for o in ranked[1:]:
-        if _obj_dist(o) - bd > 0.30:
+        if _obj_dist(o) - bd > 0.35:
             break
-        if float(o.get("conf", 0)) > float(best.get("conf", 0)) + 0.08:
+        oq = _nav_quality(o)
+        if oq > bq + 12.0 and _obj_dist(o) < bd + 0.55:
+            best, bq = o, oq
+        elif float(o.get("conf", 0)) > float(best.get("conf", 0)) + 0.10 and _obj_dist(o) < bd + 0.25:
             best = o
     return best
 
