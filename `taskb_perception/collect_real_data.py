@@ -106,17 +106,25 @@ class_id_to_size = _proj.class_id_to_size
 
 
 def get_head_camera_pose(env):
-    """从仿真 head_camera 读取世界位姿 (w,x,y,z)"""
+    """从仿真 head_camera 读取世界位姿。
+
+    必须用 quat_w_ros（+Z 朝前），不能用 quat_w_world（+X 朝前），
+    否则针孔投影会全部落在画面外 → visible=0。
+    """
     cam = env.unwrapped.scene["head_camera"]
     cam_pos_w = cam.data.pos_w[0].cpu().numpy()
-    quat = None
-    for attr in ("quat_w_world", "quat_w_ros", "quat_w"):
-        if hasattr(cam.data, attr):
-            quat = getattr(cam.data, attr)[0].cpu().numpy()
-            break
-    if quat is None:
-        raise AttributeError("head_camera quat not found on sensor data")
-    return cam_pos_w, quat
+    if hasattr(cam.data, "quat_w_ros"):
+        cam_quat = cam.data.quat_w_ros[0].cpu().numpy()
+    elif hasattr(cam.data, "quat_w_world"):
+        cam_quat = cam.data.quat_w_world[0].cpu().numpy()
+        print("  [WARN] quat_w_ros unavailable, projection may be wrong", flush=True)
+    else:
+        cam_quat = cam.data.quat_w[0].cpu().numpy()
+
+    cam_matrix = HEAD_CAM_MATRIX
+    if getattr(cam.data, "intrinsic_matrices", None) is not None:
+        cam_matrix = cam.data.intrinsic_matrices[0].cpu().numpy()
+    return cam_pos_w, cam_quat, cam_matrix
 
 
 def obj_to_class(obj_index: int) -> int:
@@ -318,43 +326,67 @@ class ManualKeyboardController:
         return self._walk.get_action(obs, step_count, turn_bias=turn_bias)
 
 
+def _project_one_object(obj_pos, obj_quat, size_3d, use_cam_pose, cam_pos_w, cam_quat_w,
+                        cam_matrix, robot_pos, robot_yaw):
+    if use_cam_pose:
+        return compute_bbox_3d_cam_pose(
+            obj_pos, obj_quat, size_3d, cam_pos_w, cam_quat_w, cam_matrix,
+        )
+    return _proj.compute_bbox_3d(
+        obj_pos, size_3d, robot_pos, robot_yaw,
+        cam_matrix, HEAD_CAM_POS_ROBOT, HEAD_CAM_ROT_MATRIX_INV,
+        obj_quat_wxyz=obj_quat,
+    )
+
+
 def project_labels(env, robot_pos, robot_yaw):
     """用仿真 head_camera 真实位姿 + 物体姿态投影 YOLO 框"""
-    labels = []
-    visible = 0
-    found = 0
-    try:
-        cam_pos_w, cam_quat_w = get_head_camera_pose(env)
-        use_cam_pose = True
-    except (AttributeError, KeyError, TypeError):
-        use_cam_pose = False
-        cam_pos_w, cam_quat_w = None, None
-
+    objects = []
     for obj_idx in range(1, 19):
         try:
             obj = env.unwrapped.scene[f"object_{obj_idx}"]
-            obj_pos = obj.data.root_pos_w[0].cpu().numpy()
-            obj_quat = obj.data.root_quat_w[0].cpu().numpy()
-            found += 1
+            objects.append((
+                obj_idx,
+                obj.data.root_pos_w[0].cpu().numpy(),
+                obj.data.root_quat_w[0].cpu().numpy(),
+            ))
         except (AttributeError, KeyError):
             continue
 
-        cid = obj_to_class(obj_idx)
-        size_3d = class_id_to_size(cid)
-        if use_cam_pose:
-            bbox = compute_bbox_3d_cam_pose(
-                obj_pos, obj_quat, size_3d, cam_pos_w, cam_quat_w, HEAD_CAM_MATRIX,
+    found = len(objects)
+    if found == 0:
+        return [], 0, 0
+
+    use_cam_pose = False
+    cam_pos_w, cam_quat_w, cam_matrix = None, None, HEAD_CAM_MATRIX
+    try:
+        cam_pos_w, cam_quat_w, cam_matrix = get_head_camera_pose(env)
+        use_cam_pose = True
+    except (AttributeError, KeyError, TypeError):
+        pass
+
+    def _run(use_cam):
+        labels, visible = [], 0
+        for obj_idx, obj_pos, obj_quat in objects:
+            cid = obj_to_class(obj_idx)
+            size_3d = class_id_to_size(cid)
+            bbox = _project_one_object(
+                obj_pos, obj_quat, size_3d, use_cam,
+                cam_pos_w, cam_quat_w, cam_matrix, robot_pos, robot_yaw,
             )
-        else:
-            bbox = _proj.compute_bbox_3d(
-                obj_pos, size_3d, robot_pos, robot_yaw,
-                HEAD_CAM_MATRIX, HEAD_CAM_POS_ROBOT, HEAD_CAM_ROT_MATRIX_INV,
-                obj_quat_wxyz=obj_quat,
-            )
-        if bbox is None:
-            continue
-        visible += 1
-        labels.append(bbox_to_yolo_line(cid, bbox))
+            if bbox is None:
+                continue
+            visible += 1
+            labels.append(bbox_to_yolo_line(cid, bbox))
+        return labels, visible
+
+    labels, visible = _run(use_cam_pose)
+
+    # 相机四元数用错约定时 visible=0；回退到机器人基座近似外参
+    if use_cam_pose and visible == 0:
+        print("  [WARN] cam_pose projection visible=0, fallback to robot-base", flush=True)
+        labels, visible = _run(False)
+
     return labels, visible, found
 
 

@@ -106,7 +106,8 @@ def world_to_camera_pixel_cam_pose(
 ) -> Optional[Tuple[int, int]]:
     """
     世界坐标 → 像素，使用仿真 head_camera 的真实位姿 (推荐)。
-    cam_quat_w: Isaac Lab Camera.data.quat_w_world，(w,x,y,z)，ROS 光学系。
+    cam_quat_w: Isaac Lab Camera.data.quat_w_ros，(w,x,y,z)。
+    勿用 quat_w_world（+X 朝前），须用 ROS（+Z 朝前，与 OpenCV 针孔一致）。
     """
     p_world = np.asarray(point_world, dtype=np.float32).reshape(3)
     cam_pos = np.asarray(cam_pos_w, dtype=np.float32).reshape(3)
