@@ -19,12 +19,22 @@ import numpy as np
 from scipy import ndimage
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import ROBOT_INIT_POS, ROBOT_INIT_YAW, TOTAL_OBJECTS
+from config import (
+    ROBOT_INIT_POS,
+    ROBOT_INIT_YAW,
+    TOTAL_OBJECTS,
+    CLASS_NAME_TO_ID,
+    OBJECT_SIZES,
+    DEFAULT_OBJECT_SIZE,
+    HEAD_CAM_POS_ROBOT,
+    HEAD_CAM_ROT_MATRIX,
+)
 from rgbd_utils import (
     bbox_center_depth,
     depth_stats,
     median_depth_in_mask,
     parse_head_rgbd,
+    pixel_depth_to_cam,
     sanitize_depth,
 )
 
@@ -35,21 +45,33 @@ ROI_V_MIN = 0.12
 ROI_V_MAX = 0.76          # 裁掉最下 24% (机身/自身影)
 ROI_U_MARGIN = 0.05
 
-SAT_MIN_ABSOLUTE = 50
-SAT_ABOVE_GROUND = 25
-VAL_MIN = 58                # 像素亮度下限 (影子更暗)
-VAL_ABOVE_GROUND = 18       # 比地面亮多少
+SAT_MIN_ABSOLUTE = 48
+SAT_ABOVE_GROUND = 22
+VAL_MIN = 55
+VAL_ABOVE_GROUND = 15
 
-BLOB_VAL_MEAN_MIN = 74      # 整块平均亮度太低 → 当影子丢掉
-BLOB_VAL_REFINE_P = 42      # 簇内保留亮度前 58% 像素 (去掉拖影)
+# 远距离 (2m+) 物体更小、饱和度略低 → 单独放宽
+FAR_DEPTH_M = 2.0
+SAT_RELAX_FAR = 16          # 远距 sat 阈值降低
+VAL_RELAX_FAR = 10
+FAR_MASK_DILATE = 3         # 远距掩码略膨胀, 补小目标
+
+BLOB_VAL_MEAN_MIN_NEAR = 74
+BLOB_VAL_MEAN_MIN_FAR = 66
+BLOB_VAL_REFINE_P_NEAR = 42
+BLOB_VAL_REFINE_P_FAR = 28  # 远距少裁暗边, 避免整块没了
 
 BBOX_PAD_RATIO = 0.14
+BBOX_PAD_RATIO_FAR = 0.22   # 远距框多扩一点
 BBOX_PAD_PX = 12
-BBOX_DILATE_K = 5           # 算框前膨胀掩码
+BBOX_PAD_PX_FAR = 18
+BBOX_DILATE_K = 5
 
-MIN_BLOB_AREA = 80
+MIN_BLOB_AREA_NEAR = 80
+MIN_BLOB_AREA_FAR = 32      # 3~5m 可能只有几十个像素
 MAX_BLOB_AREA = 45000
-MIN_BLOB_SIDE = 8
+MIN_BLOB_SIDE_NEAR = 8
+MIN_BLOB_SIDE_FAR = 5
 MAX_BLOB_SIDE = 340
 MAX_DETECTIONS = 14
 
@@ -61,6 +83,15 @@ SPLIT_WIDTH_OVER_HEIGHT = 1.35
 TRACK_MATCH_PX = 90
 TRACK_MAX_AGE = 15
 MIN_TRACK_HITS = 1
+
+MIN_CLASS_MARGIN = 0.10
+GEOM_MATCH_SIGMA = 0.065     # 部分点云 + 立/倒 容差 (米)
+RATIO_MATCH_SIGMA = 0.35     # 三边比例匹配 (与姿态无关)
+MIN_3D_POINTS = 8
+
+# 立起/倒下后仍不变: 三边排序 + 比例 (e1/e0, e2/e1)
+# 糖盒 0.039/0.098/0.175  瓶 0.057/0.082/0.189  香蕉 0.04/0.04/0.195
+_CLASS_RATIO_TEMPLATES: Dict[str, Tuple[float, float]] = {}
 
 
 class Tracker2D:
@@ -102,6 +133,17 @@ class Tracker2D:
         return out
 
 
+def _build_ratio_templates() -> Dict[str, Tuple[float, float]]:
+    out = {}
+    for name in OBJECT_SIZES:
+        e = np.sort([OBJECT_SIZES[name]["lx"], OBJECT_SIZES[name]["ly"], OBJECT_SIZES[name]["lz"]])
+        out[name] = (float(e[1] / max(e[0], 1e-4)), float(e[2] / max(e[1], 1e-4)))
+    return out
+
+
+_CLASS_RATIO_TEMPLATES.update(_build_ratio_templates())
+
+
 class RgbdDetectPipeline:
     def __init__(self):
         self.tracker = Tracker2D()
@@ -111,7 +153,7 @@ class RgbdDetectPipeline:
         self._sat_thresh = 0.0
         self._sat_ground_ref = 0.0
         self._val_ground_ref = 0.0
-        print("[RgbdDetectPipeline] saturation + shadow filter + split + bbox expand")
+        print("[RgbdDetectPipeline] sat detect + 3D geom classify")
 
     def reset(self):
         self.tracker.reset()
@@ -151,13 +193,26 @@ class RgbdDetectPipeline:
         self._sat_ground_ref, self._val_ground_ref = self._ground_refs(sat, val, roi, h)
         self._sat_thresh = max(SAT_MIN_ABSOLUTE, self._sat_ground_ref + SAT_ABOVE_GROUND)
         val_thresh = max(VAL_MIN, self._val_ground_ref + VAL_ABOVE_GROUND)
+        sat_far = max(40, self._sat_thresh - SAT_RELAX_FAR)
+        val_far = max(48, val_thresh - VAL_RELAX_FAR)
 
-        sat_mask = (sat >= self._sat_thresh) & (val >= val_thresh) & roi & valid
+        near = depth < FAR_DEPTH_M
+        far = depth >= FAR_DEPTH_M
+
+        sat_near = (sat >= self._sat_thresh) & (val >= val_thresh) & near
+        sat_far_m = (sat >= sat_far) & (val >= val_far) & far
+        sat_mask = (sat_near | sat_far_m) & roi & valid
 
         detect = sat_mask.astype(np.uint8)
+        if FAR_MASK_DILATE > 0:
+            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (FAR_MASK_DILATE, FAR_MASK_DILATE))
+            far_u8 = (sat_far_m & roi & valid).astype(np.uint8)
+            far_u8 = cv2.dilate(far_u8, k, iterations=1)
+            detect = cv2.bitwise_or(detect, far_u8)
+
         detect = cv2.morphologyEx(detect, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-        # 用小 close, 避免两个物体粘成一个
         detect = cv2.morphologyEx(detect, cv2.MORPH_CLOSE, np.ones((4, 4), np.uint8))
+        self._sat_thresh_far = sat_far
 
         self._debug = {
             "saturation": sat,
@@ -168,10 +223,37 @@ class RgbdDetectPipeline:
         self._hsv_val = val
         return detect
 
-    def _is_shadow_blob(self, ys: np.ndarray, xs: np.ndarray, val: np.ndarray, h: int) -> bool:
+    def _blob_depth_m(self, ys: np.ndarray, xs: np.ndarray, depth: np.ndarray) -> Optional[float]:
+        d = depth[ys, xs]
+        d = d[(d > DEPTH_MIN) & (d < DEPTH_MAX)]
+        return float(np.median(d)) if len(d) >= 3 else None
+
+    def _adaptive_limits(self, depth_m: Optional[float]) -> dict:
+        if depth_m is None or depth_m < FAR_DEPTH_M:
+            return {
+                "min_area": MIN_BLOB_AREA_NEAR,
+                "min_side": MIN_BLOB_SIDE_NEAR,
+                "val_mean_min": BLOB_VAL_MEAN_MIN_NEAR,
+                "val_refine_p": BLOB_VAL_REFINE_P_NEAR,
+                "pad_ratio": BBOX_PAD_RATIO,
+                "pad_px": BBOX_PAD_PX,
+            }
+        t = min(1.0, max(0.0, (depth_m - FAR_DEPTH_M) / 3.0))
+        return {
+            "min_area": int(MIN_BLOB_AREA_NEAR + t * (MIN_BLOB_AREA_FAR - MIN_BLOB_AREA_NEAR)),
+            "min_side": MIN_BLOB_SIDE_FAR,
+            "val_mean_min": BLOB_VAL_MEAN_MIN_NEAR + t * (BLOB_VAL_MEAN_MIN_FAR - BLOB_VAL_MEAN_MIN_NEAR),
+            "val_refine_p": BLOB_VAL_REFINE_P_NEAR + t * (BLOB_VAL_REFINE_P_FAR - BLOB_VAL_REFINE_P_NEAR),
+            "pad_ratio": BBOX_PAD_RATIO + t * (BBOX_PAD_RATIO_FAR - BBOX_PAD_RATIO),
+            "pad_px": int(BBOX_PAD_PX + t * (BBOX_PAD_PX_FAR - BBOX_PAD_PX)),
+        }
+
+    def _is_shadow_blob(
+        self, ys: np.ndarray, xs: np.ndarray, val: np.ndarray, h: int, lim: dict,
+    ) -> bool:
         v = val[ys, xs]
         mean_v = float(np.mean(v))
-        if mean_v < BLOB_VAL_MEAN_MIN:
+        if mean_v < lim["val_mean_min"]:
             return True
         bw = int(xs.max() - xs.min() + 1)
         bh = int(ys.max() - ys.min() + 1)
@@ -184,25 +266,30 @@ class RgbdDetectPipeline:
             return True
         return False
 
-    def _refine_blob(self, ys: np.ndarray, xs: np.ndarray, val: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """去掉簇里偏暗的拖影像素"""
+    def _refine_blob(
+        self, ys: np.ndarray, xs: np.ndarray, val: np.ndarray, lim: dict,
+    ) -> Tuple[np.ndarray, np.ndarray]:
         v = val[ys, xs]
-        v_cut = max(VAL_MIN, float(np.percentile(v, BLOB_VAL_REFINE_P)))
+        v_cut = max(VAL_MIN, float(np.percentile(v, lim["val_refine_p"])))
         keep = v >= v_cut
-        if int(np.sum(keep)) < MIN_BLOB_AREA // 2:
+        if int(np.sum(keep)) < max(20, lim["min_area"] // 2):
             return ys, xs
         return ys[keep], xs[keep]
 
-    def _expand_bbox(self, x1: int, y1: int, x2: int, y2: int, h: int, w: int) -> List[int]:
+    def _expand_bbox(
+        self, x1: int, y1: int, x2: int, y2: int, h: int, w: int, lim: dict,
+    ) -> List[int]:
         bw, bh = x2 - x1 + 1, y2 - y1 + 1
-        px = max(BBOX_PAD_PX, int(bw * BBOX_PAD_RATIO))
-        py = max(BBOX_PAD_PX, int(bh * BBOX_PAD_RATIO))
+        px = max(lim["pad_px"], int(bw * lim["pad_ratio"]))
+        py = max(lim["pad_px"], int(bh * lim["pad_ratio"]))
         return [
             max(0, x1 - px), max(0, y1 - py),
             min(w - 1, x2 + px), min(h - 1, y2 + py),
         ]
 
-    def _bbox_from_mask(self, ys: np.ndarray, xs: np.ndarray, h: int, w: int) -> List[int]:
+    def _bbox_from_mask(
+        self, ys: np.ndarray, xs: np.ndarray, h: int, w: int, lim: dict,
+    ) -> List[int]:
         sub = np.zeros((h, w), dtype=np.uint8)
         sub[ys, xs] = 255
         k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (BBOX_DILATE_K, BBOX_DILATE_K))
@@ -212,7 +299,7 @@ class RgbdDetectPipeline:
             ys2, xs2 = ys, xs
         x1, x2 = int(xs2.min()), int(xs2.max())
         y1, y2 = int(ys2.min()), int(ys2.max())
-        return self._expand_bbox(x1, y1, x2, y2, h, w)
+        return self._expand_bbox(x1, y1, x2, y2, h, w, lim)
 
     def _watershed_split(
         self, ys: np.ndarray, xs: np.ndarray, rgb: np.ndarray, h: int, w: int,
@@ -248,40 +335,169 @@ class RgbdDetectPipeline:
         parts = []
         for mid in range(2, int(markers.max()) + 1):
             py, px = np.where(markers == mid)
-            if len(py) < MIN_BLOB_AREA:
+            if len(py) < MIN_BLOB_AREA_FAR:
                 continue
             parts.append((py + y1, px + x1))
         return parts if len(parts) >= 2 else [(ys, xs)]
 
+    def _blob_points_robot(self, ys: np.ndarray, xs: np.ndarray, depth: np.ndarray) -> Optional[np.ndarray]:
+        """掩码像素 + depth → 机器人系 3D 点云"""
+        pts = []
+        step = 1 if len(ys) < 400 else 2
+        for y, x in zip(ys[::step], xs[::step]):
+            z = float(depth[y, x])
+            if z <= DEPTH_MIN or z >= DEPTH_MAX:
+                continue
+            p_cam = pixel_depth_to_cam(float(x), float(y), z)
+            p_robot = HEAD_CAM_POS_ROBOT + HEAD_CAM_ROT_MATRIX @ p_cam
+            pts.append(p_robot)
+        if len(pts) < MIN_3D_POINTS:
+            return None
+        return np.stack(pts, axis=0).astype(np.float32)
+
+    @staticmethod
+    def _template_extents(name: str) -> np.ndarray:
+        s = OBJECT_SIZES[name]
+        return np.sort([s["lx"], s["ly"], s["lz"]]).astype(np.float32)
+
+    def _pca_sorted_extents(self, pts: np.ndarray) -> np.ndarray:
+        """
+        在点云主轴上量三边 (立/倒/侧放都不变).
+        机器人系 AABB 会随姿态变; PCA 范围与物体真实长宽高一致.
+        """
+        centered = pts - np.mean(pts, axis=0)
+        if len(centered) < MIN_3D_POINTS:
+            return np.sort(np.ptp(pts, axis=0)).astype(np.float32)
+        try:
+            _, _, Vt = np.linalg.svd(centered, full_matrices=False)
+            proj = centered @ Vt.T
+            ext = np.ptp(proj, axis=0)
+        except np.linalg.LinAlgError:
+            ext = np.ptp(pts, axis=0)
+        ext = np.maximum(ext, 1e-4)
+        return np.sort(ext).astype(np.float32)
+
+    @staticmethod
+    def _extent_ratios(ext: np.ndarray) -> Tuple[float, float, float]:
+        e0, e1, e2 = [float(v) for v in ext]
+        return e1 / max(e0, 1e-4), e2 / max(e1, 1e-4), e0 / max(e2, 1e-4)
+
+    def _score_3d_shape(self, ext: np.ndarray) -> Dict[str, float]:
+        """
+        立起/倒下: 用排序尺寸 + 三边比例 (不假设哪边是高度).
+        香蕉: e1/e0≈1 (截面两维接近); 糖盒: 三边比 1:2.5:4.5; 瓶: 中间
+        """
+        r10, r21, flat = self._extent_ratios(ext)
+        scores: Dict[str, float] = {}
+
+        for name in OBJECT_SIZES:
+            t_ext = self._template_extents(name)
+            d_ext = float(np.linalg.norm(ext - t_ext))
+            s_ext = float(np.exp(-(d_ext / GEOM_MATCH_SIGMA) ** 2))
+
+            tr10, tr21 = _CLASS_RATIO_TEMPLATES[name]
+            d_ratio = float(np.hypot(r10 - tr10, r21 - tr21))
+            s_ratio = float(np.exp(-(d_ratio / RATIO_MATCH_SIGMA) ** 2))
+
+            # 比例更稳 (姿态无关), 绝对尺寸辅助 (近距)
+            scores[name] = 0.38 * s_ext + 0.62 * s_ratio
+
+        # 香蕉: 最短两边很接近 (躺/立都一样)
+        if r10 < 1.18:
+            scores["banana"] *= 1.55
+            scores["sugar_box"] *= 0.75
+        # 糖盒: 扁 (最小/最大 小) 且 不是香蕉那种 e1≈e0
+        if flat < 0.26 and r10 > 1.35:
+            scores["sugar_box"] *= 1.45
+        # 瓶: 三边比例 1:1.4:2.3 附近, 且不是香蕉
+        if 1.25 < r10 < 1.65 and 1.9 < r21 < 2.8:
+            scores["mustard_bottle"] *= 1.40
+
+        total = sum(scores.values()) + 1e-6
+        return {k: v / total for k, v in scores.items()}
+
+    def _classify_blob_2d_fallback(self, bbox: List[int], depth: np.ndarray, ys, xs) -> Tuple[str, float]:
+        """3D 点不够时的备用"""
+        x1, y1, x2, y2 = bbox
+        bw, bh = max(1, x2 - x1 + 1), max(1, y2 - y1 + 1)
+        aspect = max(bw, bh) / min(bw, bh)
+        if aspect >= 2.0:
+            return "banana", 0.45
+        if aspect < 1.2:
+            return "mustard_bottle", 0.40
+        return "sugar_box", 0.40
+
+    def _classify_blob(
+        self,
+        ys: np.ndarray,
+        xs: np.ndarray,
+        bbox: List[int],
+        depth: np.ndarray,
+        rgb: np.ndarray,
+    ) -> Tuple[str, float, Optional[List[float]]]:
+        """
+        3D 分类: 点云 PCA 三边 + YCB 模板 (立/倒用比例, 不假设竖着)
+        """
+        pts = self._blob_points_robot(ys, xs, depth)
+        if pts is None:
+            name, conf = self._classify_blob_2d_fallback(bbox, depth, ys, xs)
+            return name, conf * 0.7, None
+
+        ext = self._pca_sorted_extents(pts)
+        if float(ext[2]) < 0.025:
+            name, conf = self._classify_blob_2d_fallback(bbox, depth, ys, xs)
+            return name, conf * 0.65, ext.tolist()
+
+        scores = self._score_3d_shape(ext)
+        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        best, s1 = ranked[0]
+        s2 = ranked[1][1]
+        margin = s1 - s2
+        cls_conf = float(min(0.94, 0.5 + margin * 1.2 + min(0.15, len(pts) / 200.0)))
+
+        if margin < MIN_CLASS_MARGIN:
+            return "unknown", cls_conf * 0.55, ext.tolist()
+        return best, cls_conf, ext.tolist()
+
     def _blob_to_det(
         self, ys: np.ndarray, xs: np.ndarray, depth: np.ndarray,
-        sat: np.ndarray, val: np.ndarray, h: int, w: int,
+        sat: np.ndarray, val: np.ndarray, rgb: np.ndarray, h: int, w: int,
     ) -> Optional[dict]:
-        if self._is_shadow_blob(ys, xs, val, h):
+        depth_m0 = self._blob_depth_m(ys, xs, depth)
+        lim = self._adaptive_limits(depth_m0)
+        if self._is_shadow_blob(ys, xs, val, h, lim):
             return None
-        ys, xs = self._refine_blob(ys, xs, val)
-        if len(ys) < MIN_BLOB_AREA:
+        ys, xs = self._refine_blob(ys, xs, val, lim)
+        if len(ys) < lim["min_area"]:
             return None
 
-        bbox = self._bbox_from_mask(ys, xs, h, w)
+        bbox = self._bbox_from_mask(ys, xs, h, w, lim)
         x1, y1, x2, y2 = bbox
         bw, bh = x2 - x1 + 1, y2 - y1 + 1
-        if min(bw, bh) < MIN_BLOB_SIDE or max(bw, bh) > MAX_BLOB_SIDE:
+        if min(bw, bh) < lim["min_side"] or max(bw, bh) > MAX_BLOB_SIDE:
             return None
 
         d_m = bbox_center_depth(depth, bbox, pad=2)
         cx, cy = float(np.mean(xs)), float(np.mean(ys))
         patch_sat = float(np.mean(sat[ys, xs]))
-        conf = float(min(0.97, 0.5 + (patch_sat - self._sat_thresh) / 120.0))
+        det_conf = float(min(0.97, 0.5 + (patch_sat - self._sat_thresh) / 120.0))
+
+        cls_name, cls_conf, geom_ext = self._classify_blob(ys, xs, bbox, depth, rgb)
+        conf = float(min(0.97, det_conf * 0.45 + cls_conf * 0.55))
+        size = OBJECT_SIZES.get(cls_name, DEFAULT_OBJECT_SIZE)
 
         return {
-            "class": "object",
+            "class": cls_name,
+            "class_id": CLASS_NAME_TO_ID.get(cls_name, -1),
             "conf": conf,
+            "class_conf": cls_conf,
             "bbox": bbox,
             "centroid": (cx, cy),
             "depth_m": d_m,
             "area": int(len(ys)),
-            "source": "saturation",
+            "geom_extents": geom_ext,
+            "size_world": [size["lx"], size["ly"], size["lz"]],
+            "source": "saturation+geom3d",
         }
 
     def detect(self, rgb: np.ndarray, depth: np.ndarray) -> List[dict]:
@@ -290,6 +506,7 @@ class RgbdDetectPipeline:
         mask = self.build_saturation_mask(rgb, depth)
         sat = self._debug["saturation"]
         val = self._hsv_val
+        self._last_rgb = rgb
 
         labeled, n = ndimage.label(mask > 0)
         if n == 0:
@@ -303,7 +520,7 @@ class RgbdDetectPipeline:
 
             parts = self._watershed_split(ys, xs, rgb, h, w)
             for pys, pxs in parts:
-                det = self._blob_to_det(pys, pxs, depth, sat, val, h, w)
+                det = self._blob_to_det(pys, pxs, depth, sat, val, rgb, h, w)
                 if det is not None:
                     dets.append(det)
 
@@ -321,6 +538,7 @@ class RgbdDetectPipeline:
     def get_sat_info(self) -> Dict[str, float]:
         return {
             "thresh": self._sat_thresh,
+            "thresh_far": getattr(self, "_sat_thresh_far", self._sat_thresh),
             "ground_ref": self._sat_ground_ref,
             "val_ground": self._val_ground_ref,
         }
@@ -337,14 +555,20 @@ class RgbdDetectPipeline:
 
         objects, target = [], None
         for t in confirmed:
+            cls_name = t.get("class", "unknown")
+            size = OBJECT_SIZES.get(cls_name, DEFAULT_OBJECT_SIZE)
             obj = {
                 "id": int(t["track_id"]),
-                "class": "object",
+                "class": cls_name,
+                "class_id": t.get("class_id", -1),
                 "conf": float(t["conf"]),
+                "class_conf": float(t.get("class_conf", 0.0)),
                 "bbox": t["bbox"],
                 "centroid_uv": list(t["centroid"]),
                 "depth_m": t.get("depth_m"),
                 "dist_to_robot": t.get("depth_m"),
+                "size_world": t.get("size_world", [size["lx"], size["ly"], size["lz"]]),
+                "geom_extents": t.get("geom_extents"),
                 "pos_world": None,
                 "grasp_pos_world": None,
                 "source": "saturation",
@@ -360,6 +584,7 @@ class RgbdDetectPipeline:
             "objects_remaining": [{"id": o["id"], "class": o["class"], "dist": o["depth_m"]} for o in objects],
             "depth_stats": self.get_depth_stats(),
             "sat_thresh": info["thresh"],
+            "sat_thresh_far": info.get("thresh_far", info["thresh"]),
             "sat_ground_ref": info["ground_ref"],
             "gripper": {"is_holding": False, "width": 0.04},
             "progress": {"total": TOTAL_OBJECTS, "inside_bin": 0, "remaining": TOTAL_OBJECTS},

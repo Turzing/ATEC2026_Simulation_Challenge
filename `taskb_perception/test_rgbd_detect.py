@@ -54,6 +54,13 @@ from rgbd_utils import depth_to_vis, format_stats_line
 if args_cli.sat_min is not None:
     rdp.SAT_MIN_ABSOLUTE = args_cli.sat_min
 
+CLASS_COLORS_BGR = {
+    "sugar_box": (0, 255, 255),
+    "mustard_bottle": (255, 0, 255),
+    "banana": (0, 255, 0),
+    "unknown": (180, 180, 180),
+}
+
 
 def resolve_policy():
     if args_cli.policy:
@@ -202,16 +209,27 @@ def draw_vis(rgb, out, pipeline, depth):
 
     for obj in out.get("objects_detailed", []):
         x1, y1, x2, y2 = map(int, obj["bbox"])
-        cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cls = obj.get("class", "object")
+        c = CLASS_COLORS_BGR.get(cls, (0, 255, 0))
+        cv2.rectangle(vis, (x1, y1), (x2, y2), c, 2)
         dm = obj.get("depth_m")
-        lab = f"ID{obj['id']}"
+        cc = obj.get("class_conf", 0.0)
+        lab = f"ID{obj['id']} {cls}"
+        if cls == "unknown":
+            lab += " ?"
+        lab += f" {cc:.2f}"
         if dm:
             lab += f" {dm:.2f}m"
-        cv2.putText(vis, lab, (x1, max(14, y1 - 4)), 0, 0.45, (0, 255, 0), 1)
+        cv2.putText(vis, lab, (x1, max(14, y1 - 4)), 0, 0.42, c, 1)
+        ext = obj.get("geom_extents")
+        if ext:
+            cv2.putText(vis, f"3D {ext[0]:.2f}/{ext[1]:.2f}/{ext[2]:.2f}",
+                        (x1, min(vis.shape[0] - 6, y2 + 14)), 0, 0.38, c, 1)
 
     st = out.get("depth_stats", {})
     cv2.putText(vis, f"objects={n}  {format_stats_line(st)}", (8, 22), 0, 0.5, (0, 255, 255), 1)
-    cv2.putText(vis, f"sat_thresh={out.get('sat_thresh', 0):.0f} ground_S={out.get('sat_ground_ref', 0):.0f}",
+    cv2.putText(vis,
+                f"sat={out.get('sat_thresh', 0):.0f}/{out.get('sat_thresh_far', 0):.0f} (near/far)",
                 (8, 44), 0, 0.42, (0, 255, 255), 1)
     cv2.putText(vis, "SATURATION detect | WASD P Q", (8, 66), 0, 0.4, (200, 200, 200), 1)
     return vis
