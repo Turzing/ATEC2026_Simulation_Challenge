@@ -26,9 +26,18 @@ from config import (
     CLASS_NAME_TO_ID,
     OBJECT_SIZES,
     DEFAULT_OBJECT_SIZE,
+    HEAD_CAM,
+    EE_CAM,
     HEAD_CAM_POS_ROBOT,
     HEAD_CAM_ROT_MATRIX,
+    EE_CAM_POS_ROBOT,
+    EE_CAM_ROT_MATRIX,
 )
+
+CAMERA_PROFILES = {
+    "head": {"cam": HEAD_CAM, "pos": HEAD_CAM_POS_ROBOT, "rot": HEAD_CAM_ROT_MATRIX},
+    "ee": {"cam": EE_CAM, "pos": EE_CAM_POS_ROBOT, "rot": EE_CAM_ROT_MATRIX},
+}
 from rgbd_utils import (
     bbox_center_depth,
     depth_stats,
@@ -44,6 +53,10 @@ DEPTH_MAX = 12.0
 ROI_V_MIN = 0.12
 ROI_V_MAX = 0.76          # 裁掉最下 24% (机身/自身影)
 ROI_U_MARGIN = 0.05
+# EE 手眼相机: 不裁下方机身, 视野跟手走
+EE_ROI_V_MIN = 0.04
+EE_ROI_V_MAX = 0.96
+EE_ROI_U_MARGIN = 0.04
 
 SAT_MIN_ABSOLUTE = 48
 SAT_ABOVE_GROUND = 22
@@ -87,20 +100,22 @@ SPLIT_WIDTH_OVER_HEIGHT = 1.85
 SPLIT_PEAK_MIN_SEP = 0.28
 SPLIT_DEPTH_DIFF_M = 0.22
 
-MASK_CLOSE_K = 13            # 填糖盒/香蕉空心环
+MASK_CLOSE_K = 11            # 填空心环 (按连通域 close, 不桥接两物)
 HUE_YELLOW_LO = 12           # OpenCV H 0-180
 HUE_YELLOW_HI = 50
 HUE_SAT_RELAX = 26           # 白标中心 sat 低, 靠 hue 补
 
-MERGE_LABEL_DIST_PX = 95
-MERGE_LABEL_DEPTH_M = 0.48
+MERGE_LABEL_DIST_PX = 62       # 太大把两瓶/两根蕉并成一个 mask
+MERGE_LABEL_DEPTH_M = 0.38
+MERGE_LABEL_MIN_AREA = 280     # 两大块不合并
 
 MERGE_IOU = 0.12
 MERGE_CENTER_PX = 85
 MERGE_DEPTH_M = 0.38
 
-FLAT_TOP_E0_M = 0.045        # 俯视时 PCA 前两维太薄 → 改 2D 分类
-FLAT_TOP_E1_M = 0.065
+FLAT_TOP_E0_M = 0.045        # 俯视 PCA 薄 → 2D; e1 略大但 e0 极薄也算
+FLAT_TOP_E1_M = 0.085
+SHALLOW_TOP_E0_M = 0.055       # 弯蕉俯视 0.04/0.14/0.18 仍走 2D
 DEPTH_POINT_TOL_NEAR = 0.09  # 点云剔地面
 DEPTH_POINT_TOL_FAR = 0.14
 
@@ -169,7 +184,14 @@ _CLASS_RATIO_TEMPLATES.update(_build_ratio_templates())
 
 
 class RgbdDetectPipeline:
-    def __init__(self):
+    def __init__(self, camera: str = "head"):
+        if camera not in CAMERA_PROFILES:
+            raise ValueError(f"camera must be one of {list(CAMERA_PROFILES)}")
+        prof = CAMERA_PROFILES[camera]
+        self.camera_name = camera
+        self._cam = prof["cam"]
+        self._cam_pos = prof["pos"]
+        self._cam_rot = prof["rot"]
         self.tracker = Tracker2D()
         self.frame_count = 0
         self._debug: Dict[str, np.ndarray] = {}
@@ -177,7 +199,7 @@ class RgbdDetectPipeline:
         self._sat_thresh = 0.0
         self._sat_ground_ref = 0.0
         self._val_ground_ref = 0.0
-        print("[RgbdDetectPipeline] sat detect + 3D geom classify")
+        print(f"[RgbdDetectPipeline] camera={camera} sat + 3D geom")
 
     def reset(self):
         self.tracker.reset()
@@ -185,8 +207,12 @@ class RgbdDetectPipeline:
         self._debug.clear()
 
     def _roi(self, h: int, w: int) -> np.ndarray:
-        u0, u1 = int(w * ROI_U_MARGIN), int(w * (1 - ROI_U_MARGIN))
-        v0, v1 = int(h * ROI_V_MIN), int(h * ROI_V_MAX)
+        if self.camera_name == "ee":
+            u0, u1 = int(w * EE_ROI_U_MARGIN), int(w * (1 - EE_ROI_U_MARGIN))
+            v0, v1 = int(h * EE_ROI_V_MIN), int(h * EE_ROI_V_MAX)
+        else:
+            u0, u1 = int(w * ROI_U_MARGIN), int(w * (1 - ROI_U_MARGIN))
+            v0, v1 = int(h * ROI_V_MIN), int(h * ROI_V_MAX)
         m = np.zeros((h, w), dtype=bool)
         m[v0:v1, u0:u1] = True
         return m
@@ -255,9 +281,7 @@ class RgbdDetectPipeline:
         far_u8 = cv2.morphologyEx(far_u8, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
         detect = cv2.bitwise_or(near_u8, far_u8)
 
-        # 大 close 填空心糖盒/香蕉环
-        k_fill = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (MASK_CLOSE_K, MASK_CLOSE_K))
-        detect = cv2.morphologyEx(detect, cv2.MORPH_CLOSE, k_fill)
+        detect = self._close_mask_per_component(detect)
         self._sat_thresh_far = sat_far
 
         self._debug = {
@@ -268,6 +292,19 @@ class RgbdDetectPipeline:
         self._depth_stats = depth_stats(depth)
         self._hsv_val = val
         return detect
+
+    def _close_mask_per_component(self, detect: np.ndarray) -> np.ndarray:
+        """每个连通域单独 close 填洞, 避免两瓶/两蕉被全局 close 粘成一块"""
+        labeled, n = ndimage.label(detect > 0)
+        if n == 0:
+            return detect
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (MASK_CLOSE_K, MASK_CLOSE_K))
+        out = np.zeros_like(detect)
+        for cid in range(1, n + 1):
+            comp = (labeled == cid).astype(np.uint8) * 255
+            comp = cv2.morphologyEx(comp, cv2.MORPH_CLOSE, k)
+            out = cv2.bitwise_or(out, comp)
+        return out
 
     def _blob_depth_m(self, ys: np.ndarray, xs: np.ndarray, depth: np.ndarray) -> Optional[float]:
         d = depth[ys, xs]
@@ -441,8 +478,8 @@ class RgbdDetectPipeline:
             z = float(depth[y, x])
             if z <= DEPTH_MIN or z >= DEPTH_MAX:
                 continue
-            p_cam = pixel_depth_to_cam(float(x), float(y), z)
-            p_robot = HEAD_CAM_POS_ROBOT + HEAD_CAM_ROT_MATRIX @ p_cam
+            p_cam = pixel_depth_to_cam(float(x), float(y), z, self._cam)
+            p_robot = self._cam_pos + self._cam_rot @ p_cam
             pts.append(p_robot)
         if len(pts) < MIN_3D_POINTS:
             return None
@@ -529,9 +566,13 @@ class RgbdDetectPipeline:
             return "mustard_bottle", conf
 
         # 躺蕉在图里是横长条
-        if horiz and aspect >= 1.28:
-            conf = float(min(0.84, 0.54 + 0.13 * (aspect - 1.28)))
+        if horiz and aspect >= 1.22:
+            conf = float(min(0.84, 0.54 + 0.13 * (aspect - 1.22)))
             return "banana", conf
+
+        # 弯蕉/斜蕉 bbox 近方, 但填充偏细长的仍判蕉
+        if aspect >= 1.12 and (horiz or bw >= bh * 0.92) and fill < 0.52:
+            return "banana", 0.58
 
         if aspect >= 1.72:
             return ("mustard_bottle", 0.64) if vert else ("banana", 0.66)
@@ -576,8 +617,10 @@ class RgbdDetectPipeline:
             return name_2d, conf_2d * 0.75, None
 
         ext = self._pca_sorted_extents(pts)
-        flat_top = float(ext[0]) < FLAT_TOP_E0_M and float(ext[1]) < FLAT_TOP_E1_M
-        if flat_top or float(ext[2]) < 0.025:
+        e0, e1, e2 = float(ext[0]), float(ext[1]), float(ext[2])
+        flat_top = e0 < FLAT_TOP_E0_M and e1 < FLAT_TOP_E1_M
+        shallow_top = e0 < SHALLOW_TOP_E0_M and e2 > 0.11
+        if flat_top or shallow_top or e2 < 0.025:
             return name_2d, conf_2d, ext.tolist()
 
         scores = self._score_3d_shape(ext)
@@ -591,8 +634,11 @@ class RgbdDetectPipeline:
             if conf_2d >= 0.50:
                 return name_2d, conf_2d * 0.88, ext.tolist()
             return "unknown", cls_conf * 0.55, ext.tolist()
-        if best != name_2d and conf_2d >= 0.62 and cls_conf < 0.62:
-            return name_2d, conf_2d * 0.9, ext.tolist()
+        if best != name_2d and conf_2d >= 0.55:
+            if name_2d == "banana" and cls_conf < 0.72:
+                return name_2d, conf_2d * 0.92, ext.tolist()
+            if conf_2d >= 0.62 and cls_conf < 0.68:
+                return name_2d, conf_2d * 0.9, ext.tolist()
         return best, cls_conf, ext.tolist()
 
     def _blob_to_det(
@@ -760,6 +806,8 @@ class RgbdDetectPipeline:
                     continue
                 if abs(a["depth"] - b["depth"]) > MERGE_LABEL_DEPTH_M:
                     continue
+                if a["area"] >= MERGE_LABEL_MIN_AREA and b["area"] >= MERGE_LABEL_MIN_AREA:
+                    continue
                 unite(a["id"], b["id"])
 
         remap = {k: find(k) for k in range(1, n + 1)}
@@ -827,50 +875,64 @@ class RgbdDetectPipeline:
             "val_ground": self._val_ground_ref,
         }
 
-    def process(self, obs, dt: float = 0.02) -> dict:
+    def _track_to_object(self, t: dict) -> dict:
+        cls_name = t.get("class", "unknown")
+        size = OBJECT_SIZES.get(cls_name, DEFAULT_OBJECT_SIZE)
+        return {
+            "id": int(t["track_id"]),
+            "class": cls_name,
+            "class_id": t.get("class_id", -1),
+            "conf": float(t["conf"]),
+            "class_conf": float(t.get("class_conf", 0.0)),
+            "bbox": t["bbox"],
+            "centroid_uv": list(t["centroid"]),
+            "depth_m": t.get("depth_m"),
+            "dist_to_robot": t.get("depth_m"),
+            "size_world": t.get("size_world", [size["lx"], size["ly"], size["lz"]]),
+            "geom_extents": t.get("geom_extents"),
+            "pos_world": None,
+            "grasp_pos_world": None,
+            "source": self.camera_name,
+        }
+
+    def process_frame(self, rgb: np.ndarray, depth: np.ndarray) -> Tuple[List[dict], Optional[dict], dict]:
+        """单相机一帧 → objects, target, meta"""
         self.frame_count += 1
-        rgb, depth = parse_head_rgbd(obs)
         raw = self.detect(rgb, depth)
         tracks = self.tracker.update(raw)
         confirmed = [
             t for t in tracks
             if self.tracker.tracks.get(t["track_id"], {}).get("hits", 0) >= MIN_TRACK_HITS
         ]
-
-        objects, target = [], None
-        for t in confirmed:
-            cls_name = t.get("class", "unknown")
-            size = OBJECT_SIZES.get(cls_name, DEFAULT_OBJECT_SIZE)
-            obj = {
-                "id": int(t["track_id"]),
-                "class": cls_name,
-                "class_id": t.get("class_id", -1),
-                "conf": float(t["conf"]),
-                "class_conf": float(t.get("class_conf", 0.0)),
-                "bbox": t["bbox"],
-                "centroid_uv": list(t["centroid"]),
-                "depth_m": t.get("depth_m"),
-                "dist_to_robot": t.get("depth_m"),
-                "size_world": t.get("size_world", [size["lx"], size["ly"], size["lz"]]),
-                "geom_extents": t.get("geom_extents"),
-                "pos_world": None,
-                "grasp_pos_world": None,
-                "source": "saturation",
-            }
-            objects.append(obj)
+        objects = [self._track_to_object(t) for t in confirmed]
+        target = None
+        for obj in objects:
             if target is None or (obj["depth_m"] or 999) < (target.get("depth_m") or 999):
                 target = obj
-
         info = self.get_sat_info()
-        return {
-            "target": target,
-            "objects_detailed": objects,
-            "objects_remaining": [{"id": o["id"], "class": o["class"], "dist": o["depth_m"]} for o in objects],
+        meta = {
             "depth_stats": self.get_depth_stats(),
             "sat_thresh": info["thresh"],
             "sat_thresh_far": info.get("thresh_far", info["thresh"]),
             "sat_ground_ref": info["ground_ref"],
             "mask_components": getattr(self, "_mask_components", 0),
+        }
+        return objects, target, meta
+
+    def process(self, obs, dt: float = 0.02) -> dict:
+        rgb, depth = parse_head_rgbd(obs)
+        objects, target, meta = self.process_frame(rgb, depth)
+        return {
+            "target": target,
+            "objects_detailed": objects,
+            "objects_remaining": [{"id": o["id"], "class": o["class"], "dist": o["depth_m"]} for o in objects],
+            "depth_stats": meta["depth_stats"],
+            "sat_thresh": meta["sat_thresh"],
+            "sat_thresh_far": meta["sat_thresh_far"],
+            "sat_ground_ref": meta["sat_ground_ref"],
+            "mask_components": meta["mask_components"],
+            "active_camera": "head",
+            "phase": "approach",
             "gripper": {"is_holding": False, "width": 0.04},
             "progress": {"total": TOTAL_OBJECTS, "inside_bin": 0, "remaining": TOTAL_OBJECTS},
             "robot": {"pos_world": ROBOT_INIT_POS.tolist(), "yaw": float(ROBOT_INIT_YAW)},

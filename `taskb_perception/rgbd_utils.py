@@ -13,7 +13,19 @@ from typing import Any, Dict, Optional, Tuple
 import cv2
 import numpy as np
 
-from config import HEAD_CAM
+from config import (
+    EE_CAM,
+    EE_CAM_POS_ROBOT,
+    EE_CAM_ROT_MATRIX,
+    HEAD_CAM,
+    HEAD_CAM_POS_ROBOT,
+    HEAD_CAM_ROT_MATRIX,
+)
+
+CAMERA_MODELS = {
+    "head": (HEAD_CAM, HEAD_CAM_POS_ROBOT, HEAD_CAM_ROT_MATRIX),
+    "ee": (EE_CAM, EE_CAM_POS_ROBOT, EE_CAM_ROT_MATRIX),
+}
 
 
 def _to_numpy(x) -> np.ndarray:
@@ -92,9 +104,41 @@ def median_depth_in_mask(depth: np.ndarray, mask: np.ndarray) -> Optional[float]
     return float(np.median(vals))
 
 
-def pixel_depth_to_cam(u: float, v: float, z: float) -> np.ndarray:
-    x = (u - HEAD_CAM["cx"]) / HEAD_CAM["fx"] * z
-    y = (v - HEAD_CAM["cy"]) / HEAD_CAM["fy"] * z
+def estimate_pos_robot(
+    centroid_uv, depth_m: Optional[float], camera: str,
+) -> Optional[np.ndarray]:
+    """检测框中心 + depth → 机器人基座系 3D 点 (双相机融合用)"""
+    if depth_m is None or depth_m <= 0.05 or camera not in CAMERA_MODELS:
+        return None
+    cam, pos, rot = CAMERA_MODELS[camera]
+    u, v = float(centroid_uv[0]), float(centroid_uv[1])
+    p_cam = pixel_depth_to_cam(u, v, float(depth_m), cam)
+    return (pos + rot @ p_cam).astype(np.float32)
+
+
+def horizontal_dist_robot(pos_robot: Optional[np.ndarray]) -> Optional[float]:
+    if pos_robot is None:
+        return None
+    return float(np.linalg.norm(pos_robot[:2]))
+
+
+def annotate_pos_robot(obj: dict, camera: str) -> dict:
+    """给单相机 object 补上 pos_robot / dist_to_robot (不修改原 dict 引用时可 copy)"""
+    pos = estimate_pos_robot(obj.get("centroid_uv"), obj.get("depth_m"), camera)
+    dist = horizontal_dist_robot(pos)
+    out = dict(obj)
+    out["pos_robot"] = pos.tolist() if pos is not None else None
+    if dist is not None:
+        out["dist_to_robot"] = dist
+    return out
+
+
+def pixel_depth_to_cam(
+    u: float, v: float, z: float, cam: Optional[Dict[str, float]] = None,
+) -> np.ndarray:
+    c = cam or HEAD_CAM
+    x = (u - c["cx"]) / c["fx"] * z
+    y = (v - c["cy"]) / c["fy"] * z
     return np.array([x, y, z], dtype=np.float32)
 
 
