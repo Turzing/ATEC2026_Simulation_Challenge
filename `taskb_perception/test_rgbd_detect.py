@@ -23,6 +23,7 @@ parser.add_argument("--live", action="store_true", default=True)
 parser.add_argument("--no-live", action="store_false", dest="live")
 parser.add_argument("--preview_every", type=int, default=3)
 parser.add_argument("--fast", action="store_true", help="MIN_TRACK_HITS=1 for quicker boxes")
+parser.add_argument("--policy", type=str, default="", help="RL policy.pt (default: ../demo/policy.pt)")
 AppLauncher.add_app_launcher_args(parser)
 args_cli, _ = parser.parse_known_args()
 if not getattr(args_cli, "enable_cameras", False):
@@ -53,9 +54,77 @@ if args_cli.fast:
     rdp.MIN_TRACK_HITS = 1
 
 
-class ManualKeyboard:
-    def __init__(self, device: str):
+def resolve_policy():
+    if args_cli.policy:
+        return args_cli.policy
+    for p in [
+        os.path.join(_root, "demo", "policy.pt"),
+        os.path.join(os.path.dirname(__file__), "policy.pt"),
+    ]:
+        if os.path.isfile(p):
+            return p
+    return ""
+
+
+class SimpleWalk:
+    """与 test_rgbd_sim.py 相同 — W 前进用 RL 策略, 无 policy 时原地踏步+转向"""
+
+    def __init__(self, device: str, policy_path: str = ""):
         self.device = device
+        self.policy = None
+        self.mode = "scripted"
+        self.vx, self.vy, self.wz = 0.5, 0.0, 0.0
+        if policy_path and os.path.isfile(policy_path):
+            self.policy = torch.jit.load(policy_path, map_location=device)
+            self.policy.eval()
+            self.mode = "rl"
+            self.env_to_train = torch.tensor(
+                [4.0, 2.0, 2.0] * 4, device=device, dtype=torch.float32).view(1, -1)
+            self.train_to_env = torch.tensor(
+                [0.25, 0.5, 0.5] * 4, device=device, dtype=torch.float32).view(1, -1)
+            print(f"[walk] RL policy: {policy_path}", flush=True)
+        else:
+            print("[walk] scripted gait — copy demo/policy.pt for smooth forward walk", flush=True)
+
+    def set_cmd(self, vx, wz):
+        self.vx, self.wz = vx, wz
+
+    def get_action(self, obs, step: int, turn_bias: float = 0.0):
+        if self.mode == "rl":
+            return self._rl(obs)
+        a = torch.zeros(1, 20, dtype=torch.float32, device=self.device)
+        t = step * 0.02
+        s1, s2 = np.sin(t * 3), np.sin(t * 3 + np.pi)
+
+        def leg(ih, it, ic, s):
+            a[0, ih] = 0.25 * s
+            a[0, it] = 0.55 + 0.45 * s
+            a[0, ic] = -1.35 - 0.35 * abs(s)
+
+        leg(0, 1, 2, s1); leg(3, 4, 5, s2)
+        leg(6, 7, 8, s2); leg(9, 10, 11, s1)
+        if turn_bias:
+            a[0, 0] += turn_bias; a[0, 6] += turn_bias
+            a[0, 3] -= turn_bias; a[0, 9] -= turn_bias
+        return a
+
+    def _rl(self, obs):
+        p = obs["proprio"].to(self.device).float()
+        leg_pos = p[:, 12:24]
+        leg_vel = p[:, 32:44]
+        leg_act = p[:, 52:64] * self.env_to_train
+        cmd = torch.tensor([[self.vx, self.vy, self.wz]], device=self.device, dtype=p.dtype)
+        pol_in = torch.cat([p[:, 3:6] * 0.25, p[:, 9:12], cmd, leg_pos, leg_vel * 0.05, leg_act], dim=-1)
+        with torch.inference_mode():
+            leg = self.policy(pol_in)
+        full = torch.zeros(1, 20, device=self.device, dtype=p.dtype)
+        full[:, :12] = leg * self.train_to_env
+        return full
+
+
+class ManualKeyboard:
+    def __init__(self, device: str, policy_path: str):
+        self.walk = SimpleWalk(device, policy_path)
         self._input = self._kb = self._ki = None
         self.snap = self.quit = False
         self._p_was = False
@@ -65,44 +134,44 @@ class ManualKeyboard:
             self._input = carb.input.acquire_input_interface()
             self._kb = omni.appwindow.get_default_app_window().get_keyboard()
             self._ki = carb.input.KeyboardInput
-        except Exception:
-            pass
+            print("[keyboard] OK — click Isaac Sim window first", flush=True)
+        except Exception as e:
+            print(f"[keyboard] unavailable: {e}", flush=True)
 
     def _down(self, key):
         return self._input is not None and self._input.get_keyboard_value(self._kb, key) > 0
 
     def poll(self):
         self.snap = False
-        if self._ki is not None:
-            p = self._down(self._ki.P)
-            if p and not self._p_was:
-                self.snap = True
-            self._p_was = p
-            if self._down(self._ki.Q):
-                self.quit = True
-
-    def get_action(self, step: int):
-        act = torch.zeros(1, 20, dtype=torch.float32, device=self.device)
         if self._ki is None:
-            return act
-        w, s = self._down(self._ki.W), self._down(self._ki.S)
-        a, d = self._down(self._ki.A), self._down(self._ki.D)
+            return
+        p_key = self._down(self._ki.P)
+        if p_key and not self._p_was:
+            self.snap = True
+        self._p_was = p_key
+        if self._down(self._ki.Q):
+            self.quit = True
+
+    def get_action(self, obs, step: int):
+        self.poll()
+        if self._ki is None:
+            return torch.zeros(1, 20, dtype=torch.float32, device=self.walk.device)
+        w = self._down(self._ki.W)
+        s = self._down(self._ki.S)
+        a = self._down(self._ki.A)
+        d = self._down(self._ki.D)
         if not (w or s or a or d):
-            return act
-        s1, s2 = np.sin(step * 0.06), np.sin(step * 0.06 + np.pi)
+            return torch.zeros(1, 20, dtype=torch.float32, device=self.walk.device)
 
-        def leg(ih, it, ic, s):
-            act[0, ih], act[0, it], act[0, ic] = 0.25 * s, 0.55 + 0.45 * s, -1.35 - 0.35 * abs(s)
-
-        leg(0, 1, 2, s1); leg(3, 4, 5, s2)
-        leg(6, 7, 8, s2); leg(9, 10, 11, s1)
-        if w:
-            act[0, 0] = act[0, 3] = 0.25
-        if a:
-            act[0, 0] += 0.35; act[0, 6] += 0.35
-        if d:
-            act[0, 3] -= 0.35; act[0, 9] -= 0.35
-        return act
+        vx = 0.5 if w else (-0.25 if s else 0.0)
+        wz = 0.45 if a else (-0.45 if d else 0.0)
+        if w and (a or d):
+            vx = 0.35
+        tb = 0.5 if a else (-0.5 if d else 0.0)
+        if self.walk.mode == "rl":
+            self.walk.set_cmd(vx, wz)
+            return self.walk.get_action(obs, step)
+        return self.walk.get_action(obs, step, turn_bias=tb)
 
 
 def draw_panel(vis, img, x, y, label):
@@ -156,7 +225,7 @@ def main():
 
     device = env.unwrapped.device
     pipeline = RgbdDetectPipeline()
-    kb = ManualKeyboard(device)
+    kb = ManualKeyboard(device, resolve_policy())
 
     print("\n=== RGB-D fusion detect (official head_rgb + head_depth) ===", flush=True)
     print("  Step 1: python verify_rgbd.py  if depth valid_ratio=0", flush=True)
@@ -174,8 +243,7 @@ def main():
         while simulation_app.is_running():
             if kb.quit:
                 break
-            kb.poll()
-            act = kb.get_action(step)
+            act = kb.get_action(obs, step)
             obs, _, term, trunc, _ = env.step(act)
             step += 1
             if camera_follow:
