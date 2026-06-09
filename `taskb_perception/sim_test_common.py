@@ -113,21 +113,24 @@ class ManualKeyboard:
             self.quit = True
 
     def get_action(self, obs, step: int):
+        """无按键时也保持站立 — 不能发全零, 否则狗会倒"""
         self.poll()
         if self._ki is None:
-            return torch.zeros(1, 20, dtype=torch.float32, device=self.walk.device)
+            if self.walk.mode == "rl":
+                self.walk.set_cmd(0.0, 0.0)
+                return self.walk.get_action(obs, step)
+            return self.walk.get_action(obs, step, turn_bias=0.0)
+
         w = self._down(self._ki.W)
         s = self._down(self._ki.S)
         a = self._down(self._ki.A)
         d = self._down(self._ki.D)
-        if not (w or s or a or d):
-            return torch.zeros(1, 20, dtype=torch.float32, device=self.walk.device)
-
         vx = 0.5 if w else (-0.25 if s else 0.0)
         wz = 0.45 if a else (-0.45 if d else 0.0)
         if w and (a or d):
             vx = 0.35
         tb = 0.5 if a else (-0.5 if d else 0.0)
+
         if self.walk.mode == "rl":
             self.walk.set_cmd(vx, wz)
             return self.walk.get_action(obs, step)

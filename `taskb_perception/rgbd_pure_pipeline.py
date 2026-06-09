@@ -64,9 +64,10 @@ CAMERA_CFG = {
         "sat_relax": 14,
         "min_area": 28,
         "min_side": 5,
-        "min_track_hits": 1,
+        "min_track_hits": 2,
         "mask_close_k": 9,
-        "fusion_mode": "soft",  # relief 弱时 RGB+depth 兜底
+        "fusion_mode": "soft",
+        "val_refine_p": 32,
     },
     "ee": {
         "cam": EE_CAM,
@@ -83,11 +84,14 @@ CAMERA_CFG = {
         "sat_relax": 22,
         "min_area": 14,
         "min_side": 3,
-        "min_track_hits": 1,
-        "far_mask_dilate": 7,
-        "rgb_dilate_far": 5,
+        "min_track_hits": 2,
+        "far_mask_dilate": 5,
+        "rgb_dilate_far": 3,
         "mask_close_k": 7,
-        "fusion_mode": "rgb_depth",  # 远距: 黄+有效深度 (relief 常失效)
+        "fusion_mode": "rgb_depth",
+        "val_refine_p": 38,
+        "min_blob_sat": 42,
+        "max_depth_std": 0.058,
     },
 }
 
@@ -121,7 +125,13 @@ MAX_SIDE = 360
 TRACK_MATCH_PX = 88
 TRACK_MAX_AGE = 12
 MIN_TRACK_HITS = 2
-DEPTH_SMOOTH = 0.55
+DEPTH_SMOOTH = 0.72
+POS_SMOOTH = 0.65
+DEPTH_POINT_TOL = 0.07
+DEPTH_POINT_TOL_NEAR = 0.05
+MAX_BLOB_DEPTH_STD = 0.065
+MIN_BLOB_SAT_MEAN = 38
+SHADOW_VAL_MAX = 72
 
 
 def _yaw_from_gravity(g) -> float:
@@ -166,6 +176,19 @@ class Tracker2D:
                 nd = d["depth_m"]
                 tr["depth_m"] = nd if old is None else DEPTH_SMOOTH * old + (1 - DEPTH_SMOOTH) * nd
                 d = {**d, "depth_m": tr["depth_m"]}
+            if d.get("pos_robot") is not None:
+                op = tr.get("pos_robot")
+                np_ = np.asarray(d["pos_robot"], dtype=np.float32)
+                if op is None:
+                    tr["pos_robot"] = np_.copy()
+                else:
+                    tr["pos_robot"] = POS_SMOOTH * op + (1 - POS_SMOOTH) * np_
+                pr = tr["pos_robot"]
+                d = {
+                    **d,
+                    "pos_robot": pr.tolist(),
+                    "dist_to_robot": float(np.linalg.norm(pr[:2])),
+                }
             out.append({**d, "track_id": best_id})
         for tid in [k for k, v in self.tracks.items() if v["age"] > TRACK_MAX_AGE]:
             del self.tracks[tid]
@@ -315,14 +338,112 @@ class RgbdPureCamera:
         p_cam = pixel_depth_to_cam(u, v, z, cam)
         return (self._cfg["pos"] + self._cfg["rot"] @ p_cam).astype(np.float32)
 
-    def _blob_det(
-        self, ys, xs, depth, h, w, robot_pos, robot_yaw,
-    ) -> Optional[dict]:
+    def _filter_depth_outliers(
+        self, ys: np.ndarray, xs: np.ndarray, depth: np.ndarray, depth_m: float,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        d = depth[ys, xs]
+        tol = DEPTH_POINT_TOL_NEAR if depth_m < 1.2 else DEPTH_POINT_TOL
+        keep = (d > DEPTH_MIN) & (d < DEPTH_MAX) & (d <= depth_m + tol) & (d >= depth_m - tol * 0.7)
+        if int(np.sum(keep)) < 6:
+            return ys, xs
+        return ys[keep], xs[keep]
+
+    def _refine_blob(
+        self, ys: np.ndarray, xs: np.ndarray, depth: np.ndarray,
+        val: Optional[np.ndarray], h: int,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        d0 = depth[ys, xs]
+        ok = (d0 > DEPTH_MIN) & (d0 < DEPTH_MAX)
+        if int(np.sum(ok)) < 5:
+            return ys, xs
+        d_med = float(np.median(d0[ok]))
+        ys, xs = self._filter_depth_outliers(ys, xs, depth, d_med)
+        if val is not None and len(ys) > 8:
+            v = val[ys, xs]
+            v_cut = float(np.percentile(v, self._cfg.get("val_refine_p", 35)))
+            keep = v >= max(SHADOW_VAL_MAX - 18, v_cut)
+            if int(np.sum(keep)) >= max(6, len(ys) // 3):
+                ys, xs = ys[keep], xs[keep]
+        cy = float(np.mean(ys))
+        if cy > h * 0.62 and val is not None:
+            v = val[ys, xs]
+            if float(np.mean(v)) < SHADOW_VAL_MAX:
+                bw = int(xs.max() - xs.min() + 1)
+                bh = int(ys.max() - ys.min() + 1)
+                if bw > bh * 1.8:
+                    return np.array([], dtype=ys.dtype), np.array([], dtype=xs.dtype)
+        return ys, xs
+
+    def _robust_depth(
+        self, ys: np.ndarray, xs: np.ndarray, depth: np.ndarray, bbox: List[int],
+    ) -> Optional[float]:
         d = depth[ys, xs]
         d = d[(d > DEPTH_MIN) & (d < DEPTH_MAX)]
-        if len(d) < 5:
+        if len(d) < 4:
             return None
-        depth_m = float(np.percentile(d, 42 if len(d) >= 12 else 50))
+        d_mask = float(np.percentile(d, 38))
+        x1, y1, x2, y2 = bbox
+        iw, ih = max(1, x2 - x1 + 1), max(1, y2 - y1 + 1)
+        inner = [
+            x1 + iw // 4, y1 + ih // 4,
+            x2 - iw // 4, y2 - ih // 4,
+        ]
+        ix1, iy1, ix2, iy2 = inner
+        inner_d = depth[iy1:iy2 + 1, ix1:ix2 + 1]
+        inner_d = inner_d[(inner_d > DEPTH_MIN) & (inner_d < DEPTH_MAX)]
+        d_inner = float(np.median(inner_d)) if len(inner_d) >= 3 else d_mask
+        return float(np.median([d_mask, d_inner]))
+
+    def _pos_from_mask(
+        self, ys: np.ndarray, xs: np.ndarray, depth: np.ndarray,
+    ) -> Optional[np.ndarray]:
+        pts = []
+        step = 1 if len(ys) < 120 else 2
+        for y, x in zip(ys[::step], xs[::step]):
+            z = float(depth[y, x])
+            if z <= DEPTH_MIN or z >= DEPTH_MAX:
+                continue
+            pts.append(self._uv_depth_to_robot(float(x), float(y), z))
+        if len(pts) < 5:
+            return None
+        return np.median(np.stack(pts, axis=0), axis=0).astype(np.float32)
+
+    @staticmethod
+    def _bbox_iou(a: List[int], b: List[int]) -> float:
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        inter = max(0, ix2 - ix1 + 1) * max(0, iy2 - iy1 + 1)
+        if inter <= 0:
+            return 0.0
+        ua = (ax2 - ax1 + 1) * (ay2 - ay1 + 1) + (bx2 - bx1 + 1) * (by2 - by1 + 1) - inter
+        return float(inter) / max(ua, 1)
+
+    def _merge_dets(self, dets: List[dict]) -> List[dict]:
+        if len(dets) < 2:
+            return dets
+        dets = sorted(dets, key=lambda x: x.get("depth_m") or 999.0)
+        kept: List[dict] = []
+        for d in dets:
+            dup = False
+            for k in kept:
+                if abs((d.get("depth_m") or 0) - (k.get("depth_m") or 0)) > 0.35:
+                    continue
+                if self._bbox_iou(d["bbox"], k["bbox"]) > 0.15:
+                    dup = True
+                    break
+            if not dup:
+                kept.append(d)
+        return kept
+
+    def _blob_det(
+        self, ys, xs, depth, h, w, robot_pos, robot_yaw,
+        val: Optional[np.ndarray] = None, sat: Optional[np.ndarray] = None,
+    ) -> Optional[dict]:
+        ys, xs = self._refine_blob(ys, xs, depth, val, h)
+        if len(ys) < 5:
+            return None
         x1, x2 = int(xs.min()), int(xs.max())
         y1, y2 = int(ys.min()), int(ys.max())
         bw, bh = x2 - x1 + 1, y2 - y1 + 1
@@ -331,12 +452,33 @@ class RgbdPureCamera:
         if min(bw, bh) < min_s or max(bw, bh) > MAX_SIDE or len(ys) < min_a:
             return None
         bbox = [x1, y1, x2, y2]
-        cx, cy = float(np.mean(xs)), float(np.mean(ys))
-        cls, cls_conf = RgbdPureCamera._classify_2d(bbox, len(ys))
-        pos_r = self._uv_depth_to_robot(cx, cy, depth_m)
+        depth_m = self._robust_depth(ys, xs, depth, bbox)
+        if depth_m is None:
+            return None
+        d_vals = depth[ys, xs]
+        d_vals = d_vals[(d_vals > DEPTH_MIN) & (d_vals < DEPTH_MAX)]
+        if float(np.std(d_vals)) > self._cfg.get("max_depth_std", MAX_BLOB_DEPTH_STD):
+            return None
+        if sat is not None:
+            sm = float(np.mean(sat[ys, xs]))
+            if sm < self._cfg.get("min_blob_sat", MIN_BLOB_SAT_MEAN):
+                return None
+        cx, cy = float(np.median(xs)), float(np.median(ys))
+        cls, cls_conf = RgbdPureCamera._classify_2d(bbox, len(ys), depth_m)
+        pos_r = self._pos_from_mask(ys, xs, depth)
+        if pos_r is None:
+            pos_r = self._uv_depth_to_robot(cx, cy, depth_m)
         pos_w = _robot_to_world(pos_r, robot_pos, robot_yaw)
-        grasp_w = pos_w.copy()
-        grasp_w[2] = float(pos_w[2] + 0.06) - GRASP_DEPTH_OFFSET
+        grasp_r = pos_r.copy()
+        z_pts = []
+        for y, x in zip(ys[::2], xs[::2]):
+            z = float(depth[y, x])
+            if DEPTH_MIN < z < DEPTH_MAX:
+                p = self._uv_depth_to_robot(float(x), float(y), z)
+                z_pts.append(float(p[2]))
+        if z_pts:
+            grasp_r[2] = float(np.percentile(z_pts, 82)) - GRASP_DEPTH_OFFSET
+        grasp_w = _robot_to_world(grasp_r, robot_pos, robot_yaw)
         size = OBJECT_SIZES.get(cls, DEFAULT_OBJECT_SIZE)
         conf = float(min(0.94, 0.45 + cls_conf * 0.55))
         return {
@@ -359,6 +501,8 @@ class RgbdPureCamera:
     def detect(self, rgb: np.ndarray, depth: np.ndarray, robot_pos, robot_yaw) -> List[dict]:
         depth = sanitize_depth(depth)
         mask = self._build_fusion_mask(rgb, depth)
+        hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+        val, sat = hsv[:, :, 2], hsv[:, :, 1]
         labeled, n = ndimage.label(mask > 0)
         self._mask_n = int(n)
         if n == 0:
@@ -367,9 +511,10 @@ class RgbdPureCamera:
         dets = []
         for cid in range(1, n + 1):
             ys, xs = np.where(labeled == cid)
-            det = self._blob_det(ys, xs, depth, h, w, robot_pos, robot_yaw)
+            det = self._blob_det(ys, xs, depth, h, w, robot_pos, robot_yaw, val=val, sat=sat)
             if det is not None:
                 dets.append(det)
+        dets = self._merge_dets(dets)
         dets.sort(key=lambda x: x.get("depth_m") or 999.0)
         return dets
 
@@ -385,7 +530,12 @@ class RgbdPureCamera:
         for t in tracks:
             if self.tracker.tracks.get(t["track_id"], {}).get("hits", 0) < min_hits:
                 continue
-            objects.append({**t, "id": int(t["track_id"]), "camera": self.camera_name})
+            o = {**t, "id": int(t["track_id"]), "camera": self.camera_name}
+            if o.get("pos_robot") is not None:
+                pr = np.asarray(o["pos_robot"], dtype=np.float32)
+                o["pos_world"] = _robot_to_world(pr, robot_pos, robot_yaw).tolist()
+                o["dist_to_robot"] = float(np.linalg.norm(pr[:2]))
+            objects.append(o)
         target = min(objects, key=lambda o: o.get("depth_m") or 999.0) if objects else None
         meta = {"depth_stats": st, "mask_components": getattr(self, "_mask_n", 0)}
         return objects, target, meta
@@ -395,19 +545,25 @@ class RgbdPureCamera:
         return st.get("p10", 99) < NEAR_SCENE_P10 or st.get("min", 99) < NEAR_SCENE_MIN
 
     @staticmethod
-    def _classify_2d(bbox: List[int], area: int) -> Tuple[str, float]:
+    def _classify_2d(bbox: List[int], area: int, depth_m: Optional[float] = None) -> Tuple[str, float]:
         x1, y1, x2, y2 = bbox
         bw, bh = max(1, x2 - x1 + 1), max(1, y2 - y1 + 1)
         asp = max(bw, bh) / min(bw, bh)
         fill = area / max(bw * bh, 1)
-        if bh >= bw * 1.22 and asp >= 1.28:
-            return "mustard_bottle", min(0.82, 0.55 + 0.1 * asp)
-        if bw >= bh * 1.18 and asp >= 1.20:
-            return "banana", min(0.84, 0.52 + 0.12 * asp)
-        if asp < 1.22 or (fill > 0.38 and asp < 1.45):
-            return "sugar_box", 0.62 if fill > 0.35 else 0.55
-        if asp >= 1.55:
-            return ("banana", 0.58) if bw >= bh else ("mustard_bottle", 0.56)
+        vert, horiz = bh >= bw * 1.12, bw >= bh * 1.12
+        if vert and asp >= 1.20:
+            return "mustard_bottle", min(0.84, 0.58 + 0.08 * (asp - 1.2))
+        if horiz and asp >= 1.18 and fill < 0.55:
+            return "banana", min(0.84, 0.54 + 0.10 * (asp - 1.18))
+        if fill > 0.36 and asp < 1.48:
+            conf = 0.68 if (depth_m is not None and depth_m < 1.25) else 0.60
+            return "sugar_box", conf
+        if asp < 1.25:
+            return "sugar_box", 0.58
+        if horiz:
+            return "banana", 0.56
+        if vert:
+            return "mustard_bottle", 0.57
         return "sugar_box", 0.52
 
 

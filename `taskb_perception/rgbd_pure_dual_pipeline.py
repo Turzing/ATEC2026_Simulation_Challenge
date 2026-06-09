@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -26,25 +26,75 @@ from config import (
     ROBOT_INIT_YAW,
     TOTAL_OBJECTS,
 )
-from rgbd_pure_pipeline import RgbdPureCamera, _yaw_from_gravity
+from rgbd_pure_pipeline import RgbdPureCamera, _robot_to_world, _yaw_from_gravity
 from rgbd_utils import _to_numpy, depth_stats, parse_ee_rgbd, parse_head_rgbd
 
 # 仅当 head 确认近距目标时才切 grasp; 远距导航只用 ee
 GRASP_PHASE_DIST_M = 1.10
+TEMPORAL_MEDIAN_N = 6
+
+
+class _TemporalMedian:
+    """移动中多帧中值 — 不必停住再测"""
+
+    def __init__(self, n: int = TEMPORAL_MEDIAN_N):
+        self.n = n
+        self._hist: Dict[Tuple[str, int], List[dict]] = {}
+
+    def reset(self):
+        self._hist.clear()
+
+    def apply(self, objects: List[dict], cam: str, robot_pos, robot_yaw) -> List[dict]:
+        out = []
+        for o in objects:
+            key = (cam, int(o["id"]))
+            self._hist.setdefault(key, [])
+            self._hist[key].append(o)
+            self._hist[key] = self._hist[key][-self.n :]
+            h = self._hist[key]
+            m = dict(o)
+            depths = [x["depth_m"] for x in h if x.get("depth_m") is not None]
+            if depths:
+                m["depth_m"] = float(np.median(depths))
+            prs = [x["pos_robot"] for x in h if x.get("pos_robot") is not None]
+            if prs:
+                med = np.median(np.stack([np.asarray(p, dtype=np.float32) for p in prs]), axis=0)
+                m["pos_robot"] = med.tolist()
+                m["pos_world"] = _robot_to_world(med, robot_pos, robot_yaw).tolist()
+                m["dist_to_robot"] = float(np.linalg.norm(med[:2]))
+                gps = [x.get("grasp_pos_world") for x in h if x.get("grasp_pos_world")]
+                if gps:
+                    m["grasp_pos_world"] = np.median(
+                        np.stack([np.asarray(g, dtype=np.float32) for g in gps]), axis=0,
+                    ).tolist()
+            out.append(m)
+        return out
 
 
 def _obj_dist(obj: Optional[dict]) -> float:
+    """测距优先 depth_m (光轴), 比 dist_to_robot 稳"""
     if not obj:
         return 999.0
-    d = obj.get("dist_to_robot")
+    d = obj.get("depth_m")
     if d is not None and d > 0.05:
         return float(d)
-    d = obj.get("depth_m")
-    return float(d) if d is not None else 999.0
+    dr = obj.get("dist_to_robot")
+    return float(dr) if dr is not None else 999.0
 
 
-def _nearest(objs: List[dict]) -> Optional[dict]:
-    return min(objs, key=_obj_dist) if objs else None
+def _best_nav_target(objs: List[dict]) -> Optional[dict]:
+    """EE 导航: 最近目标; 深度接近时取 conf 更高"""
+    if not objs:
+        return None
+    ranked = sorted(objs, key=_obj_dist)
+    best = ranked[0]
+    bd = _obj_dist(best)
+    for o in ranked[1:]:
+        if _obj_dist(o) - bd > 0.30:
+            break
+        if float(o.get("conf", 0)) > float(best.get("conf", 0)) + 0.08:
+            best = o
+    return best
 
 
 class RgbdPureDualPipeline:
@@ -54,11 +104,13 @@ class RgbdPureDualPipeline:
         self.frame_count = 0
         self.robot_pos = ROBOT_INIT_POS.copy().astype(np.float32)
         self.robot_yaw = float(ROBOT_INIT_YAW)
+        self._temporal = _TemporalMedian()
         print("[RgbdPureDual] ee=nav(far)  head=grasp(near)  RGBD fusion x2")
 
     def reset(self):
         self.ee.reset()
         self.head.reset()
+        self._temporal.reset()
         self.frame_count = 0
         self.robot_pos = ROBOT_INIT_POS.copy().astype(np.float32)
         self.robot_yaw = float(ROBOT_INIT_YAW)
@@ -100,12 +152,18 @@ class RgbdPureDualPipeline:
             ee_objs, ee_tgt, ee_meta = self.ee.process_frame(e_rgb, e_depth, rp, ry)
             ee_stats = ee_meta.get("depth_stats") or depth_stats(e_depth)
 
+        head_objs = self._temporal.apply(head_objs, "head", rp, ry)
+        ee_objs = self._temporal.apply(ee_objs, "ee", rp, ry)
+        head_tgt = min(head_objs, key=_obj_dist) if head_objs else None
+        ee_tgt = min(ee_objs, key=_obj_dist) if ee_objs else None
+
         head_d = _obj_dist(head_tgt)
         # grasp: 必须 head 有近目标; 远距一律 approach + 只信 ee 导航
         phase = "grasp" if (head_tgt is not None and head_d < GRASP_PHASE_DIST_M) else "approach"
 
         if phase == "approach":
-            nav_cam, nav_objs, nav_tgt = "ee", ee_objs, _nearest(ee_objs)
+            nav_cam, nav_objs = "ee", ee_objs
+            nav_tgt = _best_nav_target(ee_objs)
             grasp_cam, grasp_objs, grasp_tgt = "ee", ee_objs, ee_tgt
         else:
             nav_cam, nav_objs, nav_tgt = "head", head_objs, head_tgt

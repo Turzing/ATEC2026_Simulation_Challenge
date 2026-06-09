@@ -1,9 +1,9 @@
 """
-双相机分工测试 — head 导航 / EE 抓取
+双相机分工测试 — EE 远距导航 / head 近距抓取
 
     python test_rgbd_dual_detect.py
 
-主画面: head (NAV)  右上: EE (GRASP)  各管各的, 不融合
+主画面: head  右上: EE  phase=approach 时 NAV 用 EE, grasp 时用 head
 """
 
 import argparse
@@ -46,7 +46,7 @@ except ImportError:
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import rgbd_detect_pipeline as rdp
-from rgbd_dual_pipeline import GRASP_PHASE_DEPTH_M, RgbdDualPipeline
+from rgbd_dual_pipeline import GRASP_PHASE_DIST_M, RgbdDualPipeline
 from rgbd_utils import depth_to_vis, format_stats_line, parse_ee_rgbd, parse_head_rgbd
 from sim_test_common import CLASS_COLORS_BGR, ManualKeyboard, draw_panel, resolve_policy
 
@@ -70,11 +70,13 @@ def draw_boxes(vis, objects, prefix="", thickness=2):
 def draw_vis(head_rgb, ee_rgb, out, pipeline, head_depth):
     vis = cv2.cvtColor(head_rgb, cv2.COLOR_RGB2BGR)
     h, w = vis.shape[:2]
+    phase = out.get("phase", "approach")
+    head_objs = out.get("head_objects", out.get("objects_nav", []))
+    ee_objs = out.get("ee_objects", out.get("objects_grasp", []))
     nav = out.get("objects_nav", [])
     grasp = out.get("objects_grasp", [])
-    phase = out.get("phase", "approach")
 
-    draw_boxes(vis, nav, prefix="N", thickness=3 if phase == "approach" else 1)
+    draw_boxes(vis, head_objs, prefix="H", thickness=3 if phase == "grasp" else 1)
 
     pw, ph = w // 4, h // 4
     mini = np.zeros((ph, pw * 4, 3), dtype=np.uint8)
@@ -92,32 +94,47 @@ def draw_vis(head_rgb, ee_rgb, out, pipeline, head_depth):
         ew, eh = w // 3, h // 3
         ee_vis = cv2.resize(cv2.cvtColor(ee_rgb, cv2.COLOR_RGB2BGR), (ew, eh))
         sx, sy = ew / ee_rgb.shape[1], eh / ee_rgb.shape[0]
-        for obj in grasp:
+        for obj in ee_objs:
             x1, y1, x2, y2 = obj["bbox"]
             x1, x2 = int(x1 * sx), int(x2 * sx)
             y1, y2 = int(y1 * sy), int(y2 * sy)
             cls = obj.get("class", "?")
             c = CLASS_COLORS_BGR.get(cls, (0, 255, 0))
-            t = 3 if phase == "grasp" else 1
+            t = 3 if phase == "approach" else 1
             cv2.rectangle(ee_vis, (x1, y1), (x2, y2), c, t)
-            cv2.putText(ee_vis, f"G{obj['id']}", (x1, max(12, y1 - 2)), 0, 0.35, c, 1)
+            dm = obj.get("dist_to_robot") or obj.get("depth_m")
+            lab = f"E{obj['id']}"
+            if dm:
+                lab += f" {dm:.1f}m"
+            cv2.putText(ee_vis, lab, (x1, max(12, y1 - 2)), 0, 0.35, c, 1)
         cv2.rectangle(ee_vis, (0, 0), (ew - 1, eh - 1), (0, 255, 255), 2)
-        cv2.putText(ee_vis, "GRASP(EE)", (4, 14), 0, 0.38, (0, 255, 255), 1)
+        cv2.putText(ee_vis, "EE(nav far)", (4, 14), 0, 0.38, (0, 255, 255), 1)
         vis[8:8 + eh, w - ew - 8:w - 8] = ee_vis
 
     st = out.get("depth_stats", {})
-    cv2.putText(vis, f"phase={phase}  NAV(head)={len(nav)}  GRASP(ee)={len(grasp)}",
+    nav_cam = out.get("navigation", {}).get("camera", "?")
+    grasp_cam = out.get("grasp", {}).get("camera", "?")
+    cv2.putText(vis, f"phase={phase}  NAV({nav_cam})={len(nav)}  GRASP({grasp_cam})={len(grasp)}",
                 (8, 22), 0, 0.5, (0, 255, 255), 2)
     cv2.putText(vis, format_stats_line(st), (8, 44), 0, 0.42, (0, 255, 255), 1)
-    cv2.putText(vis, f"grasp when nav d<{GRASP_PHASE_DEPTH_M:.1f}m | WASD P Q",
+    cv2.putText(vis, f"grasp when head<{GRASP_PHASE_DIST_M:.1f}m | WASD P Q",
                 (8, 64), 0, 0.38, (180, 180, 180), 1)
     tn, tg = out.get("target_nav"), out.get("target_grasp")
     if tn:
-        cv2.putText(vis, f"NAV  {tn.get('class')} d={tn.get('depth_m', 0):.2f}m",
+        d = tn.get("dist_to_robot") or tn.get("depth_m") or 0
+        cv2.putText(vis, f"NAV  {tn.get('class')} dist={d:.2f}m [{nav_cam}]",
                     (8, 84), 0, 0.4, (0, 255, 0), 1)
     if tg:
-        cv2.putText(vis, f"GRASP {tg.get('class')} d={tg.get('depth_m', 0):.2f}m",
+        d = tg.get("dist_to_robot") or tg.get("depth_m") or 0
+        cv2.putText(vis, f"GRASP {tg.get('class')} dist={d:.2f}m [{grasp_cam}]",
                     (8, 104), 0, 0.4, (0, 255, 255), 1)
+        gp = tg.get("grasp_pos_world") or tg.get("grasp_pos_robot")
+        if gp:
+            cv2.putText(vis, f"grasp_xyz=({gp[0]:.2f},{gp[1]:.2f},{gp[2]:.2f})",
+                        (8, 124), 0, 0.38, (0, 220, 255), 1)
+    near = out.get("near_scene", False)
+    if near and len(head_objs) == 0:
+        cv2.putText(vis, "WARN: near scene but head=0 (check ROI)", (8, 144), 0, 0.4, (0, 80, 255), 1)
     return vis
 
 
@@ -135,7 +152,7 @@ def main():
     pipeline = RgbdDualPipeline()
     kb = ManualKeyboard(device, resolve_policy(_root, args_cli.policy))
 
-    print("\n=== head=NAV  ee=GRASP  (parallel, no fusion) ===", flush=True)
+    print("\n=== ee=NAV(far)  head=GRASP(near)  (parallel, no fusion) ===", flush=True)
     print("  (若仍慢: --preview_every 10 或 --no-live)\n", flush=True)
 
     obs, _ = env.reset()
