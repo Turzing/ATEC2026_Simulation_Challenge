@@ -227,7 +227,8 @@ def draw_vis(rgb, out, pipeline, depth):
                         (x1, min(vis.shape[0] - 6, y2 + 14)), 0, 0.38, c, 1)
 
     st = out.get("depth_stats", {})
-    cv2.putText(vis, f"objects={n}  {format_stats_line(st)}", (8, 22), 0, 0.5, (0, 255, 255), 1)
+    cv2.putText(vis, f"objects={n}  mask={out.get('mask_components', 0)}  {format_stats_line(st)}",
+                (8, 22), 0, 0.5, (0, 255, 255), 1)
     cv2.putText(vis,
                 f"sat={out.get('sat_thresh', 0):.0f}/{out.get('sat_thresh_far', 0):.0f} (near/far)",
                 (8, 44), 0, 0.42, (0, 255, 255), 1)

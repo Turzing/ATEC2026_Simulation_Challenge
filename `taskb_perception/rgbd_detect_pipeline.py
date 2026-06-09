@@ -56,10 +56,10 @@ SAT_RELAX_FAR = 16          # 远距 sat 阈值降低
 VAL_RELAX_FAR = 10
 FAR_MASK_DILATE = 3         # 远距掩码略膨胀, 补小目标
 
-BLOB_VAL_MEAN_MIN_NEAR = 74
-BLOB_VAL_MEAN_MIN_FAR = 66
-BLOB_VAL_REFINE_P_NEAR = 42
-BLOB_VAL_REFINE_P_FAR = 28  # 远距少裁暗边, 避免整块没了
+BLOB_VAL_MEAN_MIN_NEAR = 58   # 黄物体侧光时 V 可偏低; 用 sat 联合判影子
+BLOB_VAL_MEAN_MIN_FAR = 52
+BLOB_VAL_REFINE_P_NEAR = 28   # 42 会把带暗边/标签的块裁没
+BLOB_VAL_REFINE_P_FAR = 22
 
 BBOX_PAD_RATIO = 0.14
 BBOX_PAD_RATIO_FAR = 0.22   # 远距框多扩一点
@@ -67,18 +67,24 @@ BBOX_PAD_PX = 12
 BBOX_PAD_PX_FAR = 18
 BBOX_DILATE_K = 5
 
-MIN_BLOB_AREA_NEAR = 80
-MIN_BLOB_AREA_FAR = 32      # 3~5m 可能只有几十个像素
+MIN_BLOB_AREA_NEAR = 45     # 近距小块也保留 ( refine 后常变小 )
+MIN_BLOB_AREA_FAR = 28
 MAX_BLOB_AREA = 45000
 MIN_BLOB_SIDE_NEAR = 8
 MIN_BLOB_SIDE_FAR = 5
 MAX_BLOB_SIDE = 340
 MAX_DETECTIONS = 14
 
-# 分水岭: 宽度明显大于高度且够大 → 尝试拆成两个
-SPLIT_MIN_WIDTH = 55
-SPLIT_MIN_AREA = 500
-SPLIT_WIDTH_OVER_HEIGHT = 1.35
+# 分水岭: 仅当像「两个挨着的块」才拆 (宽扁单物如躺倒糖盒易误拆)
+SPLIT_MIN_WIDTH = 72
+SPLIT_MIN_AREA = 1100
+SPLIT_WIDTH_OVER_HEIGHT = 1.85
+SPLIT_PEAK_MIN_SEP = 0.28    # 两峰水平间距 / 宽度
+SPLIT_DEPTH_DIFF_M = 0.22    # 两 part 深度差够大才认为是两物
+
+MERGE_IOU = 0.35
+MERGE_CENTER_PX = 48
+MERGE_DEPTH_M = 0.28
 
 TRACK_MATCH_PX = 90
 TRACK_MAX_AGE = 15
@@ -210,8 +216,13 @@ class RgbdDetectPipeline:
             far_u8 = cv2.dilate(far_u8, k, iterations=1)
             detect = cv2.bitwise_or(detect, far_u8)
 
-        detect = cv2.morphologyEx(detect, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-        detect = cv2.morphologyEx(detect, cv2.MORPH_CLOSE, np.ones((4, 4), np.uint8))
+        # 近距不做 open (小目标会被腐蚀没); 远距 open 去噪
+        near_u8 = cv2.bitwise_and(detect, near.astype(np.uint8))
+        far_u8 = cv2.bitwise_and(detect, far.astype(np.uint8))
+        near_u8 = cv2.morphologyEx(near_u8, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+        far_u8 = cv2.morphologyEx(far_u8, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        far_u8 = cv2.morphologyEx(far_u8, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+        detect = cv2.bitwise_or(near_u8, far_u8)
         self._sat_thresh_far = sat_far
 
         self._debug = {
@@ -249,20 +260,25 @@ class RgbdDetectPipeline:
         }
 
     def _is_shadow_blob(
-        self, ys: np.ndarray, xs: np.ndarray, val: np.ndarray, h: int, lim: dict,
+        self, ys: np.ndarray, xs: np.ndarray, val: np.ndarray, sat: np.ndarray, h: int, lim: dict,
     ) -> bool:
         v = val[ys, xs]
+        s = sat[ys, xs]
         mean_v = float(np.mean(v))
-        if mean_v < lim["val_mean_min"]:
+        mean_s = float(np.mean(s))
+        # 高饱和黄块即使略暗也是物体; 只剔低饱和+暗 (地面影)
+        sat_ok = mean_s >= max(35.0, self._sat_thresh - 12.0)
+        if sat_ok and mean_v >= lim["val_mean_min"] - 12.0:
+            return False
+        if mean_v < lim["val_mean_min"] and mean_s < self._sat_thresh - 8.0:
             return True
         bw = int(xs.max() - xs.min() + 1)
         bh = int(ys.max() - ys.min() + 1)
         cy = float(np.mean(ys))
         aspect = bw / max(bh, 1)
-        # 画面下方细长暗块 = 自身/地面影
-        if cy > h * 0.68 and aspect > 2.2 and mean_v < 88:
+        if cy > h * 0.68 and aspect > 2.2 and mean_v < 88 and not sat_ok:
             return True
-        if aspect > 3.8 and mean_v < 92:
+        if aspect > 3.8 and mean_v < 92 and mean_s < self._sat_thresh:
             return True
         return False
 
@@ -301,8 +317,23 @@ class RgbdDetectPipeline:
         y1, y2 = int(ys2.min()), int(ys2.max())
         return self._expand_bbox(x1, y1, x2, y2, h, w, lim)
 
+    def _watershed_peak_separation(self, dist: np.ndarray, bw: int) -> float:
+        """两前景峰在水平方向的间距 / 宽度"""
+        flat = dist.flatten()
+        if flat.size < 4 or dist.max() < 4:
+            return 0.0
+        thr = 0.38 * float(dist.max())
+        peaks = np.where(dist >= thr)
+        if len(peaks[0]) < 2:
+            return 0.0
+        xs = peaks[1]
+        left = int(xs.min())
+        right = int(xs.max())
+        return float(right - left) / max(bw, 1)
+
     def _watershed_split(
-        self, ys: np.ndarray, xs: np.ndarray, rgb: np.ndarray, h: int, w: int,
+        self, ys: np.ndarray, xs: np.ndarray, rgb: np.ndarray, depth: np.ndarray,
+        h: int, w: int,
     ) -> List[Tuple[np.ndarray, np.ndarray]]:
         x1, x2 = int(xs.min()), int(xs.max())
         y1, y2 = int(ys.min()), int(ys.max())
@@ -315,7 +346,9 @@ class RgbdDetectPipeline:
         sub[ys, xs] = 255
         roi = sub[y1:y2 + 1, x1:x2 + 1]
         dist = cv2.distanceTransform(roi, cv2.DIST_L2, 5)
-        if dist.max() < 6:
+        if dist.max() < 8:
+            return [(ys, xs)]
+        if self._watershed_peak_separation(dist, bw) < SPLIT_PEAK_MIN_SEP:
             return [(ys, xs)]
 
         _, sure_fg = cv2.threshold(dist, 0.42 * dist.max(), 255, 0)
@@ -338,7 +371,16 @@ class RgbdDetectPipeline:
             if len(py) < MIN_BLOB_AREA_FAR:
                 continue
             parts.append((py + y1, px + x1))
-        return parts if len(parts) >= 2 else [(ys, xs)]
+        if len(parts) < 2:
+            return [(ys, xs)]
+
+        depths = []
+        for pys, pxs in parts:
+            d = self._blob_depth_m(pys, pxs, depth)
+            depths.append(d if d is not None else 999.0)
+        if max(depths) - min(depths) < SPLIT_DEPTH_DIFF_M:
+            return [(ys, xs)]
+        return parts
 
     def _blob_points_robot(self, ys: np.ndarray, xs: np.ndarray, depth: np.ndarray) -> Optional[np.ndarray]:
         """掩码像素 + depth → 机器人系 3D 点云"""
@@ -465,7 +507,7 @@ class RgbdDetectPipeline:
     ) -> Optional[dict]:
         depth_m0 = self._blob_depth_m(ys, xs, depth)
         lim = self._adaptive_limits(depth_m0)
-        if self._is_shadow_blob(ys, xs, val, h, lim):
+        if self._is_shadow_blob(ys, xs, val, sat, h, lim):
             return None
         ys, xs = self._refine_blob(ys, xs, val, lim)
         if len(ys) < lim["min_area"]:
@@ -500,6 +542,119 @@ class RgbdDetectPipeline:
             "source": "saturation+geom3d",
         }
 
+    @staticmethod
+    def _bbox_iou(a: List[int], b: List[int]) -> float:
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        iw, ih = max(0, ix2 - ix1 + 1), max(0, iy2 - iy1 + 1)
+        inter = iw * ih
+        if inter <= 0:
+            return 0.0
+        area_a = (ax2 - ax1 + 1) * (ay2 - ay1 + 1)
+        area_b = (bx2 - bx1 + 1) * (by2 - by1 + 1)
+        return float(inter) / max(area_a + area_b - inter, 1)
+
+    def _merge_overlapping_dets(self, dets: List[dict]) -> List[dict]:
+        """同一物体被 watershed 误拆 → 合并为一个框"""
+        if len(dets) < 2:
+            return dets
+        used = [False] * len(dets)
+        merged: List[dict] = []
+        for i, di in enumerate(dets):
+            if used[i]:
+                continue
+            group = [di]
+            used[i] = True
+            cxi, cyi = di["centroid"]
+            di_d = di.get("depth_m") or 999.0
+            for j in range(i + 1, len(dets)):
+                if used[j]:
+                    continue
+                dj = dets[j]
+                cxj, cyj = dj["centroid"]
+                dist_px = float(np.hypot(cxi - cxj, cyi - cyj))
+                dj_d = dj.get("depth_m") or 999.0
+                iou = self._bbox_iou(di["bbox"], dj["bbox"])
+                same_depth = abs(di_d - dj_d) < MERGE_DEPTH_M
+                if iou >= MERGE_IOU or (dist_px < MERGE_CENTER_PX and same_depth):
+                    group.append(dj)
+                    used[j] = True
+            if len(group) == 1:
+                merged.append(di)
+                continue
+            best = max(group, key=lambda x: x.get("conf", 0.0))
+            all_ys, all_xs = [], []
+            for g in group:
+                x1, y1, x2, y2 = g["bbox"]
+                all_ys.extend([y1, y2])
+                all_xs.extend([x1, x2])
+            merged.append({
+                **best,
+                "bbox": [min(all_xs), min(all_ys), max(all_xs), max(all_ys)],
+                "area": sum(g.get("area", 0) for g in group),
+            })
+        return merged
+
+    def _merge_nearby_labels(
+        self, labeled: np.ndarray, depth: np.ndarray, n: int,
+    ) -> Tuple[np.ndarray, int]:
+        """掩码裂成两块 (标签/反光) → 深度接近则合并, 避免整块被 min_area 刷掉"""
+        if n < 2:
+            return labeled, n
+        parent = list(range(n + 1))
+
+        def find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def unite(a: int, b: int) -> None:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        info = []
+        for cid in range(1, n + 1):
+            ys, xs = np.where(labeled == cid)
+            if len(ys) == 0:
+                continue
+            d = self._blob_depth_m(ys, xs, depth)
+            info.append({
+                "id": cid,
+                "cx": float(np.mean(xs)),
+                "cy": float(np.mean(ys)),
+                "area": len(ys),
+                "depth": d if d is not None else 999.0,
+            })
+
+        for i in range(len(info)):
+            for j in range(i + 1, len(info)):
+                a, b = info[i], info[j]
+                if float(np.hypot(a["cx"] - b["cx"], a["cy"] - b["cy"])) > 55:
+                    continue
+                if abs(a["depth"] - b["depth"]) > 0.35:
+                    continue
+                if a["area"] < MIN_BLOB_AREA_NEAR * 3 and b["area"] < MIN_BLOB_AREA_NEAR * 3:
+                    unite(a["id"], b["id"])
+
+        remap = {k: find(k) for k in range(1, n + 1)}
+        if len(set(remap.values())) == n:
+            return labeled, n
+
+        out = np.zeros_like(labeled)
+        next_id = 1
+        id_map: Dict[int, int] = {}
+        for cid in range(1, n + 1):
+            root = find(cid)
+            if root not in id_map:
+                id_map[root] = next_id
+                next_id += 1
+            out[labeled == cid] = id_map[root]
+        return out, next_id - 1
+
     def detect(self, rgb: np.ndarray, depth: np.ndarray) -> List[dict]:
         depth = sanitize_depth(depth)
         h, w = depth.shape
@@ -509,6 +664,8 @@ class RgbdDetectPipeline:
         self._last_rgb = rgb
 
         labeled, n = ndimage.label(mask > 0)
+        labeled, n = self._merge_nearby_labels(labeled, depth, n)
+        self._mask_components = int(n)
         if n == 0:
             return []
 
@@ -518,11 +675,13 @@ class RgbdDetectPipeline:
             if len(ys) > MAX_BLOB_AREA:
                 continue
 
-            parts = self._watershed_split(ys, xs, rgb, h, w)
+            parts = self._watershed_split(ys, xs, rgb, depth, h, w)
             for pys, pxs in parts:
                 det = self._blob_to_det(pys, pxs, depth, sat, val, rgb, h, w)
                 if det is not None:
                     dets.append(det)
+
+        dets = self._merge_overlapping_dets(dets)
 
         dets.sort(key=lambda x: (x["depth_m"] if x["depth_m"] is not None else 999, -x["area"]))
         return dets[:MAX_DETECTIONS]
@@ -586,6 +745,7 @@ class RgbdDetectPipeline:
             "sat_thresh": info["thresh"],
             "sat_thresh_far": info.get("thresh_far", info["thresh"]),
             "sat_ground_ref": info["ground_ref"],
+            "mask_components": getattr(self, "_mask_components", 0),
             "gripper": {"is_holding": False, "width": 0.04},
             "progress": {"total": TOTAL_OBJECTS, "inside_bin": 0, "remaining": TOTAL_OBJECTS},
             "robot": {"pos_world": ROBOT_INIT_POS.tolist(), "yaw": float(ROBOT_INIT_YAW)},
