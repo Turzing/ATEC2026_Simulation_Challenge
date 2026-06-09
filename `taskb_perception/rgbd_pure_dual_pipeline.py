@@ -82,6 +82,21 @@ def _obj_dist(obj: Optional[dict]) -> float:
     return float(dr) if dr is not None else 999.0
 
 
+def _best_head_grasp_target(objs: List[dict]) -> Optional[dict]:
+    """head 抓取: 优先高饱和真物体, 剔除影子大块后选最近"""
+    if not objs:
+        return None
+    scored = []
+    for o in objs:
+        sm = float(o.get("blob_sat_mean", 0))
+        vm = float(o.get("blob_val_mean", 0))
+        area = int((o["bbox"][2] - o["bbox"][0] + 1) * (o["bbox"][3] - o["bbox"][1] + 1))
+        q = sm * 0.6 + vm * 0.25 - min(area, 4000) * 0.004
+        scored.append((q, o))
+    scored.sort(key=lambda x: (-x[0], _obj_dist(x[1])))
+    return scored[0][1]
+
+
 def _best_nav_target(objs: List[dict]) -> Optional[dict]:
     """EE 导航: 最近目标; 深度接近时取 conf 更高"""
     if not objs:
@@ -154,7 +169,7 @@ class RgbdPureDualPipeline:
 
         head_objs = self._temporal.apply(head_objs, "head", rp, ry)
         ee_objs = self._temporal.apply(ee_objs, "ee", rp, ry)
-        head_tgt = min(head_objs, key=_obj_dist) if head_objs else None
+        head_tgt = _best_head_grasp_target(head_objs)
         ee_tgt = min(ee_objs, key=_obj_dist) if ee_objs else None
 
         head_d = _obj_dist(head_tgt)
