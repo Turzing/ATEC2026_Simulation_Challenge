@@ -198,6 +198,22 @@ def main():
                 robot_pos = np.array([-10.0, -10.0, 0.68], dtype=np.float32)
                 robot_yaw = 0.0
 
+            # ---- 一次性诊断: 列出场景中所有物体属性 ----
+            if episode == 1 and sim_step == 0:
+                print("[DIAG] Scene attributes:", sorted([a for a in dir(env.unwrapped.scene) if not a.startswith('_')]))
+                # 试读 object_1
+                try:
+                    p = env.unwrapped.scene.object_1.data.root_pos_w[0].cpu().numpy()
+                    print(f"[DIAG] object_1 pos = {p}")
+                except Exception as e:
+                    print(f"[DIAG] object_1: {e}")
+                # 也试试 Object1
+                try:
+                    p = env.unwrapped.scene.Object1.data.root_pos_w[0].cpu().numpy()
+                    print(f"[DIAG] Object1 pos = {p}")
+                except Exception as e:
+                    print(f"[DIAG] Object1: {e}")
+
             # ---- 获取物体世界坐标 → 像素 bbox ----
             labels = []
             visible_count = 0
