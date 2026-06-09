@@ -64,15 +64,18 @@ from config import (
 # =============================================================================
 # 可调参数 — 仿真里不对就改这里
 # =============================================================================
-DEPTH_MIN = 0.45          # 最近有效深度 (m)
-DEPTH_MAX = 7.5           # 最远有效深度 (m)
-WORLD_Z_MIN = 0.06        # 物体最低点 (地面以上, m)
-WORLD_Z_MAX = 0.38        # 物体最高点 (m)
-MIN_CLUSTER_PIXELS = 60   # 簇最小像素数
+DEPTH_MIN = 0.25          # 最近有效深度 (m)
+DEPTH_MAX = 8.0           # 最远有效深度 (m)
+WORLD_Z_MIN = 0.03        # 世界系高度: 地面杂物 (糖盒~0.15m)
+WORLD_Z_MAX = 0.45        # 世界系高度上限
+MIN_CLUSTER_PIXELS = 25   # 簇最小像素数 (远处物体很小)
 MAX_CLUSTERS = 20         # 每帧最多保留簇数
 TRACK_MATCH_DIST = 0.35   # 跨帧 3D 关联距离 (m)
 TRACK_MAX_AGE = 25        # 丢失多少帧后删 track
-GROUND_ROBOT_Z_MAX = -0.02  # 机器人系下低于此视为地面 (m)
+# 头顶相机俯视: 物体多在画面中部偏下 (比例 0~1)
+ROI_V_MIN = 0.22
+ROI_V_MAX = 0.92
+DEPTH_ABOVE_GROUND = 0.04  # 比局部地面近多少 (m) 视为前景
 
 
 def quat_multiply(q1, q2):
@@ -183,38 +186,63 @@ class RgbdPerceptionPipeline:
   def _pixel_to_world(self, u: float, v: float, depth: float) -> Optional[np.ndarray]:
       if depth <= 0 or not np.isfinite(depth):
           return None
+      if depth < DEPTH_MIN or depth > DEPTH_MAX:
+          return None
       p_cam = self._pixel_depth_to_cam(u, v, depth)
-      if p_cam[2] < DEPTH_MIN:
+      if p_cam[2] <= 0.05:
           return None
       return self._robot_to_world(self._cam_to_robot(p_cam))
 
   # ------------------------------------------------------------------ RGB-D 检测
-  def _build_object_mask(self, depth: np.ndarray) -> np.ndarray:
-      """有效深度 + 高度过滤 → 前景 mask"""
+  def _world_z_map(self, depth: np.ndarray) -> np.ndarray:
+      """深度图 → 每个像素的世界系 Z"""
       h, w = depth.shape
-      valid = (depth > DEPTH_MIN) & (depth < DEPTH_MAX) & np.isfinite(depth)
-
       us = np.arange(w, dtype=np.float32)
       vs = np.arange(h, dtype=np.float32)
       uu, vv = np.meshgrid(us, vs)
-
       x = (uu - HEAD_CAM["cx"]) / HEAD_CAM["fx"] * depth
       y = (vv - HEAD_CAM["cy"]) / HEAD_CAM["fy"] * depth
-      z = depth
-      p_cam = np.stack([x, y, z], axis=-1)
+      p_cam = np.stack([x, y, depth], axis=-1)
       p_robot = np.einsum("ij,...j->...i", self.head_cam2robot, p_cam) + self.head_pos_robot
       c, s = np.cos(self.robot_yaw), np.sin(self.robot_yaw)
       rot = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=np.float32)
       p_world = np.einsum("ij,...j->...i", rot, p_robot) + self.robot_pos
+      return p_world[..., 2]
 
-      height_ok = (p_world[..., 2] >= WORLD_Z_MIN) & (p_world[..., 2] <= WORLD_Z_MAX)
-      not_ground_robot = p_robot[..., 2] > GROUND_ROBOT_Z_MAX
+  def _build_object_mask(self, depth: np.ndarray) -> np.ndarray:
+      """有效深度 + 世界高度 / 相对深度 → 前景 mask"""
+      h, w = depth.shape
+      valid = (depth > DEPTH_MIN) & (depth < DEPTH_MAX) & np.isfinite(depth)
 
-      # 去掉画面最下方机器人自身 (启发式)
-      not_robot_body = vv < int(h * 0.88)
+      vs = np.arange(h, dtype=np.float32)
+      vv = np.meshgrid(np.arange(w), vs)[1]
+      in_roi = (vv >= int(h * ROI_V_MIN)) & (vv <= int(h * ROI_V_MAX))
 
-      mask = valid & height_ok & not_ground_robot & not_robot_body
-      return mask.astype(np.uint8)
+      world_z = self._world_z_map(depth)
+      height_ok = (world_z >= WORLD_Z_MIN) & (world_z <= WORLD_Z_MAX)
+
+      # 相对深度: 比画面下半部地面更近的凸起 (不依赖里程计也很稳)
+      v0, v1 = int(h * ROI_V_MIN), int(h * 0.75)
+      roi = depth[v0:v1, :]
+      roi_valid = roi[(roi > DEPTH_MIN) & (roi < DEPTH_MAX)]
+      if len(roi_valid) > 100:
+          ground_d = float(np.percentile(roi_valid, 35))
+      else:
+          ground_d = float(np.median(depth[valid])) if np.any(valid) else 3.0
+      protrude = depth < (ground_d - DEPTH_ABOVE_GROUND)
+
+      mask = valid & in_roi & (height_ok | protrude)
+      mask = mask.astype(np.uint8)
+      mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+      mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+      self._last_debug_mask = mask
+      return mask
+
+  def get_debug_mask(self, depth: np.ndarray) -> np.ndarray:
+      """调试用: 看哪些像素被当成前景 (白=前景)"""
+      if getattr(self, "_last_debug_mask", None) is not None:
+          return (self._last_debug_mask * 255).astype(np.uint8)
+      return (self._build_object_mask(depth) * 255).astype(np.uint8)
 
   def _cluster_mask(self, mask: np.ndarray) -> Tuple[np.ndarray, int]:
       labeled, n = ndimage.label(mask)
@@ -400,6 +428,8 @@ class RgbdPerceptionPipeline:
 
       dep = (h_dep.cpu() if hasattr(h_dep, "device") and h_dep.device.type == "cuda" else h_dep)
       dep = np.asarray(dep, dtype=np.float32).squeeze()
+      if dep.ndim == 3:
+          dep = dep[..., 0]
 
       p_np = (proprio.cpu() if hasattr(proprio, "device") and proprio.device.type == "cuda" else proprio)
       p_np = np.asarray(p_np, dtype=np.float32)

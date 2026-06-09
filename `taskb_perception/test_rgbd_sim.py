@@ -190,9 +190,15 @@ class ManualKeyboard:
         return self.walk.get_action(obs, step, turn_bias=tb)
 
 
-def draw_vis(rgb, out_dict):
+def draw_vis(rgb, out_dict, pipeline=None, depth_np=None):
     vis = cv2.cvtColor(rgb.copy(), cv2.COLOR_RGB2BGR)
     h, w = vis.shape[:2]
+    n_obj = len(out_dict.get("objects_detailed", []))
+    if n_obj == 0 and pipeline is not None and depth_np is not None:
+        mask = pipeline.get_debug_mask(depth_np)
+        small = cv2.resize(mask, (w // 4, h // 4))
+        vis[h - small.shape[0]:, w - small.shape[1]:] = cv2.cvtColor(small, cv2.COLOR_GRAY2BGR)
+        cv2.putText(vis, "mask", (w - small.shape[1] + 4, h - 6), 0, 0.35, (0, 255, 255), 1)
     for obj in out_dict.get("objects_detailed", []):
         x1, y1, x2, y2 = [int(v) for v in obj["bbox"]]
         c = COLORS_BGR.get(obj["class"], (255, 255, 255))
@@ -213,7 +219,7 @@ def draw_vis(rgb, out_dict):
     else:
         cv2.putText(vis, "TARGET None — walk to objects (WASD)", (8, h - 8),
                     0, 0.5, (0, 0, 255), 2)
-    cv2.putText(vis, f"objects={len(out_dict.get('objects_detailed', []))}",
+    cv2.putText(vis, f"objects={n_obj}",
                 (8, 22), 0, 0.55, (255, 255, 255), 2)
     cv2.putText(vis, "P=save  Q=quit (no SPACE)", (8, 42), 0, 0.45, (200, 200, 200), 1)
     return vis
@@ -321,8 +327,12 @@ def _run_loop(env, out_dir, log_path, use_gui, manual, pipeline, device):
 
                 rgb = obs["image"]["head_rgb"].squeeze(0)
                 rgb_np = (rgb.cpu() if rgb.device.type == "cuda" else rgb).numpy().astype(np.uint8)
+                depth = obs["image"]["head_depth"].squeeze(0)
+                depth_np = (depth.cpu() if depth.device.type == "cuda" else depth).numpy().astype(np.float32).squeeze()
+                if depth_np.ndim == 3:
+                    depth_np = depth_np[..., 0]
 
-                vis = draw_vis(rgb_np, out)
+                vis = draw_vis(rgb_np, out, pipeline=pipeline, depth_np=depth_np)
                 if do_save:
                     path = os.path.join(out_dir, f"vis_{saved:04d}.png")
                     cv2.imwrite(path, vis)
