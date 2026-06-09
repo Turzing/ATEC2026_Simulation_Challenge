@@ -57,10 +57,16 @@ CAMERA_CFG = {
         "roi_v_max": 0.78,
         "roi_v_max_near": 0.93,
         "roi_u_margin": 0.05,
-        "relief_min": 0.026,
-        "relief_min_near": 0.018,
-        "ground_k": 19,
-        "sat_extra": 12,
+        "relief_min": 0.018,
+        "relief_min_near": 0.012,
+        "ground_k": 17,
+        "sat_extra": 10,
+        "sat_relax": 14,
+        "min_area": 28,
+        "min_side": 5,
+        "min_track_hits": 1,
+        "mask_close_k": 9,
+        "fusion_mode": "soft",  # relief 弱时 RGB+depth 兜底
     },
     "ee": {
         "cam": EE_CAM,
@@ -70,14 +76,18 @@ CAMERA_CFG = {
         "roi_v_max": 0.96,
         "roi_v_max_near": 0.96,
         "roi_u_margin": 0.04,
-        "relief_min": 0.014,
-        "relief_min_near": 0.012,
-        "ground_k": 13,
-        "sat_extra": 6,
-        "min_area": 22,
-        "min_side": 4,
+        "relief_min": 0.010,
+        "relief_min_near": 0.008,
+        "ground_k": 11,
+        "sat_extra": 4,
+        "sat_relax": 22,
+        "min_area": 14,
+        "min_side": 3,
         "min_track_hits": 1,
-        "far_mask_dilate": 5,
+        "far_mask_dilate": 7,
+        "rgb_dilate_far": 5,
+        "mask_close_k": 7,
+        "fusion_mode": "rgb_depth",  # 远距: 黄+有效深度 (relief 常失效)
     },
 }
 
@@ -87,8 +97,9 @@ DEPTH_MAX = 11.0
 GROUND_OPEN_K = 19
 RELIEF_MIN = 0.026
 RELIEF_MIN_NEAR = 0.018
-RELIEF_MAX = 0.24
+RELIEF_MAX = 0.28
 NEAR_DEPTH_M = 1.15
+CLOSER_THAN_BG_M = 0.012
 
 # ── 画面 ROI ─────────────────────────────────────────────────────
 ROI_V_MIN = 0.10
@@ -199,6 +210,58 @@ class RgbdPureCamera:
         g[~valid] = 0.0
         return g
 
+    def _rgb_foreground(
+        self, hue, sat, val, roi: np.ndarray, valid: np.ndarray, near: bool,
+    ) -> np.ndarray:
+        c = self._cfg
+        g_sat = float(np.percentile(sat[roi & valid], 50)) if np.any(roi & valid) else 28.0
+        relax = int(c.get("sat_relax", 12))
+        sat_thr = max(SAT_MIN - 6, g_sat + c["sat_extra"])
+        sat_lo = max(16, sat_thr - relax)
+        val_lo = VAL_MIN - (10 if self.camera_name == "ee" else 6)
+        yellow = (
+            (hue >= HUE_LO) & (hue <= HUE_HI)
+            & (sat >= sat_lo) & (val >= val_lo)
+        )
+        high_sat = sat >= max(sat_lo + 4, sat_thr - 6)
+        return (yellow | high_sat) & roi
+
+    def _depth_gate(
+        self, depth: np.ndarray, relief: np.ndarray, valid: np.ndarray,
+        roi: np.ndarray, near: bool,
+    ) -> np.ndarray:
+        """Depth 校验: relief 凸起 或 比场景地面更近 (仿真里 relief 常很弱)"""
+        c = self._cfg
+        mode = c.get("fusion_mode", "soft")
+        rmin = c["relief_min_near"] if near else c["relief_min"]
+        depth_fg = (relief >= rmin) & (relief <= RELIEF_MAX) & valid
+
+        roi_d = depth[roi & valid]
+        closer = np.zeros_like(depth, dtype=bool)
+        if roi_d.size > 80:
+            d_bg = float(np.percentile(roi_d, 58))
+            closer = valid & (depth < d_bg - CLOSER_THAN_BG_M)
+
+        if mode == "rgb_depth":
+            return valid & (depth > 0.38) & (depth < 10.5)
+
+        if near:
+            return valid & (depth_fg | closer | (depth < NEAR_DEPTH_M))
+        return valid & (depth_fg | closer)
+
+    @staticmethod
+    def _close_components(mask: np.ndarray, ksize: int) -> np.ndarray:
+        labeled, n = ndimage.label(mask > 0)
+        if n == 0:
+            return mask
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+        out = np.zeros_like(mask)
+        for cid in range(1, n + 1):
+            comp = (labeled == cid).astype(np.uint8) * 255
+            comp = cv2.morphologyEx(comp, cv2.MORPH_CLOSE, k)
+            out = cv2.bitwise_or(out, comp)
+        return out
+
     def _build_fusion_mask(self, rgb: np.ndarray, depth: np.ndarray) -> np.ndarray:
         h, w = depth.shape
         near = self._scene_near(depth)
@@ -208,40 +271,42 @@ class RgbdPureCamera:
 
         ground = self._ground_depth(depth, valid)
         relief = ground - depth
-        rmin = c["relief_min_near"] if near else c["relief_min"]
-        depth_fg = (relief >= rmin) & (relief <= RELIEF_MAX) & valid
 
         hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
         hue, sat, val = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
-        g_sat = float(np.percentile(sat[roi & valid], 55)) if np.any(roi & valid) else 30.0
-        sat_thr = max(SAT_MIN, g_sat + c["sat_extra"])
-        yellow = (
-            (hue >= HUE_LO) & (hue <= HUE_HI)
-            & (sat >= sat_thr - 10) & (val >= VAL_MIN)
-        )
-        rgb_fg = yellow | (sat >= sat_thr + 4)
+        rgb_fg = self._rgb_foreground(hue, sat, val, roi, valid, near)
 
-        fused = (depth_fg & rgb_fg & roi).astype(np.uint8)
-        fused = cv2.morphologyEx(fused, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+        rd = int(c.get("rgb_dilate_far", 0))
+        if self.camera_name == "ee" and not near and rd > 0:
+            rk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (rd, rd))
+            rgb_fg = cv2.dilate(rgb_fg.astype(np.uint8), rk, 1).astype(bool)
+
+        depth_ok = self._depth_gate(depth, relief, valid, roi, near)
+        fused = (rgb_fg & depth_ok).astype(np.uint8)
+
+        min_a = int(c.get("min_area", MIN_AREA))
+        if int(np.sum(fused)) < min_a and int(np.sum(rgb_fg & valid)) >= min_a // 2:
+            fused = (rgb_fg & valid & roi).astype(np.uint8)
+
+        if self.camera_name == "head" and near:
+            um = c["roi_u_margin"]
+            strip = np.zeros((h, w), dtype=bool)
+            strip[int(h * 0.60) : h - 2, int(w * um) : int(w * (1 - um))] = True
+            fused = cv2.bitwise_or(fused, (rgb_fg & valid & strip).astype(np.uint8))
+
+        ck = int(c.get("mask_close_k", 5))
+        fused = self._close_components(fused, ck)
 
         fd = int(c.get("far_mask_dilate", 0))
         if self.camera_name == "ee" and not near and fd > 0:
             k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (fd, fd))
             fused = cv2.dilate(fused, k, iterations=1)
 
-        if self.camera_name == "head" and near and int(np.sum(fused)) < MIN_AREA:
-            strip = np.zeros((h, w), dtype=bool)
-            um = c["roi_u_margin"]
-            strip[int(h * 0.62) : h - 2, int(w * um) : int(w * (1 - um))] = True
-            fused2 = (rgb_fg & valid & strip).astype(np.uint8)
-            fused2 = cv2.morphologyEx(fused2, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
-            fused = cv2.bitwise_or(fused, fused2)
-
         self._debug = {
             "relief": np.clip(relief / RELIEF_MAX * 255, 0, 255).astype(np.uint8),
-            "depth_fg": (depth_fg & roi).astype(np.uint8) * 255,
+            "depth_fg": (depth_ok & roi).astype(np.uint8) * 255,
             "rgb_fg": (rgb_fg & roi).astype(np.uint8) * 255,
-            "fusion": fused * 255,
+            "fusion": fused.astype(np.uint8) * 255,
         }
         return fused
 
@@ -257,7 +322,7 @@ class RgbdPureCamera:
         d = d[(d > DEPTH_MIN) & (d < DEPTH_MAX)]
         if len(d) < 5:
             return None
-        depth_m = float(np.median(d))
+        depth_m = float(np.percentile(d, 42 if len(d) >= 12 else 50))
         x1, x2 = int(xs.min()), int(xs.max())
         y1, y2 = int(ys.min()), int(ys.max())
         bw, bh = x2 - x1 + 1, y2 - y1 + 1

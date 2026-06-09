@@ -102,8 +102,13 @@ def draw_vis(head_rgb, ee_rgb, out, pipeline, head_depth):
             if dm:
                 lab += f" {dm:.1f}m"
             cv2.putText(ee_vis, lab, (x1, max(12, y1 - 2)), 0, 0.35, c, 1)
-        cv2.rectangle(ee_vis, (0, 0), (ew - 1, eh - 1), (0, 255, 255), 2)
-        cv2.putText(ee_vis, "EE nav far", (4, 14), 0, 0.38, (0, 255, 255), 1)
+        ee_fus = pipeline.get_debug("ee", "fusion")
+        if ee_fus is not None:
+            fus_s = cv2.resize(ee_fus, (ew, eh))
+            ee_vis[fus_s > 40] = (0, 200, 0)
+        n_ee = len(ee_objs)
+        cv2.rectangle(ee_vis, (0, 0), (ew - 1, eh - 1), (0, 255, 0) if n_ee else (0, 80, 255), 2)
+        cv2.putText(ee_vis, f"EE nav ({n_ee})", (4, 14), 0, 0.38, (0, 255, 255), 1)
         vis[8:8 + eh, w - ew - 8:w - 8] = ee_vis
 
     nav_cam = out.get("navigation", {}).get("camera", "?")
