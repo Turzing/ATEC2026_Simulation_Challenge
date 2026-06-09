@@ -253,19 +253,36 @@ def main():
     use_gui = not getattr(args_cli, "headless", False)
     policy = resolve_policy()
 
-    env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=1)
-    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array")
-    if isinstance(env.unwrapped, DirectMARLEnv):
-        env = multi_agent_to_single_agent(env)
-    apply_safe_action_spec(env)
+    sim_device = args_cli.device
+    env_cfg = parse_env_cfg(
+        args_cli.task, device=sim_device, num_envs=1,
+        use_fabric=not getattr(args_cli, "disable_fabric", False),
+    )
+    env_cfg = apply_safe_action_spec(env_cfg, "{}")
 
-    pipeline = RgbdPerceptionPipeline()
-    device = env.unwrapped.device
-    manual = ManualKeyboard(device, policy) if args_cli.mode == "manual" else None
+    env = None
+    try:
+        env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array")
+        if isinstance(env.unwrapped, DirectMARLEnv):
+            env = multi_agent_to_single_agent(env)
 
-    print_help()
-    print(f"Output folder: {out_dir}", flush=True)
+        pipeline = RgbdPerceptionPipeline()
+        device = env.unwrapped.device
+        manual = ManualKeyboard(device, policy) if args_cli.mode == "manual" else None
 
+        print_help()
+        print(f"Output folder: {out_dir}", flush=True)
+        _run_loop(env, out_dir, log_path, use_gui, manual, pipeline, device)
+    except Exception as e:
+        print(f"[test_rgbd_sim] ERROR: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+    finally:
+        if env is not None:
+            _shutdown(env)
+
+
+def _run_loop(env, out_dir, log_path, use_gui, manual, pipeline, device):
     obs, _ = env.reset()
     for _ in range(15):
         obs, _, _, _, _ = env.step(torch.zeros(1, 20, dtype=torch.float32, device=device))
@@ -338,8 +355,17 @@ def main():
     if args_cli.live:
         cv2.destroyAllWindows()
     print(f"Done. {saved} images in {out_dir}", flush=True)
-    env.close()
-    simulation_app.close()
+
+
+def _shutdown(env):
+    try:
+        env.close()
+    except Exception:
+        pass
+    try:
+        simulation_app.close()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
