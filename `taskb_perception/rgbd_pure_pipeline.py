@@ -1,11 +1,11 @@
 """
-ATEC Task B — 老师版 RGB-D（depth 凸起 + RGB 黄色融合）
+ATEC Task B — RGB-D 双摄感知
 
-单摄:
-    from rgbd_pure_pipeline import RgbdPurePipeline
-    out = RgbdPurePipeline().process(obs)
+RGB: HSV 黄 / 分深度段饱和度
+Depth: relief 融合 + 掩码点云反投影 + PCA 3D 形状分类 (head)
+EE:   列出物体 + depth_m / dist (导航)
+Head: pos_world + grasp_pos_world + grasp_quat_world (抓取)
 
-双摄 (老师要求: 爪远 head 近):
     from rgbd_pure_dual_pipeline import RgbdPureDualPipeline
     out = RgbdPureDualPipeline().process(obs)
 """
@@ -23,11 +23,13 @@ from scipy import ndimage
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import (
     CLASS_NAME_TO_ID,
+    DEFAULT_GRASP_FIXED_QUAT,
     DEFAULT_OBJECT_SIZE,
     EE_CAM,
     EE_CAM_POS_ROBOT,
     EE_CAM_ROT_MATRIX,
     GRASP_DEPTH_OFFSET,
+    GRASP_FIXED_QUAT,
     HEAD_CAM,
     HEAD_CAM_POS_ROBOT,
     HEAD_CAM_ROT_MATRIX,
@@ -157,6 +159,44 @@ DEPTH_POINT_TOL_NEAR = 0.05
 MAX_BLOB_DEPTH_STD = 0.065
 MIN_BLOB_SAT_MEAN = 38
 SHADOW_VAL_MAX = 72
+
+# ── 3D 形状分类 (head 精定位 / ee 辅助) ───────────────────────────
+MIN_3D_POINTS = 8
+MIN_CLASS_MARGIN = 0.10
+GEOM_MATCH_SIGMA = 0.065
+RATIO_MATCH_SIGMA = 0.35
+FLAT_TOP_E0_M = 0.045
+FLAT_TOP_E1_M = 0.085
+SHALLOW_TOP_E0_M = 0.055
+HEAD_DEPTH_POINT_TOL = 0.06
+EE_DEPTH_POINT_TOL_NEAR = 0.10
+EE_DEPTH_POINT_TOL_FAR = 0.14
+
+
+def _build_ratio_templates() -> Dict[str, Tuple[float, float]]:
+    out: Dict[str, Tuple[float, float]] = {}
+    for name in OBJECT_SIZES:
+        e = np.sort([OBJECT_SIZES[name]["lx"], OBJECT_SIZES[name]["ly"], OBJECT_SIZES[name]["lz"]])
+        out[name] = (float(e[1] / max(e[0], 1e-4)), float(e[2] / max(e[1], 1e-4)))
+    return out
+
+
+_CLASS_RATIO_TEMPLATES = _build_ratio_templates()
+
+
+def _quat_multiply_wxyz(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
+    w1, x1, y1, z1 = [float(v) for v in q1]
+    w2, x2, y2, z2 = [float(v) for v in q2]
+    return np.array([
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+    ], dtype=np.float32)
+
+
+def _quat_from_yaw_wxyz(yaw: float) -> np.ndarray:
+    return np.array([np.cos(yaw * 0.5), 0.0, 0.0, np.sin(yaw * 0.5)], dtype=np.float32)
 
 
 def _yaw_from_gravity(g) -> float:
@@ -684,19 +724,173 @@ class RgbdPureCamera:
         d_inner = float(np.median(inner_d)) if len(inner_d) >= 3 else d_mask
         return float(np.median([d_mask, d_inner]))
 
-    def _pos_from_mask(
-        self, ys: np.ndarray, xs: np.ndarray, depth: np.ndarray,
+    def _filter_blob_pixels_by_depth(
+        self, ys: np.ndarray, xs: np.ndarray, depth: np.ndarray, depth_m: float,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        d = depth[ys, xs]
+        dmin = self._depth_min()
+        ok = (d > dmin) & (d < DEPTH_MAX)
+        if int(np.sum(ok)) < MIN_3D_POINTS:
+            return ys, xs
+        if self.camera_name == "head":
+            tol = HEAD_DEPTH_POINT_TOL
+        else:
+            tol = EE_DEPTH_POINT_TOL_NEAR if depth_m < FAR_DEPTH_M else EE_DEPTH_POINT_TOL_FAR
+        d_med = float(np.median(d[ok]))
+        keep = ok & (d <= d_med + tol) & (d >= d_med - tol * 0.55)
+        if int(np.sum(keep)) >= max(6, MIN_3D_POINTS // 2):
+            return ys[keep], xs[keep]
+        return ys, xs
+
+    def _blob_points_robot(
+        self, ys: np.ndarray, xs: np.ndarray, depth: np.ndarray, depth_m: float,
     ) -> Optional[np.ndarray]:
+        ys, xs = self._filter_blob_pixels_by_depth(ys, xs, depth, depth_m)
         pts = []
-        step = 1 if len(ys) < 120 else 2
+        step = 1 if len(ys) < 400 else 2
+        dmin = self._depth_min()
         for y, x in zip(ys[::step], xs[::step]):
             z = float(depth[y, x])
-            if z <= self._depth_min() or z >= DEPTH_MAX:
+            if z <= dmin or z >= DEPTH_MAX:
                 continue
             pts.append(self._uv_depth_to_robot(float(x), float(y), z))
-        if len(pts) < 5:
+        if len(pts) < MIN_3D_POINTS:
             return None
-        return np.median(np.stack(pts, axis=0), axis=0).astype(np.float32)
+        return np.stack(pts, axis=0).astype(np.float32)
+
+    @staticmethod
+    def _template_extents(name: str) -> np.ndarray:
+        s = OBJECT_SIZES[name]
+        return np.sort([s["lx"], s["ly"], s["lz"]]).astype(np.float32)
+
+    def _pca_sorted_extents(self, pts: np.ndarray) -> np.ndarray:
+        centered = pts - np.mean(pts, axis=0)
+        if len(centered) < MIN_3D_POINTS:
+            return np.sort(np.ptp(pts, axis=0)).astype(np.float32)
+        try:
+            _, _, vt = np.linalg.svd(centered, full_matrices=False)
+            ext = np.ptp(centered @ vt.T, axis=0)
+        except np.linalg.LinAlgError:
+            ext = np.ptp(pts, axis=0)
+        return np.sort(np.maximum(ext, 1e-4)).astype(np.float32)
+
+    @staticmethod
+    def _extent_ratios(ext: np.ndarray) -> Tuple[float, float, float]:
+        e0, e1, e2 = float(ext[0]), float(ext[1]), float(ext[2])
+        return e1 / max(e0, 1e-4), e2 / max(e1, 1e-4), e0 / max(e2, 1e-4)
+
+    def _score_3d_shape(self, ext: np.ndarray) -> Dict[str, float]:
+        r10, r21, flat = self._extent_ratios(ext)
+        scores: Dict[str, float] = {}
+        for name in OBJECT_SIZES:
+            t_ext = self._template_extents(name)
+            d_ext = float(np.linalg.norm(ext - t_ext))
+            s_ext = float(np.exp(-(d_ext / GEOM_MATCH_SIGMA) ** 2))
+            tr10, tr21 = _CLASS_RATIO_TEMPLATES[name]
+            d_ratio = float(np.hypot(r10 - tr10, r21 - tr21))
+            s_ratio = float(np.exp(-(d_ratio / RATIO_MATCH_SIGMA) ** 2))
+            scores[name] = 0.38 * s_ext + 0.62 * s_ratio
+        if r10 < 1.18:
+            scores["banana"] = scores.get("banana", 0) * 1.55
+            scores["sugar_box"] = scores.get("sugar_box", 0) * 0.75
+        if flat < 0.26 and r10 > 1.35:
+            scores["sugar_box"] = scores.get("sugar_box", 0) * 1.45
+        if 1.25 < r10 < 1.65 and 1.9 < r21 < 2.8:
+            scores["mustard_bottle"] = scores.get("mustard_bottle", 0) * 1.40
+        total = sum(scores.values()) + 1e-6
+        return {k: v / total for k, v in scores.items()}
+
+    @staticmethod
+    def _classify_2d_shape(
+        bbox: List[int], area: int, sat_mean: float, depth_m: Optional[float] = None,
+    ) -> Tuple[str, float]:
+        x1, y1, x2, y2 = bbox
+        bw, bh = max(1, x2 - x1 + 1), max(1, y2 - y1 + 1)
+        asp = max(bw, bh) / min(bw, bh)
+        fill = area / max(bw * bh, 1)
+        vert, horiz = bh >= bw * 1.20, bw >= bh * 1.20
+        if fill > 0.36 and asp < 1.50:
+            conf = 0.72 if (depth_m is not None and depth_m < 1.30) else 0.65
+            return "sugar_box", conf
+        if vert and asp >= 1.32:
+            return "mustard_bottle", min(0.86, 0.56 + 0.11 * (asp - 1.32))
+        if horiz and asp >= 1.22:
+            return "banana", min(0.84, 0.54 + 0.13 * (asp - 1.22))
+        if asp >= 1.72:
+            return ("mustard_bottle", 0.64) if vert else ("banana", 0.66)
+        if asp < 1.16:
+            return "sugar_box", 0.60
+        return "sugar_box", 0.55
+
+    def _classify_object(
+        self,
+        bbox: List[int],
+        area: int,
+        ys: np.ndarray,
+        xs: np.ndarray,
+        depth: np.ndarray,
+        sat_mean: float,
+        depth_m: float,
+        use_3d: bool,
+    ) -> Tuple[str, float, Optional[List[float]]]:
+        name_2d, conf_2d = self._classify_2d_shape(bbox, area, sat_mean, depth_m)
+        if not use_3d:
+            return name_2d, conf_2d, None
+        pts = self._blob_points_robot(ys, xs, depth, depth_m)
+        if pts is None:
+            return name_2d, conf_2d * 0.85, None
+        ext = self._pca_sorted_extents(pts)
+        e0, e1, e2 = float(ext[0]), float(ext[1]), float(ext[2])
+        if (
+            (e0 < FLAT_TOP_E0_M and e1 < FLAT_TOP_E1_M)
+            or (e0 < SHALLOW_TOP_E0_M and e2 > 0.11)
+            or e2 < 0.025
+        ):
+            return name_2d, conf_2d, ext.tolist()
+        scores = self._score_3d_shape(ext)
+        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        best, s1 = ranked[0]
+        s2 = ranked[1][1] if len(ranked) > 1 else 0.0
+        margin = s1 - s2
+        cls_conf = float(min(0.94, 0.5 + margin * 1.2 + min(0.15, len(pts) / 200.0)))
+        if margin < MIN_CLASS_MARGIN:
+            if conf_2d >= 0.50:
+                return name_2d, conf_2d * 0.88, ext.tolist()
+            return name_2d, cls_conf * 0.7, ext.tolist()
+        return best, cls_conf, ext.tolist()
+
+    @staticmethod
+    def _grasp_from_robot_points(pts: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        pos = np.median(pts, axis=0).astype(np.float32)
+        z_top = float(np.percentile(pts[:, 2], 88))
+        grasp = pos.copy()
+        grasp[2] = z_top - GRASP_DEPTH_OFFSET
+        return pos, grasp
+
+    def _compute_grasp_quat(self, class_name: str, pos_world: np.ndarray, robot_pos: np.ndarray) -> np.ndarray:
+        fixed = GRASP_FIXED_QUAT.get(str(class_name), DEFAULT_GRASP_FIXED_QUAT).copy()
+        dx = float(pos_world[0] - robot_pos[0])
+        dy = float(pos_world[1] - robot_pos[1])
+        yaw = float(np.arctan2(dy, dx))
+        return _quat_multiply_wxyz(_quat_from_yaw_wxyz(yaw), fixed)
+
+    def _pos_from_mask(
+        self, ys: np.ndarray, xs: np.ndarray, depth: np.ndarray, depth_m: float,
+    ) -> Optional[np.ndarray]:
+        pts = self._blob_points_robot(ys, xs, depth, depth_m)
+        if pts is not None:
+            return np.median(pts, axis=0).astype(np.float32)
+        raw = []
+        step = 1 if len(ys) < 120 else 2
+        dmin = self._depth_min()
+        for y, x in zip(ys[::step], xs[::step]):
+            z = float(depth[y, x])
+            if z <= dmin or z >= DEPTH_MAX:
+                continue
+            raw.append(self._uv_depth_to_robot(float(x), float(y), z))
+        if len(raw) < 5:
+            return None
+        return np.median(np.stack(raw, axis=0), axis=0).astype(np.float32)
 
     @staticmethod
     def _bbox_iou(a: List[int], b: List[int]) -> float:
@@ -788,24 +982,32 @@ class RgbdPureCamera:
             if rm < 0.007 and len(ys) > 700 and asp > 1.8 and vm < 84:
                 return None
         cx, cy = float(np.median(xs)), float(np.median(ys))
-        cls, cls_conf = RgbdPureCamera._classify_2d(bbox, len(ys), depth_m)
-        pos_r = self._pos_from_mask(ys, xs, depth)
-        if pos_r is None:
-            pos_r = self._uv_depth_to_robot(cx, cy, depth_m)
+        is_head = self.camera_name == "head"
+        use_3d = is_head or (self.camera_name == "ee" and len(ys) >= 24)
+        cls, cls_conf, geom_ext = self._classify_object(
+            bbox, len(ys), ys, xs, depth, sm, depth_m, use_3d=use_3d,
+        )
+        pts = self._blob_points_robot(ys, xs, depth, depth_m)
+        if is_head and pts is not None:
+            pos_r, grasp_r = self._grasp_from_robot_points(pts)
+        else:
+            pos_r = self._pos_from_mask(ys, xs, depth, depth_m)
+            if pos_r is None:
+                pos_r = self._uv_depth_to_robot(cx, cy, depth_m)
+            grasp_r = pos_r.copy()
+            if pts is not None:
+                grasp_r[2] = float(np.percentile(pts[:, 2], 85)) - GRASP_DEPTH_OFFSET
+            else:
+                grasp_r[2] = float(pos_r[2]) - GRASP_DEPTH_OFFSET * 0.5
         pos_w = _robot_to_world(pos_r, robot_pos, robot_yaw)
-        grasp_r = pos_r.copy()
-        z_pts = []
-        for y, x in zip(ys[::2], xs[::2]):
-            z = float(depth[y, x])
-            if self._depth_min() < z < DEPTH_MAX:
-                p = self._uv_depth_to_robot(float(x), float(y), z)
-                z_pts.append(float(p[2]))
-        if z_pts:
-            grasp_r[2] = float(np.percentile(z_pts, 82)) - GRASP_DEPTH_OFFSET
         grasp_w = _robot_to_world(grasp_r, robot_pos, robot_yaw)
+        grasp_q = None
+        if is_head:
+            grasp_q = self._compute_grasp_quat(cls, pos_w, robot_pos).tolist()
         size = OBJECT_SIZES.get(cls, DEFAULT_OBJECT_SIZE)
         conf = float(min(0.94, 0.45 + cls_conf * 0.55))
-        return {
+        yaw_rel = float(np.arctan2(pos_r[1], pos_r[0]))
+        out = {
             "class": cls,
             "class_id": CLASS_NAME_TO_ID.get(cls, -1),
             "conf": conf,
@@ -815,6 +1017,7 @@ class RgbdPureCamera:
             "centroid_uv": [cx, cy],
             "depth_m": depth_m,
             "dist_to_robot": float(np.linalg.norm(pos_r[:2])),
+            "yaw_rel": yaw_rel,
             "pos_robot": pos_r.tolist(),
             "pos_world": pos_w.tolist(),
             "grasp_pos_world": grasp_w.tolist(),
@@ -823,6 +1026,11 @@ class RgbdPureCamera:
             "blob_val_mean": vm,
             "source": f"rgbd_fusion_{self.camera_name}",
         }
+        if geom_ext is not None:
+            out["geom_extents"] = geom_ext
+        if grasp_q is not None:
+            out["grasp_quat_world"] = grasp_q
+        return out
 
     def _dets_from_mask(
         self,

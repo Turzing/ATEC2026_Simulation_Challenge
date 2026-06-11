@@ -123,13 +123,48 @@ def horizontal_dist_robot(pos_robot: Optional[np.ndarray]) -> Optional[float]:
 
 
 def annotate_pos_robot(obj: dict, camera: str) -> dict:
-    """给单相机 object 补上 pos_robot / dist_to_robot (不修改原 dict 引用时可 copy)"""
-    pos = estimate_pos_robot(obj.get("centroid_uv"), obj.get("depth_m"), camera)
-    dist = horizontal_dist_robot(pos)
+    """给单相机 object 补上 pos_robot / dist_to_robot (掩码反投影优先于框中心)"""
     out = dict(obj)
-    out["pos_robot"] = pos.tolist() if pos is not None else None
+    pos = None
+    if obj.get("pos_robot") is not None:
+        pos = np.asarray(obj["pos_robot"], dtype=np.float32)
+    if pos is None:
+        pos = estimate_pos_robot(obj.get("centroid_uv"), obj.get("depth_m"), camera)
+        if pos is not None:
+            out["pos_robot"] = pos.tolist()
+    dist = horizontal_dist_robot(pos)
     if dist is not None:
         out["dist_to_robot"] = dist
+    return out
+
+
+def robot_to_world(
+    p_robot, robot_pos: np.ndarray, robot_yaw: float,
+) -> np.ndarray:
+    """机器人基座系 → 世界系"""
+    p = np.asarray(p_robot, dtype=np.float32).reshape(3)
+    c, s = float(np.cos(robot_yaw)), float(np.sin(robot_yaw))
+    rot = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+    return (robot_pos.astype(np.float32) + rot @ p).astype(np.float32)
+
+
+def annotate_world_coords(
+    obj: dict, robot_pos: np.ndarray, robot_yaw: float,
+) -> dict:
+    """pos_robot / grasp_pos_robot → 世界坐标 (操作层用 grasp_pos_world)"""
+    out = dict(obj)
+    pr = obj.get("pos_robot")
+    if pr is not None:
+        pw = robot_to_world(pr, robot_pos, robot_yaw)
+        out["pos_world"] = pw.tolist()
+    gr = obj.get("grasp_pos_robot")
+    if gr is not None:
+        out["grasp_pos_world"] = robot_to_world(gr, robot_pos, robot_yaw).tolist()
+    elif out.get("pos_world") is not None:
+        gp = np.asarray(out["pos_world"], dtype=np.float32).copy()
+        from config import GRASP_DEPTH_OFFSET
+        gp[2] -= GRASP_DEPTH_OFFSET
+        out["grasp_pos_world"] = gp.tolist()
     return out
 
 

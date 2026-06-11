@@ -22,7 +22,8 @@ parser.add_argument("--out", type=str, default="../datasets/rgbd_pure_dual_debug
 parser.add_argument("--fresh", action="store_true", help="清空输出目录后再存图")
 parser.add_argument("--live", action="store_true", default=True)
 parser.add_argument("--no-live", action="store_false", dest="live")
-parser.add_argument("--preview_every", type=int, default=5)
+parser.add_argument("--preview_every", type=int, default=1,
+                    help="每 N 帧刷新预览 (默认 1; 旧默认 5 易让人以为秒退)")
 parser.add_argument("--policy", type=str, default="")
 AppLauncher.add_app_launcher_args(parser)
 args_cli, _ = parser.parse_known_args()
@@ -120,20 +121,33 @@ def draw_vis(head_rgb, ee_rgb, out, pipeline, head_depth):
     cv2.putText(vis, f"RGBD-dual phase={phase} NAV({nav_cam}) GRASP({grasp_cam})",
                 (8, 22), 0, 0.5, (0, 255, 255), 2)
     cv2.putText(vis, format_stats_line(out.get("depth_stats", {})), (8, 44), 0, 0.42, (0, 255, 255), 1)
-    cv2.putText(vis, f"松开键=站立(需policy) | P随时存图 | WASD Q",
+    cv2.putText(vis, f"Isaac窗: WASD P存图 Q退出 (勿在OpenCV窗按q)",
                 (8, 64), 0, 0.38, (180, 180, 180), 1)
     if phase == "approach" and len(ee_objs) == 0:
-        cv2.putText(vis, "NAV: ee=0 (tune EE, not head)", (8, 144), 0, 0.4, (0, 80, 255), 1)
+        cv2.putText(vis, "NAV: ee=0 (tune EE, not head)", (8, 164), 0, 0.4, (0, 80, 255), 1)
     tn, tg = out.get("target_nav"), out.get("target_grasp")
+    y = 84
     if tn:
         d = tn.get("dist_to_robot") or tn.get("depth_m") or 0
-        cv2.putText(vis, f"NAV {tn.get('class')} {d:.2f}m [{nav_cam}]", (8, 84), 0, 0.4, (0, 255, 0), 1)
+        cv2.putText(vis, f"NAV {tn.get('class')} z={d:.2f}m [{nav_cam}]", (8, y), 0, 0.4, (0, 255, 0), 1)
+        y += 20
+    cv2.putText(vis, f"EE objs={len(ee_objs)}  HEAD objs={len(head_objs)}", (8, y), 0, 0.38, (200, 200, 200), 1)
+    y += 18
+    for i, o in enumerate(ee_objs[:3]):
+        dm = o.get("depth_m") or 0
+        cv2.putText(vis, f"  E{o['id']} {o.get('class','?')} {dm:.2f}m", (8, y), 0, 0.35, (0, 200, 255), 1)
+        y += 16
     if tg:
         d = tg.get("dist_to_robot") or tg.get("depth_m") or 0
-        cv2.putText(vis, f"GRASP {tg.get('class')} {d:.2f}m [{grasp_cam}]", (8, 104), 0, 0.4, (0, 255, 255), 1)
+        cv2.putText(vis, f"GRASP {tg.get('class')} {d:.2f}m [{grasp_cam}]", (8, y), 0, 0.4, (0, 255, 255), 1)
+        y += 18
         gp = tg.get("grasp_pos_world")
         if gp:
-            cv2.putText(vis, f"grasp ({gp[0]:.2f},{gp[1]:.2f},{gp[2]:.2f})", (8, 124), 0, 0.38, (0, 220, 255), 1)
+            cv2.putText(vis, f"grasp ({gp[0]:.2f},{gp[1]:.2f},{gp[2]:.2f})", (8, y), 0, 0.38, (0, 220, 255), 1)
+            y += 16
+        gq = tg.get("grasp_quat_world")
+        if gq:
+            cv2.putText(vis, f"quat ({gq[0]:.2f},{gq[1]:.2f},{gq[2]:.2f},{gq[3]:.2f})", (8, y), 0, 0.35, (0, 200, 255), 1)
     return vis
 
 
@@ -172,7 +186,12 @@ def main():
     step = saved = 0
     if not simulation_app.is_running():
         print("[warn] Isaac app 未在运行 — 请保持 Isaac Sim 窗口打开后再跑", flush=True)
-    print("[run] 主循环开始 | OpenCV 窗: RGBD-Pure-Dual | Isaac 窗获焦后 WASD / P存图 / Q退出",
+    live = args_cli.live
+    if live and not os.environ.get("DISPLAY"):
+        print("[warn] 无 DISPLAY, 自动 --no-live (仍可用 P 存图)", flush=True)
+        live = False
+    print("[run] 主循环开始 | Isaac 窗获焦: WASD / P存图 / Q退出"
+          + (" | OpenCV: RGBD-Pure-Dual" if live else " | 无预览窗"),
           flush=True)
     try:
         while simulation_app.is_running():
@@ -203,16 +222,24 @@ def main():
                 saved += 1
                 kb.snap = False
 
-            if args_cli.live:
-                cv2.imshow("RGBD-Pure-Dual", vis)
-                if (cv2.waitKey(1) & 0xFF) == ord("q"):
-                    break
+            if live:
+                try:
+                    cv2.imshow("RGBD-Pure-Dual", vis)
+                    cv2.waitKey(1)
+                except cv2.error as e:
+                    print(f"[warn] OpenCV 预览失败: {e} — 改用 --no-live", flush=True)
+                    live = False
 
             if term or trunc:
                 obs, _ = env.reset()
                 pipeline.reset()
     finally:
-        why = "quit" if kb.quit else ("isaac_closed" if not simulation_app.is_running() else "break")
+        if kb.quit:
+            why = "quit(Q on Isaac)"
+        elif not simulation_app.is_running():
+            why = "isaac_closed"
+        else:
+            why = "loop_end"
         print(f"[exit] steps={step} saved={saved} reason={why}", flush=True)
         cv2.destroyAllWindows()
         env.close()
