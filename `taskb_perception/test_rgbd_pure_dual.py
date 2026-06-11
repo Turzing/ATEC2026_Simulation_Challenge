@@ -10,6 +10,7 @@
 import argparse
 import os
 import sys
+import traceback
 
 import cv2
 import numpy as np
@@ -162,7 +163,8 @@ def main():
 
     env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=1)
     env_cfg = apply_safe_action_spec(env_cfg, "{}")
-    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array")
+    # 感知用 obs['image']；rgb_array 多占显存且易与 OpenCV 预览冲突导致秒退
+    env = gym.make(args_cli.task, cfg=env_cfg)
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
 
@@ -191,56 +193,98 @@ def main():
         print("[warn] 无 DISPLAY, 自动 --no-live (仍可用 P 存图)", flush=True)
         live = False
     print("[run] 主循环开始 | Isaac 窗获焦: WASD / P存图 / Q退出"
-          + (" | OpenCV: RGBD-Pure-Dual" if live else " | 无预览窗"),
+          + (" | OpenCV: RGBD-Pure-Dual" if live else " | 无预览窗(仅按P时跑感知+存图)"),
           flush=True)
+    if live:
+        print("[hint] 若秒退/闪退, 改用 --no-live (OpenCV+Isaac 双窗在远程桌面常冲突)", flush=True)
+    else:
+        print("[hint] --no-live: 主循环只走路, 按 P 才 process+存图, 省 GPU", flush=True)
+    _not_running_streak = 0
+    _frame_errors = 0
     try:
-        while simulation_app.is_running():
+        while True:
             if kb.quit:
                 break
-            act = kb.get_action(obs, step)
-            obs, _, term, trunc, _ = env.step(act)
-            step += 1
-            if camera_follow:
-                camera_follow(env)
+            if not simulation_app.is_running():
+                _not_running_streak += 1
+                if _not_running_streak == 1:
+                    print("[warn] simulation_app.is_running()=False, 等待恢复…", flush=True)
+                if _not_running_streak >= 15:
+                    break
+                continue
+            _not_running_streak = 0
+            try:
+                act = kb.get_action(obs, step)
+                obs, _, term, trunc, _ = env.step(act)
+                step += 1
+                if step <= 8 and (term or trunc):
+                    print(f"[warn] step={step} term={term} trunc={trunc}", flush=True)
+                if camera_follow:
+                    camera_follow(env)
 
-            if step % args_cli.preview_every != 0 and not kb.snap:
+                # --no-live: 不按 P 时不跑感知/draw_vis, 避免每帧吃 GPU 导致秒退
+                need_perceive = live or kb.snap
+                if not need_perceive:
+                    if term or trunc:
+                        obs, _ = env.reset()
+                        pipeline.reset()
+                    continue
+                if step % args_cli.preview_every != 0 and not kb.snap:
+                    if term or trunc:
+                        obs, _ = env.reset()
+                        pipeline.reset()
+                    continue
+
+                out = pipeline.process(obs)
+                head_rgb, head_depth = parse_head_rgbd(obs)
+                ee_rgb, _ = parse_ee_rgbd(obs)
+                vis = draw_vis(head_rgb, ee_rgb, out, pipeline, head_depth)
+
+                if kb.snap:
+                    p = os.path.join(out_dir, f"pure_dual_{saved:04d}.png")
+                    cv2.imwrite(p, vis)
+                    print(f"saved nav={len(out['objects_nav'])} grasp={len(out['objects_grasp'])} "
+                          f"phase={out['phase']}", flush=True)
+                    saved += 1
+                    kb.snap = False
+
+                if live:
+                    try:
+                        cv2.imshow("RGBD-Pure-Dual", vis)
+                        cv2.waitKey(1)
+                    except cv2.error as e:
+                        print(f"[warn] OpenCV 预览失败: {e} — 改用 --no-live", flush=True)
+                        live = False
+
                 if term or trunc:
                     obs, _ = env.reset()
                     pipeline.reset()
-                continue
-
-            out = pipeline.process(obs)
-            head_rgb, head_depth = parse_head_rgbd(obs)
-            ee_rgb, _ = parse_ee_rgbd(obs)
-            vis = draw_vis(head_rgb, ee_rgb, out, pipeline, head_depth)
-
-            if kb.snap:
-                p = os.path.join(out_dir, f"pure_dual_{saved:04d}.png")
-                cv2.imwrite(p, vis)
-                print(f"saved nav={len(out['objects_nav'])} grasp={len(out['objects_grasp'])} "
-                      f"phase={out['phase']}", flush=True)
-                saved += 1
-                kb.snap = False
-
-            if live:
-                try:
-                    cv2.imshow("RGBD-Pure-Dual", vis)
-                    cv2.waitKey(1)
-                except cv2.error as e:
-                    print(f"[warn] OpenCV 预览失败: {e} — 改用 --no-live", flush=True)
-                    live = False
-
-            if term or trunc:
-                obs, _ = env.reset()
-                pipeline.reset()
+            except Exception:
+                _frame_errors += 1
+                print(f"[error] step={step} frame_fail #{_frame_errors}:", flush=True)
+                traceback.print_exc()
+                if _frame_errors >= 20:
+                    print("[fatal] 连续帧错误过多, 退出", flush=True)
+                    break
+    except KeyboardInterrupt:
+        print("[exit] KeyboardInterrupt", flush=True)
     finally:
         if kb.quit:
             why = "quit(Q on Isaac)"
         elif not simulation_app.is_running():
             why = "isaac_closed"
+        elif _not_running_streak >= 15:
+            why = "isaac_not_running"
+        elif _frame_errors >= 20:
+            why = "too_many_frame_errors"
         else:
             why = "loop_end"
-        print(f"[exit] steps={step} saved={saved} reason={why}", flush=True)
+        print(f"[exit] steps={step} saved={saved} reason={why} "
+              f"is_running={simulation_app.is_running()} frame_errors={_frame_errors} "
+              f"not_running_streak={_not_running_streak}", flush=True)
+        if step < 80 and why not in ("quit(Q on Isaac)",):
+            print("[exit] 过早退出: 请向上翻是否有 [error] Traceback; "
+                  "并确认已拷最新 test_rgbd_pure_dual.py", flush=True)
         cv2.destroyAllWindows()
         env.close()
         simulation_app.close()
