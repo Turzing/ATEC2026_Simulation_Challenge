@@ -1559,7 +1559,11 @@ class AlgSolution:
         robot_pos_world, robot_yaw, pose_source = self._resolve_robot_pose_world(obs, local_nav, perception_output)
 
         phase = str(perception_output.get("phase", "approach"))
-        preferred_camera = "head" if phase == "grasp" else "ee"
+        active = perception_output.get("active_camera")
+        if active in ("head", "ee"):
+            preferred_camera = str(active)
+        else:
+            preferred_camera = "ee" if phase == "grasp" else "head"
         fallback_camera = "ee" if preferred_camera == "head" else "head"
 
         preferred_raw = perception_output.get("head_objects", []) if preferred_camera == "head" else perception_output.get("ee_objects", [])

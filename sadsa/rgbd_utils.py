@@ -286,12 +286,6 @@ def filter_plausible_objects(
                 continue
             if is_ee_sky_blob(o):
                 continue
-            if pz < EE_NAV_ROBOT_Z_MIN and not o.get("grasp_reliable"):
-                continue
-            if not bbox_lateral_consistent(o):
-                continue
-        if camera == "head" and not bbox_lateral_consistent(o):
-            continue
         out.append(o)
     return out
 

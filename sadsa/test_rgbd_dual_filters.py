@@ -62,7 +62,9 @@ class TestRgbdDualFilters(unittest.TestCase):
             "bbox": [200, 280, 280, 400],
             "pos_robot": [1.6, 0.05, -0.2],
         }
-        self.assertTrue(_is_head_nav_unreliable(weak))
+        self.assertFalse(_is_head_nav_unreliable(weak))
+        jumped = dict(weak, pos_jump_rejected=True)
+        self.assertTrue(_is_head_nav_unreliable(jumped))
 
 
 if __name__ == "__main__":

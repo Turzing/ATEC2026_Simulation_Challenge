@@ -408,10 +408,8 @@ def _nav_quality(obj: dict) -> float:
 
 
 def _is_ee_phantom_near(ee_o: dict, head_objs: List[dict]) -> bool:
-    """EE 侧视假近距：天空框 / 同 id 异类 / head 更远 / 无 world_reliable."""
+    """EE 侧视假近距：仅天空框 / 同 id 异类 / head 明显更远."""
     if is_ee_sky_blob(ee_o):
-        return True
-    if not bbox_lateral_consistent(ee_o):
         return True
     ee_d = _obj_dist(ee_o)
     if ee_d > EE_PHANTOM_NEAR_M:
@@ -531,31 +529,11 @@ def _strict_lock_match(a: Optional[dict], b: Optional[dict]) -> bool:
 
 
 def _is_head_nav_unreliable(obj: dict) -> bool:
-    """head 导航质量门：点云/bbox 一致性不足时不允许新锁."""
+    """仅拒 coast / 跳变; 不再要求 pointcloud 否则 head 远距全灭."""
     if obj.get("coast_frame"):
-        return True
-    if not bbox_lateral_consistent(obj):
-        return True
-    depth = float(obj.get("depth_m") or obj.get("nav_depth_m") or 99.0)
-    n_pts = int(obj.get("nav_point_count") or 0)
-    conf = float(obj.get("pos_confidence") or head_nav_pos_confidence(obj))
-    if depth < 2.6:
-        if not obj.get("pos_from_pointcloud"):
-            return True
-        if n_pts < MIN_LOCK_POINT_COUNT:
-            return True
-        if conf < MIN_NAV_LOCK_CONF * 0.55:
-            return True
+        return False
     if obj.get("pos_jump_rejected"):
         return True
-    anchor_d = obj.get("nav_anchor_depth")
-    depth = float(obj.get("depth_m") or obj.get("nav_depth_m") or 99.0)
-    if anchor_d is not None and depth < 2.5:
-        try:
-            if abs(float(anchor_d) - depth) > 0.50:
-                return True
-        except (TypeError, ValueError):
-            pass
     return False
 
 
@@ -829,24 +807,39 @@ def _export_ee_for_motion(
     authority_mode: str,
 ) -> List[dict]:
     """
-    solution_rl approach 固定读 ee_objects:
-    非 grasp 阶段只 export head mirror, 绝不 export 原始 EE 导航假检.
+    motion approach 读 ee_objects / head_objects:
+    - 有 head → mirror 最近/锁定目标到 ee_objects
+    - 无 head → export 最佳 EE (仅 sky 过滤)
+    - grasp → EE 真检测 (grasp_reliable)
     """
     ee_objs = _drop_ee_class_conflict(ee_objs, head_objs)
-    if auth_tgt is None:
-        return []
 
     if nav_stage == "grasp":
+        if auth_tgt is None:
+            return []
         ee_tgt = _find_in_pool(ee_objs, auth_tgt.get("id"), auth_tgt.get("class"))
-        if ee_tgt is None and auth_cam == "ee":
-            ee_tgt = auth_tgt
+        if ee_tgt is None:
+            ee_tgt = auth_tgt if auth_cam == "ee" else None
         if ee_tgt is None or not ee_tgt.get("grasp_reliable"):
             return []
         exp = _safe_ee_export(ee_tgt, head_objs, ee_objs)
         return [exp] if exp is not None else []
 
-    if auth_tgt is not None:
+    if head_objs:
+        best = auth_tgt if auth_tgt is not None else min(head_objs, key=lambda o: _nav_lock_rank(o))
+        if best is not None:
+            return [_make_head_mirror(best)]
+
+    if auth_tgt is not None and auth_cam == "head":
         return [_make_head_mirror(auth_tgt)]
+
+    if ee_objs:
+        pool = [o for o in ee_objs if not _is_ee_phantom_near(o, head_objs)]
+        if pool:
+            best_ee = min(pool, key=_obj_dist)
+            exp = _safe_ee_export(best_ee, head_objs, ee_objs)
+            if exp is not None:
+                return [exp]
     return []
 
 
@@ -874,6 +867,17 @@ def _ensure_ee_motion_export(
     if head_objs:
         best = min(head_objs, key=lambda o: _nav_lock_rank(o))
         return [_make_head_mirror(best)]
+    if ee_nav is not None:
+        exp = _safe_ee_export(ee_nav, head_objs, ee_objs)
+        if exp is not None:
+            return [exp]
+    if ee_objs:
+        pool = [o for o in ee_objs if not _is_ee_phantom_near(o, head_objs)]
+        if pool:
+            best = min(pool, key=_obj_dist)
+            exp = _safe_ee_export(best, head_objs, ee_objs)
+            if exp is not None:
+                return [exp]
     return []
 
 
@@ -896,8 +900,8 @@ class RgbdPureDualPipeline:
         self._last_ee_motion: List[dict] = []
         self._last_head_objs: List[dict] = []
         print(
-            "[RgbdPureDual] head-only-export | sky-filter | bearing-gate | "
-            f"class-stable | coast={DETECTION_COAST_FRAMES}f"
+            "[RgbdPureDual] simple-dual | head-nav | ee-sky-only | "
+            f"coast={DETECTION_COAST_FRAMES}f"
         )
 
     def reset(self):
@@ -1118,7 +1122,7 @@ class RgbdPureDualPipeline:
         )
 
         if nav_stage == "grasp" and ee_near < HEAD_DISABLE_DIST_M:
-            head_objs = []
+            pass  # 保留 head_objects 供 motion fallback
 
         ee_objs_raw = list(ee_objs)
         ee_motion = _export_ee_for_motion(
@@ -1177,6 +1181,8 @@ class RgbdPureDualPipeline:
             "grasp_locked": bool(grasp_tgt and grasp_tgt.get("grasp_locked")),
             "head_dist_m": _obj_dist(head_nav),
             "ee_dist_m": ee_d,
+            "head_count_raw": len(head_objs),
+            "ee_count_raw": len(ee_objs_raw),
             "nav_depth_m": None if nav_tgt is None else nav_tgt.get("nav_depth_m"),
             "nav_yaw_rel": None if nav_tgt is None else nav_tgt.get("nav_yaw_rel"),
             "world_reliable": bool(nav_tgt and nav_tgt.get("world_reliable")),
