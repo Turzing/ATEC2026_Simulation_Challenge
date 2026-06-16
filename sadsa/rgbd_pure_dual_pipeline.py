@@ -44,13 +44,15 @@ from rgbd_utils import (
     refresh_ee_object_pose,
     refresh_head_object_pose,
     refresh_locked_grasp,
+    stabilize_ee_nav_pose,
 )
 
 GRASP_PHASE_DIST_M = 1.10
 GRASP_LOCK_DIST_M = 1.22
 GRASP_UNLOCK_DIST_M = 1.50
-HEAD_DISABLE_DIST_M = 1.15
-EE_NAV_PREFER_DIST_M = 2.50
+HEAD_DISABLE_DIST_M = 1.05
+EE_NAV_PREFER_DIST_M = 1.35
+HEAD_MIRROR_EE_MIN_M = 1.25
 TEMPORAL_MEDIAN_N = 6
 GRASP_TEMPORAL_N = 10
 MOTION_FREEZE_THRESH = 0.35
@@ -292,19 +294,45 @@ def _pick_nav_target(
 ) -> Tuple[str, List[dict], Optional[dict]]:
     if ee_near < EE_NAV_PREFER_DIST_M and ee_tgt:
         return "ee", ee_objs, ee_tgt
+    if head_tgt and (not ee_tgt or _obj_dist(head_tgt) + 0.15 < _obj_dist(ee_tgt)):
+        return "head", head_objs, head_tgt
     if ee_tgt and not head_tgt:
         return "ee", ee_objs, ee_tgt
     if head_tgt and not ee_tgt:
         return "head", head_objs, head_tgt
     if not ee_tgt and not head_tgt:
         return "ee", ee_objs, None
-    if (
-        _obj_dist(head_tgt) + 0.25 < _obj_dist(ee_tgt)
-        and _obj_dist(head_tgt) > 1.35
-        and _nav_quality(head_tgt) > _nav_quality(ee_tgt) - 12.0
-    ):
+    if _nav_quality(head_tgt) > _nav_quality(ee_tgt) + 8.0:
         return "head", head_objs, head_tgt
     return "ee", ee_objs, ee_tgt
+
+
+def _inject_head_nav_into_ee(
+    ee_objs: List[dict],
+    head_nav: Optional[dict],
+    phase: str,
+    ee_near: float,
+) -> List[dict]:
+    """solution_rl approach 固定 preferred=ee；远距把 head 导航位姿注入 ee_objects."""
+    if phase != "approach" or head_nav is None or ee_near < HEAD_MIRROR_EE_MIN_M:
+        return ee_objs
+    hd = _obj_dist(head_nav)
+    if hd > 3.0:
+        return ee_objs
+    mirror = dict(head_nav)
+    for k in (
+        "grasp_pos_robot", "grasp_pos_world", "grasp_quat_world",
+        "grasp_reliable", "grasp_locked", "grasp_offset_robot",
+    ):
+        mirror.pop(k, None)
+    mirror["grasp_reliable"] = False
+    mirror["nav_from_head"] = True
+    cls = mirror.get("class")
+    kept = [
+        o for o in ee_objs
+        if not (cls is not None and o.get("class") == cls and _obj_dist(o) > hd * 0.80)
+    ]
+    return [mirror] + kept
 
 
 class RgbdPureDualPipeline:
@@ -316,7 +344,7 @@ class RgbdPureDualPipeline:
         self.robot_yaw = float(ROBOT_INIT_YAW)
         self._temporal = _TemporalMedian()
         self._frozen_grasp: Optional[dict] = None
-        print("[RgbdPureDual] ee=nav+grasp | head=nav-only | grasp-lock")
+        print("[RgbdPureDual] ee=nav+grasp | head=nav-only | grasp-lock | head-mirror-ee")
 
     def reset(self):
         self.ee.reset()
@@ -412,8 +440,6 @@ class RgbdPureDualPipeline:
         ee_objs = filter_plausible_objects(ee_objs, "ee")
         ee_near = _obj_dist(_best_nav_target(ee_objs) or _best_ee_grasp(ee_objs))
         head_objs = filter_plausible_objects(head_objs, "head", ee_near_m=ee_near)
-        if ee_near < HEAD_DISABLE_DIST_M:
-            head_objs = []
 
         head_objs.sort(key=_obj_dist)
         ee_objs.sort(key=_obj_dist)
@@ -426,10 +452,16 @@ class RgbdPureDualPipeline:
         grasp_tgt = self._update_grasp_lock(ee_grasp or ee_nav, ee_d, rp, ry, arm_q)
         phase = "grasp" if (grasp_tgt and ee_d < GRASP_PHASE_DIST_M) else "approach"
 
+        if phase == "grasp" and ee_near < HEAD_DISABLE_DIST_M:
+            head_objs = []
+
+        ee_objs = [stabilize_ee_nav_pose(o) for o in ee_objs]
+        ee_objs = _inject_head_nav_into_ee(ee_objs, head_nav, phase, ee_near)
+
         nav_cam, nav_objs, nav_tgt = _pick_nav_target(
             ee_nav, head_nav, ee_objs, head_objs, ee_near,
         )
-        if phase == "grasp" or ee_near < HEAD_DISABLE_DIST_M:
+        if phase == "grasp":
             nav_cam, nav_objs, nav_tgt = "ee", ee_objs, ee_nav or grasp_tgt
 
         use_grasp = phase == "grasp" and grasp_tgt is not None

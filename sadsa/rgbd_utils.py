@@ -218,8 +218,6 @@ def filter_plausible_objects(
                     continue
                 if depth < 0.55 and cy > 140 and sm < 62 and 55 < vm < 155:
                     continue
-            if ee_near_m < 1.15 and depth < 1.20:
-                continue
         if camera == "ee" and depth < 0.35 and sm < 40:
             continue
         out.append(o)
@@ -264,6 +262,38 @@ def pixel_to_robot(
 ) -> np.ndarray:
     p_cam = pixel_depth_to_cam(u, v, float(depth_m), cam_cfg)
     return (np.asarray(cam_pos_robot, dtype=np.float32) + cam_rot_matrix @ p_cam).astype(np.float32)
+
+
+def stabilize_ee_nav_pose(obj: dict) -> dict:
+    """侧视 EE 远距时 pos_robot 横向偏差大，用 depth + yaw 拉回导航距离."""
+    out = dict(obj)
+    pr = out.get("pos_robot")
+    depth = out.get("nav_depth_m") or out.get("depth_m")
+    if pr is None or depth is None:
+        return out
+    try:
+        px, py, pz = float(pr[0]), float(pr[1]), float(pr[2])
+        depth_f = float(depth)
+    except (TypeError, ValueError, IndexError):
+        return out
+    if depth_f < 0.90 or depth_f > 2.60 or out.get("nav_from_head"):
+        return out
+    xy = float(np.hypot(px, py))
+    if xy < 0.15:
+        return out
+    yaw = float(out.get("nav_yaw_rel") or out.get("yaw_rel") or np.arctan2(py, px))
+    blend = 0.55 if depth_f > 1.60 else 0.35
+    nav_xy = depth_f * blend + xy * (1.0 - blend)
+    out["pos_robot"] = [
+        float(nav_xy * np.cos(yaw)),
+        float(nav_xy * np.sin(yaw)),
+        pz,
+    ]
+    out["dist_to_robot"] = float(np.hypot(out["pos_robot"][0], out["pos_robot"][1]))
+    out["yaw_rel"] = yaw
+    out["nav_yaw_rel"] = yaw
+    out["nav_depth_m"] = depth_f
+    return out
 
 
 def refresh_ee_object_pose(
