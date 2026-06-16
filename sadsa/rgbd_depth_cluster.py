@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-PERCEPTION_BUILD_ID = "20260617-fix-detect-shape"
+PERCEPTION_BUILD_ID = "20260617-fix-search-osc"
 
 from typing import List, Optional, Tuple
 
@@ -41,7 +41,7 @@ MAX_CLUSTERS = 20
 ROI_V_MIN = 0.06
 ROI_V_MAX_HEAD = 0.68   # head 排除画面下部地砖 (假检重灾区)
 ROI_V_MAX_EE = 0.96
-PROTRUDE_HEAD_M = 0.016
+PROTRUDE_HEAD_M = 0.010
 PROTRUDE_EE_M = 0.010
 LOCAL_GROUND_K = 15
 EE_GRASP_NEAR_M = 1.15
@@ -249,6 +249,9 @@ class DepthClusterDetector:
             mask = self._build_mask(depth, protrude_scale=0.45)
             labeled, n = ndimage.label(mask)
         if n == 0:
+            mask = self._build_mask(depth, protrude_scale=0.28)
+            labeled, n = ndimage.label(mask)
+        if n == 0:
             return []
 
         is_head = self.camera_name == "head"
@@ -275,11 +278,11 @@ class DepthClusterDetector:
 
             x1, x2 = int(xs.min()), int(xs.max())
             y1, y2 = int(ys.min()), int(ys.max())
-            if is_head and float(np.median(ys)) > img_h * 0.62:
+            if is_head and float(np.median(ys)) > img_h * 0.66:
                 continue
             bbox = [x1, y1, x2, y2]
             bw, bh = max(1, x2 - x1 + 1), max(1, y2 - y1 + 1)
-            if is_head and bw * bh > img_h * img_w * 0.14:
+            if is_head and bw * bh > img_h * img_w * 0.18:
                 continue
             cx, cy = float(np.median(xs)), float(np.median(ys))
             cls, cls_conf = _classify_cluster(rgb, ys, xs, bbox, z_extent)

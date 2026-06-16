@@ -1269,6 +1269,7 @@ class RgbdPureDualPipeline:
         self._nav_lock_miss = 0
         self._nav_lock_ee_only = False
         self._nav_lock_ee_only_frames = 0
+        self._nav_lock_reject_until = 0
         self._last_ee_motion: List[dict] = []
         self._last_head_objs: List[dict] = []
         self._ransac = RansacClusterDetector() if RansacClusterDetector is not None else None
@@ -1300,11 +1301,24 @@ class RgbdPureDualPipeline:
         self._nav_lock_miss = 0
         self._nav_lock_ee_only = False
         self._nav_lock_ee_only_frames = 0
+        self._nav_lock_reject_until = 0
         self._last_ee_motion = []
         self._last_head_objs = []
         self.frame_count = 0
         self.robot_pos = ROBOT_INIT_POS.copy().astype(np.float32)
         self.robot_yaw = float(ROBOT_INIT_YAW)
+
+    def clear_nav_lock(self, reason: str = "", cooldown_frames: int = 50) -> None:
+        """motion 层 phantom unlock 时同步清感知 lock，避免转圈↔停住振荡."""
+        self._nav_lock_id = None
+        self._nav_lock_class = None
+        self._nav_lock_world = None
+        self._nav_lock_miss = 0
+        self._nav_lock_ee_only = False
+        self._nav_lock_ee_only_frames = 0
+        self._nav_lock_reject_until = self.frame_count + max(1, int(cooldown_frames))
+        if reason:
+            print(f"[RgbdPureDual] nav_lock cleared: {reason}")
 
     def _refresh_coast_obj(self, obj: dict, robot_pos, robot_yaw) -> dict:
         out = dict(obj)
@@ -1402,9 +1416,17 @@ class RgbdPureDualPipeline:
         head_objs, _, head_meta = self.head.process_frame(h_rgb, h_depth, rp, ry)
 
         ee_objs: List[dict] = []
+        ee_bearing_pool: List[dict] = []
         ee_meta: dict = {}
         ee_stats: dict = {}
-        if not STATIC_TWO_STEP:
+        if STATIC_TWO_STEP:
+            e_rgb, e_depth = parse_ee_rgbd(obs)
+            if e_rgb is not None and e_depth is not None:
+                raw_ee, _, ee_meta = self.ee.process_frame(e_rgb, e_depth, rp, ry)
+                ee_bearing_pool = [_finalize_ee(o, rp, ry, arm_q) for o in raw_ee]
+                ee_bearing_pool = filter_plausible_objects(ee_bearing_pool, "ee")
+                ee_stats = ee_meta.get("depth_stats") or depth_stats(e_depth)
+        else:
             e_rgb, e_depth = parse_ee_rgbd(obs)
             if e_rgb is not None and e_depth is not None:
                 ee_objs, _, ee_meta = self.ee.process_frame(e_rgb, e_depth, rp, ry)
@@ -1490,7 +1512,7 @@ class RgbdPureDualPipeline:
                 locked = live
                 lock_ref = live
 
-        if locked is None and self._nav_lock_id is None:
+        if locked is None and self._nav_lock_id is None and self.frame_count >= self._nav_lock_reject_until:
             seed = _acquire_nav_lock(head_objs, ee_objs, head_nav, ee_nav, head_d, ee_d)
             if seed is not None and not _can_acquire_nav_lock(seed, head_objs):
                 seed = None
@@ -1599,27 +1621,34 @@ class RgbdPureDualPipeline:
             self._nav_lock_miss += 1
 
         if self._nav_lock_miss >= NAV_LOCK_MISS_MAX:
-            prev_class = self._nav_lock_class
-            prev_world = list(self._nav_lock_world) if self._nav_lock_world is not None else None
-            prev_id = self._nav_lock_id
-            self._nav_lock_id = None
-            self._nav_lock_class = None
-            self._nav_lock_world = None
-            self._nav_lock_miss = 0
-            seed = _acquire_nav_lock(
-                head_objs, ee_objs, head_nav, ee_nav, head_d, ee_d,
-                prefer_class=prev_class, prefer_world=prev_world,
-            )
-            if seed is not None and _can_acquire_nav_lock(seed, head_objs):
-                self._nav_lock_id = int(seed["id"])
-                self._nav_lock_class = seed.get("class")
-                pw = seed.get("pos_world")
-                self._nav_lock_world = list(pw) if pw is not None else None
-            elif prev_id is not None and prev_world is not None:
-                self._nav_lock_id = int(prev_id)
-                self._nav_lock_class = prev_class
-                self._nav_lock_world = prev_world
+            if self.frame_count < self._nav_lock_reject_until:
                 self._nav_lock_miss = NAV_LOCK_MISS_MAX // 2
+            else:
+                prev_class = self._nav_lock_class
+                prev_world = list(self._nav_lock_world) if self._nav_lock_world is not None else None
+                prev_id = self._nav_lock_id
+                self._nav_lock_id = None
+                self._nav_lock_class = None
+                self._nav_lock_world = None
+                self._nav_lock_miss = 0
+                seed = _acquire_nav_lock(
+                    head_objs, ee_objs, head_nav, ee_nav, head_d, ee_d,
+                    prefer_class=prev_class, prefer_world=prev_world,
+                )
+                if seed is not None and _can_acquire_nav_lock(seed, head_objs):
+                    self._nav_lock_id = int(seed["id"])
+                    self._nav_lock_class = seed.get("class")
+                    pw = seed.get("pos_world")
+                    self._nav_lock_world = list(pw) if pw is not None else None
+                elif (
+                    prev_id is not None
+                    and prev_world is not None
+                    and (not STATIC_TWO_STEP or head_objs)
+                ):
+                    self._nav_lock_id = int(prev_id)
+                    self._nav_lock_class = prev_class
+                    self._nav_lock_world = prev_world
+                    self._nav_lock_miss = NAV_LOCK_MISS_MAX // 2
 
         grasp_src = ee_grasp_nav if _same_nav_target(ee_grasp_nav, auth_tgt) else None
         if grasp_src is None and auth_tgt is not None:
@@ -1717,7 +1746,10 @@ class RgbdPureDualPipeline:
         ee_list = [_object_summary(o, "ee") for o in ee_objs]
         head_list = [_object_summary(o, "head") for o in head_objs]
         ee_search_hint = _build_ee_search_hint(
-            head_objs, ee_objs_raw, head_nav=head_nav, nav_lock_id=self._nav_lock_id,
+            head_objs,
+            ee_bearing_pool if STATIC_TWO_STEP else ee_objs_raw,
+            head_nav=head_nav,
+            nav_lock_id=self._nav_lock_id,
         )
 
         return {

@@ -1490,6 +1490,10 @@ class AlgSolution:
             }
             return search_cmd, search_info
         gt_err = self._gt_perc_xy_error(target_nav)
+        if self.static_two_step:
+            head_n = len((self._last_perception_output or {}).get("head_objects") or [])
+            if head_n == 0 or bool(target_nav.get("nav_coast")):
+                gt_err = None
         if gt_err is not None and gt_err > self.grasp_gt_max_err:
             self._phantom_gt_err_steps += 1
             if (
@@ -1998,6 +2002,9 @@ class AlgSolution:
         self._nav_turn_sign = 0
         self._nav_turn_sign_hold = 0
         self._nav_ignore_perc_until_head = False
+        self._clear_locked_target()
+        if self.perception is not None and hasattr(self.perception, "clear_nav_lock"):
+            self.perception.clear_nav_lock(reason)
 
     def _nav_approach_stalled(
         self,
