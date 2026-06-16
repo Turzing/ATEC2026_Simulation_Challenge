@@ -86,6 +86,8 @@ class AlgSolution:
         self._nav_heading_error_f: float | None = None
         self._nav_turn_sign: int = 0
         self._nav_turn_sign_hold = 0
+        self._fuse_lock_key: tuple[Any, Any] | None = None
+        self._fuse_pos_world: np.ndarray | None = None
         self._release_step_count = 0
         self._arm_grasp_controller = None
         self._arm_controller_init_failed = False
@@ -808,7 +810,9 @@ class AlgSolution:
                 )
             target_nav = perception_output.get("target_nav")
             if isinstance(target_nav, dict) and not target_nav.get("skip_camera_correction"):
-                if not _is_head_sourced(target_nav):
+                if perception_output.get("nav_lock_id") is not None:
+                    pass
+                elif not _is_head_sourced(target_nav):
                     self._correct_object_with_camera_pose(
                         target_nav, ee_cam_pos_w, ee_cam_rot_w, *EE_INTR, robot_pos, robot_yaw,
                     )
@@ -840,7 +844,9 @@ class AlgSolution:
                 )
             target_nav = perception_output.get("target_nav")
             if isinstance(target_nav, dict) and not target_nav.get("skip_camera_correction"):
-                if _is_head_sourced(target_nav):
+                if perception_output.get("nav_lock_id") is not None:
+                    pass
+                elif _is_head_sourced(target_nav):
                     self._correct_object_with_camera_pose(
                         target_nav, head_cam_pos_w, head_cam_rot_w, *HEAD_INTR, robot_pos, robot_yaw,
                     )
@@ -1792,37 +1798,59 @@ class AlgSolution:
         merged["objects_remaining"] = list(nav_input.get("objects_remaining") or [])
         return merged
 
-    def _build_target_from_perception_nav(
+    def _fuse_perception_target(
         self,
         perception_output: dict[str, Any],
         robot_pos_world: np.ndarray,
         robot_yaw: float,
     ) -> dict[str, Any] | None:
-        nav_lock_id = perception_output.get("nav_lock_id")
+        """单一导航出口：只跟感知 target_nav，motion 不再独立 pick/confirm。"""
         raw_nav = perception_output.get("target_nav")
-        if nav_lock_id is None or not isinstance(raw_nav, dict):
+        if not isinstance(raw_nav, dict) or raw_nav.get("pos_world") is None:
             return None
-        if raw_nav.get("pos_world") is None:
-            return None
+
+        lock_id = perception_output.get("nav_lock_id")
         lock_class = perception_output.get("nav_lock_class")
-        if lock_class and raw_nav.get("class") not in {None, lock_class}:
+        if lock_id is not None and lock_class and raw_nav.get("class") not in {None, lock_class}:
             return None
-        nav_cam = str(raw_nav.get("source_camera") or "head")
-        if nav_cam == "lock_coast":
-            nav_cam = "head"
-        seeded = self._prepare_pipeline_object(raw_nav, nav_cam, robot_pos_world, robot_yaw)
-        if seeded is None:
+        if raw_nav.get("pos_jump_rejected") and lock_id is None:
             return None
-        seeded["confirmed"] = True
-        seeded["visible"] = not bool(raw_nav.get("nav_coast")) and not bool(raw_nav.get("pos_jump_rejected"))
-        track_id = int(nav_lock_id)
-        if self._tracked_target is not None and int(self._tracked_target.get("id", -99)) == track_id:
-            self._tracked_target = self._update_tracking_state_from_candidate(self._tracked_target, seeded)
+
+        active = perception_output.get("active_camera")
+        nav_cam = str(raw_nav.get("source_camera") or active or "head")
+        if nav_cam in ("lock_coast", "none"):
+            nav_cam = "head" if active != "ee" else "ee"
+
+        target = self._prepare_pipeline_object(raw_nav, nav_cam, robot_pos_world, robot_yaw)
+        if target is None:
+            return None
+
+        lock_key = (lock_id, lock_class)
+        pw = self._safe_numpy(target.get("pos_world"), np.zeros(3, dtype=np.float32))
+        if lock_key != self._fuse_lock_key or self._fuse_pos_world is None:
+            self._fuse_lock_key = lock_key
+            self._fuse_pos_world = pw.copy()
+            self._nav_heading_error_f = None
         else:
-            self._tracked_target = self._make_tracking_state(seeded, stable_count=self.target_confirm_steps)
-            self._pending_target = None
-        self._target_lost_count = 0
-        return self._build_tracked_nav_target(self._tracked_target, robot_pos_world, robot_yaw)
+            coast = bool(raw_nav.get("nav_coast"))
+            alpha = 0.18 if coast else 0.32
+            self._fuse_pos_world = (1.0 - alpha) * self._fuse_pos_world + alpha * pw
+
+        pos_robot = self._world_to_robot_frame(self._fuse_pos_world, robot_pos_world, robot_yaw)
+        target["id"] = lock_id if lock_id is not None else target.get("id")
+        target["class"] = lock_class or target.get("class")
+        target["pos_world"] = self._fuse_pos_world.tolist()
+        target["pos_robot"] = pos_robot.tolist()
+        target["dist_to_robot"] = float(np.linalg.norm(pos_robot[:2]))
+        target["yaw_rel"] = float(math.atan2(pos_robot[1], pos_robot[0]))
+        target["source_camera"] = nav_cam
+        target["camera"] = nav_cam
+        target["confirmed"] = lock_id is not None
+        target["visible"] = not bool(raw_nav.get("nav_coast")) and not bool(raw_nav.get("pos_jump_rejected"))
+        target["nav_lock_id"] = lock_id
+        self._last_known_target_pos = target["pos_world"]
+        self._set_locked_target_snapshot(target)
+        return target
 
     def _adapt_perception_output(
         self,
@@ -1846,10 +1874,8 @@ class AlgSolution:
         preferred_candidates = self._normalize_camera_objects(preferred_raw, preferred_camera, robot_pos_world, robot_yaw)
         fallback_candidates = self._normalize_camera_objects(fallback_raw, fallback_camera, robot_pos_world, robot_yaw)
 
-        nav_lock_id = perception_output.get("nav_lock_id")
-        if nav_lock_id is not None:
-            target = self._build_target_from_perception_nav(perception_output, robot_pos_world, robot_yaw)
-        else:
+        target = self._fuse_perception_target(perception_output, robot_pos_world, robot_yaw)
+        if target is None and perception_output.get("nav_lock_id") is None:
             target = self._update_visual_target_tracking(
                 preferred_candidates,
                 fallback_candidates,
@@ -1857,18 +1883,6 @@ class AlgSolution:
                 robot_pos_world,
                 robot_yaw,
             )
-            if target is None:
-                raw_nav = perception_output.get("target_nav")
-                if isinstance(raw_nav, dict) and raw_nav.get("pos_world") is not None and not raw_nav.get("pos_jump_rejected"):
-                    nav_cam = str(raw_nav.get("source_camera") or preferred_camera)
-                    seeded = self._prepare_pipeline_object(raw_nav, nav_cam, robot_pos_world, robot_yaw)
-                    has_head = bool(preferred_candidates) if preferred_camera == "head" else bool(fallback_candidates)
-                    if (
-                        seeded is not None
-                        and self._tracking_candidate_allowed(seeded, has_head_candidates=has_head)
-                    ):
-                        target = seeded
-                        target["confirmed"] = True
 
         bin_info = perception_output.get("bin") or {}
         bin_center = self._safe_numpy(bin_info.get("center_world"), self.default_bin_center)
@@ -2919,7 +2933,11 @@ class AlgSolution:
                             self._clear_locked_target()
             else:
                 base_cmd = np.array([0.0, 0.0, self.search_yaw_rate], dtype=np.float32)
-                search_phase = "searching_lost_target" if self._tracked_target is not None else "search"
+                search_phase = "search"
+                if perception_output.get("nav_lock_id") is not None:
+                    search_phase = "search_coast"
+                elif self._fuse_lock_key is not None:
+                    search_phase = "searching_lost_target"
                 nav_info = self._make_pipeline_nav_info(
                     perception_output,
                     pose_source,

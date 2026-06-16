@@ -67,7 +67,8 @@ HEAD_DISABLE_DIST_M = 1.05
 NAV_EE_FAR_MIN_M = 1.35          # >= 远距 EE 导航
 NAV_EE_TO_HEAD_M = 1.28          # 迟滞: 远→近
 NAV_HEAD_TO_EE_M = 1.42          # 迟滞: 近→远
-NAV_LOCK_MISS_MAX = 18           # 丢失多少帧后解锁重选
+NAV_LOCK_MISS_MAX = 45           # 丢失多少帧后解锁重选 (~0.9s)
+NAV_RELOCK_MAX_XY_M = 1.25       # 重锁不得离上一 lock_world 超过此距
 TARGET_MATCH_RADIUS = 0.55       # 判定同一导航目标
 HEAD_MIRROR_EE_MIN_M = 0.85
 TEMPORAL_MEDIAN_N = 6
@@ -677,8 +678,14 @@ def _acquire_nav_lock(
     head_d: float,
     ee_d: float,
     prefer_class: Optional[str] = None,
+    prefer_world: Optional[List[float]] = None,
 ) -> Optional[dict]:
     """新锁：head 优先；剔除 EE 假近与同 id 异类."""
+
+    def _near_preferred(o: dict) -> bool:
+        if prefer_world is None:
+            return True
+        return _world_xy_dist(o, {"pos_world": prefer_world}) <= NAV_RELOCK_MAX_XY_M
 
     def _eligible(o: dict, from_ee: bool) -> bool:
         if from_ee:
@@ -694,7 +701,7 @@ def _acquire_nav_lock(
                 return False
         return True
 
-    head_cands = [o for o in head_objs if _eligible(o, False)]
+    head_cands = [o for o in head_objs if _eligible(o, False) and _near_preferred(o)]
     if prefer_class and head_cands:
         same_cls = [o for o in head_cands if o.get("class") == prefer_class]
         if same_cls:
@@ -705,7 +712,7 @@ def _acquire_nav_lock(
         out["pos_confidence"] = float(best.get("pos_confidence") or head_nav_pos_confidence(best))
         return out
 
-    ee_cands = [o for o in ee_objs if _eligible(o, True)]
+    ee_cands = [o for o in ee_objs if _eligible(o, True) and _near_preferred(o)]
     if prefer_class and ee_cands:
         same_cls = [o for o in ee_cands if o.get("class") == prefer_class]
         if same_cls:
@@ -716,7 +723,10 @@ def _acquire_nav_lock(
         out["pos_confidence"] = float(best.get("pos_confidence") or head_nav_pos_confidence(best))
         return out
 
-    if head_nav is not None:
+    if prefer_world is not None:
+        return None
+
+    if head_nav is not None and _eligible(head_nav, False):
         return head_nav
     if ee_nav is not None and not _is_ee_phantom_near(ee_nav, head_objs):
         if not _is_far_ee_nav_unreliable(ee_nav):
@@ -755,27 +765,29 @@ def _resolve_authoritative_target(
     fallback = NAV_FALLBACK[nav_stage]
     pools = {"head": head_objs, "ee": ee_objs}
     navs = {"head": head_nav, "ee": ee_nav}
+    has_lock = lock_id is not None
 
     tgt = _find_in_pool(pools[primary], lock_id, lock_class, lock_world)
-    if tgt is None:
+    if tgt is None and not has_lock:
         tgt = navs[primary]
     if tgt is not None:
         if primary == "ee" and _is_ee_phantom_near(tgt, head_objs):
-            fb = _find_in_pool(pools["head"], lock_id, lock_class, lock_world) or head_nav
+            fb = _find_in_pool(pools["head"], lock_id, lock_class, lock_world)
+            if fb is None and not has_lock:
+                fb = head_nav
             if fb is not None:
                 return fb, "head", "fallback"
         return tgt, primary, "primary"
 
     if fallback:
         fb = _find_in_pool(pools[fallback], lock_id, lock_class, lock_world)
-        if fb is None:
+        if fb is None and not has_lock:
             fb = navs[fallback]
         if fb is not None:
             if fallback == "ee" and _is_ee_phantom_near(fb, head_objs):
-                fb_head = (
-                    _find_in_pool(pools["head"], lock_id, lock_class, lock_world)
-                    or head_nav
-                )
+                fb_head = _find_in_pool(pools["head"], lock_id, lock_class, lock_world)
+                if fb_head is None and not has_lock:
+                    fb_head = head_nav
                 if fb_head is not None:
                     return fb_head, "head", "fallback"
             return fb, fallback, "fallback"
@@ -1198,8 +1210,10 @@ class RgbdPureDualPipeline:
             nav_stage, head_objs, ee_objs, head_nav, ee_nav,
             self._nav_lock_id, self._nav_lock_class, self._nav_lock_world,
         )
-        if auth_tgt is not None and self._nav_lock_class is not None:
-            if auth_tgt.get("class") != self._nav_lock_class:
+        if auth_tgt is not None and self._nav_lock_id is not None:
+            if int(auth_tgt.get("id", -1)) != int(self._nav_lock_id):
+                auth_tgt = None
+            elif self._nav_lock_class and auth_tgt.get("class") != self._nav_lock_class:
                 auth_tgt = None
 
         if auth_tgt is not None:
@@ -1215,8 +1229,8 @@ class RgbdPureDualPipeline:
                     auth_tgt = dict(auth_tgt)
                     auth_tgt["pos_world"] = list(self._nav_lock_world)
                     auth_tgt["pos_jump_rejected"] = True
-            self._nav_lock_id = int(auth_tgt["id"])
-            if auth_tgt.get("class") is not None:
+            if self._nav_lock_id is None:
+                self._nav_lock_id = int(auth_tgt["id"])
                 self._nav_lock_class = auth_tgt.get("class")
             pw = auth_tgt.get("pos_world")
             if pw is not None and not auth_tgt.get("pos_jump_rejected"):
@@ -1227,18 +1241,26 @@ class RgbdPureDualPipeline:
 
         if self._nav_lock_miss >= NAV_LOCK_MISS_MAX:
             prev_class = self._nav_lock_class
+            prev_world = list(self._nav_lock_world) if self._nav_lock_world is not None else None
+            prev_id = self._nav_lock_id
             self._nav_lock_id = None
             self._nav_lock_class = None
             self._nav_lock_world = None
             self._nav_lock_miss = 0
             seed = _acquire_nav_lock(
-                head_objs, ee_objs, head_nav, ee_nav, head_d, ee_d, prefer_class=prev_class,
+                head_objs, ee_objs, head_nav, ee_nav, head_d, ee_d,
+                prefer_class=prev_class, prefer_world=prev_world,
             )
             if seed is not None:
                 self._nav_lock_id = int(seed["id"])
                 self._nav_lock_class = seed.get("class")
                 pw = seed.get("pos_world")
                 self._nav_lock_world = list(pw) if pw is not None else None
+            elif prev_id is not None and prev_world is not None:
+                self._nav_lock_id = int(prev_id)
+                self._nav_lock_class = prev_class
+                self._nav_lock_world = prev_world
+                self._nav_lock_miss = NAV_LOCK_MISS_MAX // 2
 
         grasp_src = ee_grasp_nav if _same_nav_target(ee_grasp_nav, auth_tgt) else None
         if grasp_src is None and auth_tgt is not None:
@@ -1324,6 +1346,7 @@ class RgbdPureDualPipeline:
             "nav_authority_mode": auth_mode,
             "nav_lock_id": self._nav_lock_id,
             "nav_lock_class": self._nav_lock_class,
+            "nav_lock_stable": self._nav_lock_id is not None and self._nav_lock_miss == 0,
             "nav_pos_confidence": None if nav_tgt is None else nav_tgt.get("pos_confidence"),
             "navigation": {"camera": nav_cam, "target": nav_tgt, "objects_detailed": nav_objs},
             "target_nav": nav_tgt,
