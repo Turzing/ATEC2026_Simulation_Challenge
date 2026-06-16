@@ -83,9 +83,10 @@ TEMPORAL_MEDIAN_N = 6
 GRASP_TEMPORAL_N = 10
 MOTION_FREEZE_THRESH = 0.35
 
-# 远/近距导航均 head 主导 (EE 侧视远距假检太多); grasp 才 EE
+# 远/近距导航 head 主导; EE 远距只做 ee_search_hint 方位，不做 3D fallback
 NAV_AUTHORITY = {"far_ee": "head", "near_head": "head", "grasp": "ee"}
-NAV_FALLBACK = {"far_ee": "ee", "near_head": "ee", "grasp": None}
+NAV_FALLBACK = {"far_ee": None, "near_head": None, "grasp": None}
+EE_BEARING_ONLY_MAX_M = 2.85   # 超过此距 EE 只 export 方位角，不 export target_nav
 
 
 def _obj_dist(obj: Optional[dict]) -> float:
@@ -512,9 +513,9 @@ def _best_nav_target(
 ) -> Optional[dict]:
     if not objs:
         return None
-    locked = _find_in_pool(objs, lock_id, lock_class, lock_world)
-    if locked is not None:
-        return _enrich_nav(locked)
+    if lock_id is not None:
+        locked = _find_in_pool(objs, lock_id, lock_class, lock_world)
+        return _enrich_nav(locked) if locked is not None else None
     return _enrich_nav(min(objs, key=lambda o: _nav_lock_rank(o)))
 
 
@@ -677,13 +678,21 @@ def _head_confirms_lock(
 
 
 def _can_acquire_nav_lock(seed: Optional[dict], head_objs: List[dict]) -> bool:
-    """必须 head 确认才首锁 (log: ee-only 错锁 → 转圈 30s)."""
+    """必须 head 确认才首锁 (log: ee-only / 同类远距 head → 错锁转圈)."""
     if seed is None or not head_objs:
         return False
-    if _is_ee_sourced(seed) and not _head_confirms_lock(head_objs, seed.get("id"), seed.get("class")):
-        same = [o for o in head_objs if o.get("class") == seed.get("class")]
-        if not same:
+    if _head_confirms_lock(head_objs, seed.get("id"), seed.get("class")):
+        return True
+    if _is_ee_sourced(seed):
+        same_cls = [o for o in head_objs if o.get("class") == seed.get("class")]
+        if not same_cls:
             return False
+        pw = seed.get("pos_world")
+        if pw is None:
+            return False
+        ref = {"pos_world": pw}
+        near = min(same_cls, key=lambda o: _world_xy_dist(o, ref))
+        return _world_xy_dist(near, ref) <= NAV_RELOCK_MAX_XY_M
     return True
 
 
@@ -760,17 +769,6 @@ def _acquire_nav_lock(
             head_cands = same_cls
     if head_cands:
         best = min(head_cands, key=lambda o: _nav_lock_rank(o))
-        out = dict(best)
-        out["pos_confidence"] = float(best.get("pos_confidence") or head_nav_pos_confidence(best))
-        return out
-
-    ee_cands = [o for o in ee_objs if _eligible(o, True) and _near_preferred(o)]
-    if prefer_class and ee_cands:
-        same_cls = [o for o in ee_cands if o.get("class") == prefer_class]
-        if same_cls:
-            ee_cands = same_cls
-    if ee_cands and head_objs:
-        best = min(ee_cands, key=lambda o: _nav_lock_rank(o, prefer_head=False))
         out = dict(best)
         out["pos_confidence"] = float(best.get("pos_confidence") or head_nav_pos_confidence(best))
         return out
@@ -996,13 +994,6 @@ def _export_ee_for_motion(
     if auth_tgt is not None and auth_cam == "head":
         return [_make_head_mirror(auth_tgt)]
 
-    if ee_objs:
-        pool = [o for o in ee_objs if not _is_ee_phantom_near(o, head_objs)]
-        if pool:
-            best_ee = min(pool, key=_obj_dist)
-            exp = _safe_ee_export(best_ee, head_objs, ee_objs)
-            if exp is not None:
-                return [exp]
     return []
 
 
@@ -1030,28 +1021,47 @@ def _ensure_ee_motion_export(
     if head_objs:
         best = min(head_objs, key=lambda o: _nav_lock_rank(o))
         return [_make_head_mirror(best)]
-    if ee_nav is not None:
-        exp = _safe_ee_export(ee_nav, head_objs, ee_objs)
-        if exp is not None:
-            return [exp]
-    if ee_objs:
-        pool = [o for o in ee_objs if not _is_ee_phantom_near(o, head_objs)]
-        if pool:
-            best = min(pool, key=_obj_dist)
-            exp = _safe_ee_export(best, head_objs, ee_objs)
+    if nav_stage == "grasp":
+        if ee_nav is not None:
+            exp = _safe_ee_export(ee_nav, head_objs, ee_objs)
             if exp is not None:
                 return [exp]
+        if ee_objs:
+            pool = [o for o in ee_objs if not _is_ee_phantom_near(o, head_objs)]
+            if pool:
+                best = min(pool, key=_obj_dist)
+                exp = _safe_ee_export(best, head_objs, ee_objs)
+                if exp is not None:
+                    return [exp]
     return []
+
+
+def _head_has_nav_target(head_objs: List[dict], head_nav: Optional[dict]) -> bool:
+    if head_nav is not None:
+        return True
+    return any(
+        o.get("pos_world") is not None
+        and not o.get("coast_frame")
+        and float(o.get("pos_confidence") or 0.0) >= 0.35
+        for o in head_objs
+    )
 
 
 def _build_ee_search_hint(
     head_objs: List[dict],
     ee_objs: List[dict],
+    head_nav: Optional[dict] = None,
+    nav_lock_id: Optional[int] = None,
 ) -> Optional[dict]:
-    """head=0 时 export EE 方位角供 motion 定向搜 (log: 盲转 43s)."""
-    if head_objs or not ee_objs:
+    """head 无可靠 3D 时 export EE 方位角供 motion 转向 (不用 EE world 坐标导航)."""
+    if not ee_objs:
         return None
-    best = min(ee_objs, key=_obj_dist)
+    if nav_lock_id is not None and _head_has_nav_target(head_objs, head_nav):
+        return None
+    pool = [o for o in ee_objs if not o.get("nav_from_head")]
+    if not pool:
+        pool = list(ee_objs)
+    best = min(pool, key=_obj_dist)
     pr = best.get("pos_robot")
     if pr is None:
         return None
@@ -1061,13 +1071,43 @@ def _build_ee_search_hint(
         return None
     if abs(px) < 0.05 and abs(py) < 0.05:
         return None
+    depth = _obj_dist(best)
     bearing = float(np.arctan2(py, px))
     return {
         "yaw_rel": bearing,
         "class": best.get("class"),
+        "id": best.get("id"),
         "bearing_only": True,
-        "depth_m": _obj_dist(best),
+        "depth_m": depth,
+        "depth_unreliable": depth > EE_BEARING_ONLY_MAX_M or _is_far_ee_nav_unreliable(best),
     }
+
+
+def _suppress_far_ee_nav_target(
+    nav_tgt: Optional[dict],
+    auth_cam: str,
+    head_objs: List[dict],
+    nav_lock_id: Optional[int],
+    nav_stage: str,
+) -> Optional[dict]:
+    """无 head lock 时禁止 EE 3D 当 target_nav；改走 ee_search_hint."""
+    if nav_tgt is None or nav_stage == "grasp":
+        return nav_tgt
+    if nav_tgt.get("nav_from_head"):
+        return nav_tgt
+    if nav_lock_id is not None and _head_confirms_lock(head_objs, nav_lock_id, nav_tgt.get("class")):
+        return nav_tgt
+    src = str(nav_tgt.get("source_camera") or auth_cam or "")
+    ee_sourced = "ee" in src.lower() and not nav_tgt.get("nav_from_head")
+    if not ee_sourced and auth_cam != "ee":
+        return nav_tgt
+    if _head_has_nav_target(head_objs, None):
+        return nav_tgt
+    if _is_far_ee_nav_unreliable(nav_tgt) or _nav_dist_conservative(nav_tgt) > EE_BEARING_ONLY_MAX_M:
+        return None
+    if not head_objs:
+        return None
+    return nav_tgt
 
 
 def _sync_lock_id_from_head(
@@ -1320,12 +1360,20 @@ class RgbdPureDualPipeline:
         )
         ee_grasp_nav = ee_grasp if _strict_lock_match(ee_grasp, lock_ref_obj) else None
         ee_grasp_ok = ee_grasp_nav is not None and bool(ee_grasp_nav.get("grasp_reliable"))
-        head_close = _nav_dist_conservative(head_nav) < GRASP_APPROACH_DIST_M
+        head_lock_hit = _find_in_pool(
+            head_objs, self._nav_lock_id, self._nav_lock_class, self._nav_lock_world,
+        )
+        head_close = (
+            head_lock_hit is not None
+            and _nav_dist_conservative(head_lock_hit) < GRASP_APPROACH_DIST_M
+        )
         lock_dist = _nav_dist_conservative(locked or lock_ref_obj)
         want_grasp = (
-            close_d < GRASP_APPROACH_DIST_M
+            self._nav_lock_id is not None
+            and close_d < GRASP_APPROACH_DIST_M
             and lock_dist < GRASP_APPROACH_DIST_M + 0.08
             and lock_ref_obj is not None
+            and _strict_lock_match(lock_ref_obj, {"id": self._nav_lock_id, "class": self._nav_lock_class})
             and (ee_grasp_ok or head_close)
         )
 
@@ -1346,12 +1394,21 @@ class RgbdPureDualPipeline:
         if auth_tgt is not None:
             nav_dist = _nav_dist_conservative(auth_tgt)
             if self._nav_lock_id is None:
-                self._nav_lock_id = int(auth_tgt["id"])
-                self._nav_lock_class = auth_tgt.get("class")
-            pw = auth_tgt.get("pos_world")
-            if pw is not None:
-                self._nav_lock_world = list(pw)
-            self._nav_lock_miss = 0
+                if _can_acquire_nav_lock(auth_tgt, head_objs):
+                    self._nav_lock_id = int(auth_tgt["id"])
+                    self._nav_lock_class = auth_tgt.get("class")
+                    pw = auth_tgt.get("pos_world")
+                    if pw is not None:
+                        self._nav_lock_world = list(pw)
+                    self._nav_lock_miss = 0
+                else:
+                    auth_tgt = None
+                    self._nav_lock_miss += 1
+            else:
+                pw = auth_tgt.get("pos_world")
+                if pw is not None:
+                    self._nav_lock_world = list(pw)
+                self._nav_lock_miss = 0
         else:
             self._nav_lock_miss += 1
 
@@ -1447,6 +1504,15 @@ class RgbdPureDualPipeline:
                 ry,
             )
 
+        nav_tgt = _suppress_far_ee_nav_target(
+            nav_tgt, auth_cam, head_objs, self._nav_lock_id, nav_stage,
+        )
+        if nav_tgt is None and auth_tgt is not None:
+            if _suppress_far_ee_nav_target(
+                auth_tgt, auth_cam, head_objs, self._nav_lock_id, nav_stage,
+            ) is None:
+                auth_tgt = None
+
         if self._nav_lock_id is not None:
             synced = _sync_lock_id_from_head(
                 self._nav_lock_id, self._nav_lock_class, head_objs,
@@ -1461,10 +1527,12 @@ class RgbdPureDualPipeline:
             grasp_objs = [g0] if g0 is not None else []
         ee_list = [_object_summary(o, "ee") for o in ee_objs]
         head_list = [_object_summary(o, "head") for o in head_objs]
-        ee_search_hint = _build_ee_search_hint(head_objs, ee_objs_raw)
+        ee_search_hint = _build_ee_search_hint(
+            head_objs, ee_objs_raw, head_nav=head_nav, nav_lock_id=self._nav_lock_id,
+        )
 
         return {
-            "roles": {"ee": "nav_far+grasp", "head": "nav_near"},
+            "roles": {"ee": "bearing_search+grasp", "head": "nav_lock"},
             "nav_stage": nav_stage,
             "nav_authority": auth_cam,
             "nav_authority_mode": auth_mode,

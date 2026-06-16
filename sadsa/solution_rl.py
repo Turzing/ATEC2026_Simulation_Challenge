@@ -605,7 +605,64 @@ class AlgSolution:
         w, x, y, z = float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3])
         return pos_world, self._quat_to_rot_matrix(w, x, y, z)
 
-    def _get_ground_truth_camera_pose(self, camera_name: str) -> tuple[np.ndarray, np.ndarray] | None:
+    def _fk_camera_pose_world(
+        self,
+        camera_name: str,
+        robot_pos: np.ndarray,
+        robot_yaw: float,
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        """机器人 FK 外参：scene 传感器 pos_w 不跟随时 fallback."""
+        try:
+            from taskb_perception.rgbd_utils import (
+                compute_dynamic_ee_cam_pos,
+                compute_dynamic_head_cam_pos,
+                EE_CAM_ROT_MATRIX,
+                HEAD_CAM_ROT_MATRIX,
+                robot_to_world,
+            )
+        except ImportError:
+            return None
+
+        c, s = math.cos(robot_yaw), math.sin(robot_yaw)
+        rot_world = np.array(
+            [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]],
+            dtype=np.float32,
+        )
+        arm_joints = None
+        gravity = None
+        robot = self._get_robot()
+        if robot is not None:
+            try:
+                q = robot.data.joint_pos[0].detach().cpu().numpy()
+                name_to_q = {
+                    n: float(q[i])
+                    for i, n in enumerate(robot.data.joint_names)
+                }
+                arm_joints = [
+                    name_to_q.get(n, 0.0) for n in self.arm_ik_joint_names
+                ]
+            except Exception:
+                arm_joints = None
+            try:
+                gravity = robot.data.projected_gravity_b[0].detach().cpu().numpy()
+            except Exception:
+                gravity = None
+
+        if "ee" in camera_name:
+            cam_pos_robot = compute_dynamic_ee_cam_pos(arm_joints)
+            cam_rot_w = rot_world @ EE_CAM_ROT_MATRIX
+        else:
+            cam_pos_robot = compute_dynamic_head_cam_pos(gravity)
+            cam_rot_w = rot_world @ HEAD_CAM_ROT_MATRIX
+        cam_pos_w = robot_to_world(cam_pos_robot, robot_pos, robot_yaw)
+        return cam_pos_w.astype(np.float32), cam_rot_w.astype(np.float32)
+
+    def _get_ground_truth_camera_pose(
+        self,
+        camera_name: str,
+        robot_pos: np.ndarray | None = None,
+        robot_yaw: float | None = None,
+    ) -> tuple[np.ndarray, np.ndarray] | None:
         """从 scene 传感器读取相机真实世界位姿 (pos_w / quat_w_ros)."""
         if self.env is None:
             return None
@@ -620,6 +677,10 @@ class AlgSolution:
                 scene = env_unwrapped._env.scene
 
             if scene is None:
+                if robot_pos is not None:
+                    return self._fk_camera_pose_world(
+                        camera_name, robot_pos, float(robot_yaw or 0.0),
+                    )
                 return None
 
             if "head" in camera_name:
@@ -656,9 +717,24 @@ class AlgSolution:
                         continue
                 if self._step_count % 30 == 0:
                     self._log(f"[CAM] camera '{camera_name}' not found. Available sensors: {available}")
+                if robot_pos is not None:
+                    return self._fk_camera_pose_world(
+                        camera_name, robot_pos, float(robot_yaw or 0.0),
+                    )
                 return None
 
             name, (pos_world, rot_matrix) = found
+            if robot_pos is not None:
+                mount_xy = float(np.linalg.norm(pos_world[:2] - robot_pos[:2]))
+                if mount_xy > 0.75:
+                    fk = self._fk_camera_pose_world(
+                        camera_name,
+                        robot_pos,
+                        float(robot_yaw or 0.0),
+                    )
+                    if fk is not None:
+                        pos_world, rot_matrix = fk
+                        name = f"{name}_fk"
             if self._step_count % 60 == 0:
                 forward_world = rot_matrix @ np.array([0.0, 0.0, 1.0], dtype=np.float32)
                 self._log(
@@ -669,6 +745,10 @@ class AlgSolution:
         except Exception as exc:
             if self._step_count % 30 == 0:
                 self._log(f"[CAM] camera '{camera_name}' error: {type(exc).__name__}: {exc}")
+            if robot_pos is not None:
+                return self._fk_camera_pose_world(
+                    camera_name, robot_pos, float(robot_yaw or 0.0),
+                )
             return None
 
     def _quat_to_rot_matrix(self, w: float, x: float, y: float, z: float) -> np.ndarray:
@@ -804,7 +884,7 @@ class AlgSolution:
             return "head" in src.lower()
 
         # 获取 EE 相机真实位姿并校正 (跳过 head mirror，由 head 相机校正)
-        ee_cam_pose = self._get_ground_truth_camera_pose("ee_camera")
+        ee_cam_pose = self._get_ground_truth_camera_pose("ee_camera", robot_pos, robot_yaw)
         if ee_cam_pose is not None:
             ee_cam_pos_w, ee_cam_rot_w = ee_cam_pose
             ee_objects = perception_output.get("ee_objects", [])
@@ -834,7 +914,7 @@ class AlgSolution:
                 self._log(f"[CORR] EE camera correction applied, {n_before} objects at pos=[{pw[0]:.2f}, {pw[1]:.2f}, {pw[2]:.2f}]")
 
         # 获取 head 相机真实位姿并校正 head 检测 + head mirror (ee_objects)
-        head_cam_pose = self._get_ground_truth_camera_pose("head_camera")
+        head_cam_pose = self._get_ground_truth_camera_pose("head_camera", robot_pos, robot_yaw)
         if head_cam_pose is not None:
             head_cam_pos_w, head_cam_rot_w = head_cam_pose
             head_objects = perception_output.get("head_objects", [])
@@ -1766,13 +1846,14 @@ class AlgSolution:
         return None
 
     def _compute_search_cmd(self, perception_output: dict[str, Any] | None) -> np.ndarray:
-        """head=0 时用 EE 方位定向转，避免盲转 43s (log 02-27-18)."""
+        """head 无 lock 时用 EE 方位转向+慢走，避免盲转或跟 EE 错 3D."""
         hint = (perception_output or {}).get("ee_search_hint")
-        if isinstance(hint, dict) and hint.get("yaw_rel") is not None:
+        if isinstance(hint, dict) and hint.get("bearing_only") and hint.get("yaw_rel") is not None:
             bearing = float(hint["yaw_rel"])
-            if abs(bearing) > 0.12:
-                ang = float(np.clip(bearing * self.heading_kp, -0.55, 0.55))
-                return np.array([0.0, 0.0, ang], dtype=np.float32)
+            if abs(bearing) > 0.08:
+                ang = float(np.clip(bearing * self.heading_kp, -0.52, 0.52))
+                lin = 0.18 if abs(bearing) < 0.45 else 0.08
+                return np.array([lin, 0.0, ang], dtype=np.float32)
         return np.array([0.25, 0.0, self.search_yaw_rate * 0.85], dtype=np.float32)
 
     def _build_search_nav_info(self, nav_input: dict[str, Any], target: dict[str, Any] | None) -> dict[str, Any]:
@@ -1916,7 +1997,9 @@ class AlgSolution:
         fallback_candidates = self._normalize_camera_objects(fallback_raw, fallback_camera, robot_pos_world, robot_yaw)
 
         target = self._fuse_perception_target(perception_output, robot_pos_world, robot_yaw)
-        if target is None and perception_output.get("nav_lock_id") is None:
+        ee_hint = perception_output.get("ee_search_hint")
+        bearing_only = isinstance(ee_hint, dict) and bool(ee_hint.get("bearing_only"))
+        if target is None and perception_output.get("nav_lock_id") is None and not bearing_only:
             target = self._update_visual_target_tracking(
                 preferred_candidates,
                 fallback_candidates,
@@ -2506,6 +2589,8 @@ class AlgSolution:
             )
 
         fallback = dict(target_nav)
+        if lock_id is not None and int(fallback.get("id", -1)) != int(lock_id):
+            return None
         if fallback.get("grasp_pos_world") is None:
             fallback["grasp_pos_world"] = tracked_pos.tolist()
         return fallback
@@ -2669,7 +2754,17 @@ class AlgSolution:
                 tracked_pos = self._safe_numpy(self._tracked_target.get("filtered_pos_world"), np.zeros(3, dtype=np.float32))
                 tracked_robot = self._world_to_robot_frame(tracked_pos, robot_pos_world, robot_yaw)
                 tracked_dist = float(np.linalg.norm(tracked_robot[:2]))
-            if tracked_dist <= self.target_near_range:
+            nav_lock_id = perception_output.get("nav_lock_id")
+            lock_cons_dist = float("inf")
+            if isinstance(perception_output.get("target_nav"), dict):
+                lock_cons_dist = self._conservative_target_dist(
+                    perception_output["target_nav"], robot_pos_world,
+                )
+            if (
+                tracked_dist <= self.target_near_range
+                and nav_lock_id is not None
+                and lock_cons_dist <= self.grasp_start_depth
+            ):
                 perception_output["phase"] = "grasp"
             nav_input, target_nav = self._adapt_perception_output(obs, local_nav, perception_output)
 
@@ -2928,14 +3023,20 @@ class AlgSolution:
                 heading_ok = abs(float(nav_info.get("heading_error") or 999.0)) <= max(
                     self.object_yaw_tolerance * 3.0, 0.45,
                 )
+                lock_id = perception_output.get("nav_lock_id") if isinstance(perception_output, dict) else None
+                lock_match = (
+                    lock_id is not None
+                    and matched_grasp_target is not None
+                    and int(matched_grasp_target.get("id", -1)) == int(lock_id)
+                )
                 if (
                     matched_grasp_target is not None
+                    and lock_match
                     and dist_ok
                     and heading_ok
                     and (
                         nav_info.get("phase") == "ready_to_grasp"
-                        or perception_phase == "grasp"
-                        or cons_dist <= self.grasp_start_depth
+                        or cons_dist <= self.grasp_start_depth - 0.08
                     )
                 ):
                     base_cmd = np.zeros(3, dtype=np.float32)

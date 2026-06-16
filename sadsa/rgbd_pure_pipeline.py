@@ -1305,7 +1305,7 @@ class RgbdPureCamera:
         mask = (
             roi & valid
             & (hue >= HEAD_HUE_LO) & (hue <= HEAD_HUE_HI)
-            & (sat >= 14) & (val >= 36)
+            & (sat >= 12) & (val >= 32)
         ).astype(np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
         dets = self._dets_from_mask(mask, rgb, depth, robot_pos, robot_yaw)
@@ -1380,7 +1380,7 @@ class RgbdPureCamera:
             if far_dets:
                 if not dets:
                     dets = far_dets
-                elif all(float(o.get("depth_m") or 99.0) > 2.0 for o in dets):
+                elif all(float(o.get("depth_m") or 99.0) > 1.85 for o in dets):
                     dets = self._merge_dets(list(dets) + far_dets)
             if len(dets) == 0:
                 if self._scene_near(depth):
