@@ -318,6 +318,53 @@ def _pick_nav_target(
     return "ee", ee_objs, ee_tgt
 
 
+def _is_far_ee_nav_unreliable(obj: dict) -> bool:
+    """侧视 EE 远距假检：depth>2m 且横向过大，易锁错目标导致只转不走."""
+    if obj.get("nav_from_head") or obj.get("grasp_reliable"):
+        return False
+    depth = float(obj.get("nav_depth_m") or obj.get("depth_m") or 0.0)
+    if depth < 2.05:
+        return False
+    pr = obj.get("pos_robot")
+    if pr is None:
+        return depth > 2.8
+    try:
+        px, py = abs(float(pr[0])), abs(float(pr[1]))
+    except (TypeError, ValueError, IndexError):
+        return True
+    if py > 0.85 and py > px * 0.55:
+        return True
+    if depth > 2.8 and not obj.get("world_reliable"):
+        return True
+    return False
+
+
+def _export_ee_for_motion(
+    ee_objs: List[dict],
+    head_nav: Optional[dict],
+    phase: str,
+    ee_near: float,
+    ee_nav: Optional[dict],
+) -> List[dict]:
+    """solution_rl approach 只读 ee_objects；剔除远距 EE 假检 + head 位姿注入."""
+    out = [o for o in ee_objs if not (phase == "approach" and _is_far_ee_nav_unreliable(o))]
+    if phase == "approach":
+        out = _inject_head_nav_into_ee(out, head_nav, phase, ee_near, ee_nav)
+        if head_nav is not None and out and out[0].get("nav_from_head"):
+            hd = _obj_dist(head_nav)
+            out = [out[0]] + [
+                o for o in out[1:]
+                if not (
+                    o.get("class") == head_nav.get("class")
+                    and _obj_dist(o) > hd + 0.6
+                    and _is_far_ee_nav_unreliable(o)
+                )
+            ]
+    else:
+        out = [stabilize_ee_nav_pose(o) for o in out]
+    return out
+
+
 def _ee_nav_lateral(obj: Optional[dict]) -> float:
     if not obj:
         return 0.0
@@ -344,7 +391,7 @@ def _inject_head_nav_into_ee(
     if hd > 3.2:
         return ee_objs
     ee_lat = _ee_nav_lateral(ee_nav)
-    if ee_near < HEAD_MIRROR_EE_MIN_M and ee_lat < 0.55:
+    if ee_near < HEAD_MIRROR_EE_MIN_M and ee_lat < 0.55 and hd >= ee_near - 0.15:
         return ee_objs
     mirror = dict(head_nav)
     for k in (
@@ -482,8 +529,9 @@ class RgbdPureDualPipeline:
         if phase == "grasp" and ee_near < HEAD_DISABLE_DIST_M:
             head_objs = []
 
-        ee_objs = [stabilize_ee_nav_pose(o) for o in ee_objs]
-        ee_objs = _inject_head_nav_into_ee(ee_objs, head_nav, phase, ee_near, ee_nav)
+        ee_objs = _export_ee_for_motion(ee_objs, head_nav, phase, ee_near, ee_nav)
+        if phase == "grasp":
+            ee_objs = [stabilize_ee_nav_pose(o) for o in ee_objs]
 
         nav_cam, nav_objs, nav_tgt = _pick_nav_target(
             ee_nav, head_nav, ee_objs, head_objs, ee_near,
