@@ -582,6 +582,52 @@ def refresh_head_object_pose(
     return out
 
 
+def align_nav_pos_to_bbox_ray(
+    obj: dict,
+    robot_pos: np.ndarray,
+    robot_yaw: float,
+    cam_pos_robot: np.ndarray,
+    cam_cfg: dict,
+    cam_rot_matrix: np.ndarray,
+) -> dict:
+    """用 bbox 中心像素射线定导航方位 (fix: 3D 横向偏 90° 导致转圈)."""
+    out = dict(obj)
+    bbox = out.get("bbox")
+    pr = out.get("pos_robot")
+    if not bbox or len(bbox) != 4 or pr is None:
+        return out
+    try:
+        cx = 0.5 * (float(bbox[0]) + float(bbox[2]))
+        cy = 0.5 * (float(bbox[1]) + float(bbox[3]))
+        depth = float(
+            out.get("nav_anchor_depth")
+            or out.get("nav_depth_m")
+            or out.get("depth_m")
+            or np.linalg.norm(np.asarray(pr, dtype=np.float32)[:2])
+        )
+    except (TypeError, ValueError, IndexError):
+        return out
+    if depth <= 0.05:
+        return out
+    ray = pixel_to_robot(cx, cy, depth, cam_cfg, cam_pos_robot, cam_rot_matrix)
+    dist = float(np.linalg.norm(np.asarray(pr, dtype=np.float32)[:2]))
+    ray_xy = float(np.linalg.norm(ray[:2]))
+    if ray_xy < 0.05:
+        return out
+    scale = dist / ray_xy
+    pos_r = np.array(
+        [float(ray[0]) * scale, float(ray[1]) * scale, float(pr[2]) if len(pr) > 2 else float(ray[2])],
+        dtype=np.float32,
+    )
+    out["pos_robot"] = pos_r.tolist()
+    out["pos_world"] = robot_to_world(pos_r, robot_pos, robot_yaw).tolist()
+    out["dist_to_robot"] = dist
+    out["yaw_rel"] = float(np.arctan2(pos_r[1], pos_r[0]))
+    out["nav_yaw_rel"] = out["yaw_rel"]
+    out["nav_from_bbox"] = True
+    return out
+
+
 def refresh_locked_grasp(
     frozen: dict,
     robot_pos: np.ndarray,

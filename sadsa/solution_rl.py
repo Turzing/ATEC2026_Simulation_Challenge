@@ -1170,27 +1170,29 @@ class AlgSolution:
         target_dist = float(np.linalg.norm(target_pos_robot[:2]))
         heading_error = self._smooth_nav_heading(float(math.atan2(target_pos_robot[1], target_pos_robot[0])))
         stop_distance = self._dynamic_stop_distance_for_target(target_nav)
-        forward_error = float(target_pos_robot[0] - stop_distance)
+        remaining = max(0.0, target_dist - stop_distance)
         lateral_error = float(target_pos_robot[1])
-        goal_dist = float(np.linalg.norm([forward_error, lateral_error]))
+        goal_dist = remaining
 
         phase = "near_refine" if target_dist <= self.target_near_range else "far_approach"
 
-        approach_scale = float(np.clip(goal_dist / self.slow_down_radius, 0.0, 1.0))
-        heading_scale = max(self.min_heading_lin_scale, math.cos(min(abs(heading_error), math.pi / 2.0)))
-        align_threshold = self.turn_then_go_yaw_threshold
+        approach_scale = float(np.clip(remaining / self.slow_down_radius, 0.0, 1.0))
+        heading_scale = max(self.min_heading_lin_scale, abs(math.cos(heading_error)))
 
-        if abs(heading_error) > align_threshold:
-            creep = max(0.22, approach_scale * heading_scale * 0.55)
-            lin_x = float(np.clip(forward_error * creep, 0.0, self.max_lin_vel))
-            lin_y = 0.0
-            ang_z = float(np.clip(heading_error * self.heading_kp, -self.max_ang_vel, self.max_ang_vel))
+        lin_x = float(np.clip(remaining * approach_scale * heading_scale, 0.0, self.max_lin_vel))
+        if remaining > 0.35 and lin_x < 0.45:
+            lin_x = 0.45 * approach_scale
+        lin_y = 0.0
+        ang_z = float(np.clip(heading_error * self.heading_kp, -self.max_ang_vel, self.max_ang_vel))
+        if remaining > 1.0:
+            ang_z *= 0.72
+
+        if abs(heading_error) > self.turn_then_go_yaw_threshold and lin_x < 0.20:
             phase = "turn_to_target"
+        elif target_dist <= self.target_near_range:
+            phase = "near_refine"
         else:
-            lin_x = float(np.clip(forward_error * approach_scale * heading_scale, -self.max_lin_vel, self.max_lin_vel))
-            lin_y = 0.0
-            ang_z = 0.0
-            phase = "near_refine" if target_dist <= self.target_near_range else "far_approach"
+            phase = "far_approach"
 
         stopped = False
         if goal_dist <= self.object_stop_tolerance and abs(heading_error) <= self.object_yaw_tolerance:
@@ -1207,7 +1209,7 @@ class AlgSolution:
             "target_dist": target_dist,
             "goal_dist": goal_dist,
             "heading_error": heading_error,
-            "forward_error": forward_error,
+            "forward_error": remaining,
             "lateral_error": lateral_error,
             "stopped": stopped,
             "ang_z": float(ang_z),
@@ -1337,13 +1339,6 @@ class AlgSolution:
         self._pregrasp_stall_steps = 0
         self._pregrasp_last_robot_xy = None
         base_cmd, nav_info = self._compute_dynamic_visual_cmd(target_nav, target_pos_robot)
-        if self._nav_approach_stalled(nav_info, float(target_nav.get("dist_to_robot") or 0.0)):
-            self._clear_fuse_nav_lock(
-                f"turn stall dist={float(target_nav.get('dist_to_robot') or 0.0):.2f}m"
-            )
-            nav_info["phase"] = "search_stall"
-            nav_info["stopped"] = False
-            return self._compute_search_cmd(self._last_perception_output), nav_info
         return base_cmd, nav_info
 
     @staticmethod

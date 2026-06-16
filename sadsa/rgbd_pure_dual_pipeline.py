@@ -16,6 +16,10 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from config import (
+    EE_CAM,
+    EE_CAM_ROT_MATRIX,
+    HEAD_CAM,
+    HEAD_CAM_ROT_MATRIX,
     BIN_CENTER,
     BIN_RADIUS,
     CLASS_FLIP_CONF,
@@ -53,6 +57,7 @@ from rgbd_utils import (
     parse_head_rgbd,
     refresh_ee_object_pose,
     refresh_head_object_pose,
+    align_nav_pos_to_bbox_ray,
     refresh_locked_grasp,
     reject_pos_world_jump,
     stabilize_ee_nav_pose,
@@ -188,6 +193,7 @@ def _finalize_ee(o: dict, robot_pos, robot_yaw, arm_joints) -> dict:
         from config import EE_CAM_POS_ROBOT
         cam_pos = EE_CAM_POS_ROBOT
     out = refresh_ee_object_pose(o, robot_pos, robot_yaw, cam_pos)
+    out = align_nav_pos_to_bbox_ray(out, robot_pos, robot_yaw, cam_pos, EE_CAM, EE_CAM_ROT_MATRIX)
     out["camera"] = "ee"
     out["role"] = "nav_grasp"
     return _enrich_nav(out) or out
@@ -196,6 +202,7 @@ def _finalize_ee(o: dict, robot_pos, robot_yaw, arm_joints) -> dict:
 def _finalize_head(o: dict, robot_pos, robot_yaw, grav) -> dict:
     cam_pos = compute_dynamic_head_cam_pos(grav)
     out = refresh_head_object_pose(o, robot_pos, robot_yaw, cam_pos)
+    out = align_nav_pos_to_bbox_ray(out, robot_pos, robot_yaw, cam_pos, HEAD_CAM, HEAD_CAM_ROT_MATRIX)
     out["camera"] = "head"
     out["role"] = "nav"
     return _enrich_nav(out) or out
@@ -666,8 +673,12 @@ def _head_confirms_lock(
 
 
 def _can_acquire_nav_lock(seed: Optional[dict], head_objs: List[dict]) -> bool:
-    """有检出就允许锁，不再额外门控."""
-    return seed is not None
+    """有检出就锁; EE 独检须等 head 出帧 (log: ee-only banana heading 1.78rad 纯转)."""
+    if seed is None:
+        return False
+    if _is_ee_sourced(seed) and not head_objs:
+        return False
+    return True
 
 
 def _find_locked_target(
@@ -752,7 +763,7 @@ def _acquire_nav_lock(
         same_cls = [o for o in ee_cands if o.get("class") == prefer_class]
         if same_cls:
             ee_cands = same_cls
-    if ee_cands:
+    if ee_cands and head_objs:
         best = min(ee_cands, key=lambda o: _nav_lock_rank(o, prefer_head=False))
         out = dict(best)
         out["pos_confidence"] = float(best.get("pos_confidence") or head_nav_pos_confidence(best))
@@ -763,7 +774,7 @@ def _acquire_nav_lock(
 
     if head_nav is not None and _eligible(head_nav, False):
         return head_nav
-    if ee_nav is not None and not _is_ee_phantom_near(ee_nav, head_objs):
+    if ee_nav is not None and head_objs and not _is_ee_phantom_near(ee_nav, head_objs):
         if not _is_far_ee_nav_unreliable(ee_nav):
             ed = float(ee_nav.get("depth_m") or ee_nav.get("nav_depth_m") or 99.0)
             if ed <= EE_NAV_LOCK_MAX_DEPTH_M and bool(ee_nav.get("world_reliable")):
