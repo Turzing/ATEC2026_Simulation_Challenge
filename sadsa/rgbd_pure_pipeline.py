@@ -1073,15 +1073,25 @@ class RgbdPureCamera:
         is_ee = self.camera_name == "ee"
         x1, y1, x2, y2 = bbox
 
-        # ── head: 点云 + 底边 anchor 导航 (不用 centroid 单点 depth) ──
+        # ── head: 点云 + 底边 anchor 导航 (近端 depth, 避免 bbox 底边打到地面) ──
         if is_head:
             nav_u = float(cx)
             nav_v = float(y2)
-            au = int(np.clip(nav_u, 0, w - 1))
-            av = int(np.clip(nav_v, 0, h - 1))
-            az = float(depth[av, au])
-            if az <= self._depth_min() or az >= DEPTH_MAX:
-                az = float(depth_m)
+            dmin, dmax = self._depth_min(), DEPTH_MAX
+            blob_d = depth[ys, xs]
+            blob_d = blob_d[(blob_d > dmin) & (blob_d < dmax)]
+            if blob_d.size >= 6:
+                az = float(np.percentile(blob_d, 10))
+                near_idx = int(np.argmin(np.abs(blob_d - az)))
+                near_y, near_x = int(ys[near_idx]), int(xs[near_idx])
+                nav_u = float(near_x)
+                nav_v = float(near_y)
+            else:
+                au = int(np.clip(nav_u, 0, w - 1))
+                av = int(np.clip(nav_v, 0, h - 1))
+                az = float(depth[av, au])
+                if az <= dmin or az >= dmax:
+                    az = float(depth_m)
 
             pts = self._blob_points_robot(ys, xs, depth, depth_m)
             pos_from_pc = False
@@ -1125,7 +1135,7 @@ class RgbdPureCamera:
             )
             conf = float(min(0.94, 0.45 + cls_conf * 0.55))
             yaw_rel = float(np.arctan2(pos_r[1], pos_r[0]))
-            depth_f = float(depth_m)
+            depth_f = float(az if az > self._depth_min() else depth_m)
             return {
                 "class": cls,
                 "class_id": CLASS_NAME_TO_ID.get(cls, -1),
