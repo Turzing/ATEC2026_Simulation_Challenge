@@ -282,12 +282,14 @@ class RgbdPureCamera:
         self.frame_count = 0
         self._debug: Dict[str, np.ndarray] = {}
         self._arm_joints: Optional[np.ndarray] = None
+        self._projected_gravity: Optional[np.ndarray] = None
 
     def reset(self):
         self.tracker.reset()
         self.frame_count = 0
         self._debug.clear()
         self._arm_joints = None
+        self._projected_gravity = None
 
     def set_arm_joints(self, arm_joints) -> None:
         if arm_joints is None:
@@ -295,10 +297,19 @@ class RgbdPureCamera:
         else:
             self._arm_joints = np.asarray(arm_joints, dtype=np.float32).reshape(-1)[:6]
 
+    def set_projected_gravity(self, grav) -> None:
+        if grav is None:
+            self._projected_gravity = None
+        else:
+            self._projected_gravity = np.asarray(grav, dtype=np.float32).reshape(3)
+
     def _cam_pos_robot(self) -> np.ndarray:
         if self.camera_name == "ee" and self._arm_joints is not None:
             from rgbd_utils import compute_dynamic_ee_cam_pos
             return compute_dynamic_ee_cam_pos(self._arm_joints)
+        if self.camera_name == "head" and self._projected_gravity is not None:
+            from rgbd_utils import compute_dynamic_head_cam_pos
+            return compute_dynamic_head_cam_pos(self._projected_gravity)
         return self._cfg["pos"]
 
     def get_debug(self, name: str) -> Optional[np.ndarray]:
@@ -645,22 +656,22 @@ class RgbdPureCamera:
         d_med = float(np.median(d0[ok]))
         ys, xs = self._filter_depth_outliers(ys, xs, depth, d_med)
         if val is not None and len(ys) > 8 and self.camera_name != "head":
-            v = val[ys, xs]
+            v = val[ys, xs].astype(np.float32)
             v_cut = float(np.percentile(v, self._cfg.get("val_refine_p", 35)))
             v_floor = 42 if self.camera_name == "ee" else (SHADOW_VAL_MAX - 18)
             keep = v >= max(v_floor, v_cut)
             if int(np.sum(keep)) >= max(5, len(ys) // 4):
                 ys, xs = ys[keep], xs[keep]
         if self.camera_name == "head" and val is not None and len(ys) > 8:
-            v = val[ys, xs]
+            v = val[ys, xs].astype(np.float32)
             v_cut = float(np.percentile(v, self._cfg.get("val_refine_p", 32)))
             keep = v >= max(52, v_cut)
             if int(np.sum(keep)) >= max(5, len(ys) // 4):
                 ys, xs = ys[keep], xs[keep]
-            # 横长块: 影子在侧面/下方, 保留更亮一侧
+                v = val[ys, xs].astype(np.float32)
             bw = int(xs.max() - xs.min() + 1)
             bh = int(ys.max() - ys.min() + 1)
-            if bw > bh * 1.35 and len(ys) > 60:
+            if bw > bh * 1.35 and len(ys) > 60 and v.size == xs.size:
                 cx = float(np.median(xs))
                 bright = v >= float(np.percentile(v, 55))
                 left, right = xs < cx, xs >= cx
@@ -677,13 +688,15 @@ class RgbdPureCamera:
         self,
         ys: np.ndarray,
         xs: np.ndarray,
-        val: np.ndarray,
-        sat: np.ndarray,
+        val: Optional[np.ndarray],
+        sat: Optional[np.ndarray],
         h: int,
         w: int,
         relief: Optional[np.ndarray] = None,
     ) -> bool:
-        if len(ys) < 5:
+        if len(ys) < 5 or val is None or sat is None:
+            return False
+        if val.shape[:2] != (h, w) or sat.shape[:2] != (h, w):
             return False
         bw = int(xs.max() - xs.min() + 1)
         bh = int(ys.max() - ys.min() + 1)
@@ -716,6 +729,10 @@ class RgbdPureCamera:
             return True
         if mean_r < 0.009 and mean_s < 36:
             return True
+        # 蹲下: 灰色臂/躯干贴脸 — 低饱和+近距+画面中下
+        if self.camera_name == "head" and cy > h * 0.26 and mean_s < 54 and mean_v > 58:
+            if mean_r < 0.018 and area < 900:
+                return True
         if mean_r < 0.010 and area > 200 and aspect > 1.35 and mean_v < 88:
             return True
         if cy > h * 0.44 and mean_r < 0.011 and aspect > 1.45 and area > 160:
@@ -1033,6 +1050,10 @@ class RgbdPureCamera:
             return None
         if self.camera_name == "head" and vm < self._cfg.get("min_blob_val", 62):
             return None
+        if self.camera_name == "head" and depth_m < 1.05 and sm < 46:
+            return None
+        if self.camera_name == "head" and depth_m < 0.80 and sm < 54:
+            return None
         if relief is not None and self.camera_name == "head":
             rm = float(np.median(relief[ys, xs]))
             asp = max(bw, bh) / max(min(bw, bh), 1)
@@ -1051,6 +1072,10 @@ class RgbdPureCamera:
             if pos_r is None:
                 pos_r = self._pos_from_mask(ys, xs, depth, depth_m)
             if pos_r is None:
+                return None
+            if float(pos_r[2]) < -0.78 or float(pos_r[2]) > 0.28:
+                return None
+            if depth_m < 0.85 and sm < 58 and cy > h * 0.30 and abs(cx - w * 0.5) < w * 0.34:
                 return None
             pos_w = _robot_to_world(pos_r, robot_pos, robot_yaw)
             cls, cls_conf, geom_ext = self._classify_object(
@@ -1095,6 +1120,8 @@ class RgbdPureCamera:
         if pos_r is None:
             pos_r = self._pos_from_mask(ys, xs, depth, depth_m)
         if pos_r is None:
+            return None
+        if float(pos_r[2]) < -0.78 or float(pos_r[2]) > 0.28:
             return None
 
         # EE 抓取 anchor: bbox 底边中心 (贴地物体更准)
@@ -1203,7 +1230,9 @@ class RgbdPureCamera:
         return self._dets_from_mask(mask, rgb, depth, robot_pos, robot_yaw)
 
     def detect(self, rgb: np.ndarray, depth: np.ndarray, robot_pos, robot_yaw) -> List[dict]:
+        from rgbd_utils import align_rgb_to_depth
         depth = sanitize_depth(depth)
+        rgb = align_rgb_to_depth(rgb, depth)
         mask = self._build_fusion_mask(rgb, depth)
         dets = self._dets_from_mask(mask, rgb, depth, robot_pos, robot_yaw)
 
