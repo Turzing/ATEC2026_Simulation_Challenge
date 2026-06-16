@@ -639,6 +639,22 @@ def _find_in_pool(
     return None
 
 
+def _is_ee_sourced(obj: Optional[dict]) -> bool:
+    if not obj or obj.get("nav_from_head"):
+        return False
+    cam = str(obj.get("source_camera") or obj.get("camera") or "")
+    return cam == "ee"
+
+
+def _is_head_sourced(obj: Optional[dict]) -> bool:
+    if not obj:
+        return False
+    if obj.get("nav_from_head"):
+        return True
+    cam = str(obj.get("source_camera") or obj.get("camera") or "")
+    return cam == "head"
+
+
 def _head_confirms_lock(
     head_objs: List[dict],
     lock_id: Optional[int],
@@ -647,6 +663,25 @@ def _head_confirms_lock(
     if lock_id is None or not head_objs:
         return False
     return _find_in_pool(head_objs, lock_id, lock_class, None) is not None
+
+
+def _can_acquire_nav_lock(seed: Optional[dict], head_objs: List[dict]) -> bool:
+    """首锁必须 head 确认；EE 独检一律拒 (log: source_camera 缺字段 bypass)."""
+    if seed is None:
+        return False
+    if _is_head_sourced(seed):
+        return True
+    if not head_objs:
+        return False
+    if not _head_confirms_lock(head_objs, seed.get("id"), seed.get("class")):
+        same = [o for o in head_objs if o.get("class") == seed.get("class")]
+        if not same:
+            return False
+    if _is_ee_sourced(seed):
+        sd = _obj_dist(seed)
+        if sd > EE_NAV_LOCK_MAX_DEPTH_M or not bool(seed.get("world_reliable")):
+            return False
+    return True
 
 
 def _find_locked_target(
@@ -1209,26 +1244,15 @@ class RgbdPureDualPipeline:
         locked = lock_ref
         if locked is None and self._nav_lock_id is None:
             seed = _acquire_nav_lock(head_objs, ee_objs, head_nav, ee_nav, head_d, ee_d)
-            if seed is not None and seed.get("source_camera") == "ee":
-                sd = _obj_dist(seed)
-                if (
-                    not head_objs
-                    or sd > EE_NAV_LOCK_MAX_DEPTH_M
-                    or _is_far_ee_nav_unreliable(seed)
-                    or not bool(seed.get("world_reliable"))
-                ):
-                    seed = None
-                elif head_objs:
-                    hc = [o for o in head_objs if o.get("class") == seed.get("class")]
-                    if hc and _obj_dist(min(hc, key=_obj_dist)) < _obj_dist(seed) + 0.35:
-                        seed = None
+            if seed is not None and not _can_acquire_nav_lock(seed, head_objs):
+                seed = None
             if seed is not None:
                 self._nav_lock_id = int(seed["id"])
                 self._nav_lock_class = seed.get("class")
                 pw = seed.get("pos_world")
                 self._nav_lock_world = list(pw) if pw is not None else None
                 self._nav_lock_ee_only = (
-                    seed.get("source_camera") == "ee"
+                    _is_ee_sourced(seed)
                     and not _head_confirms_lock(head_objs, self._nav_lock_id, self._nav_lock_class)
                 )
                 self._nav_lock_ee_only_frames = 0
@@ -1240,7 +1264,7 @@ class RgbdPureDualPipeline:
                 self._nav_lock_ee_only_frames = 0
             elif self._nav_lock_ee_only:
                 self._nav_lock_ee_only_frames += 1
-            elif locked is not None and locked.get("source_camera") == "ee" and not head_objs:
+            elif locked is not None and _is_ee_sourced(locked) and not head_objs:
                 self._nav_lock_ee_only = True
                 self._nav_lock_ee_only_frames = 0
 
@@ -1304,7 +1328,12 @@ class RgbdPureDualPipeline:
                 self._nav_lock_id = int(auth_tgt["id"])
                 self._nav_lock_class = auth_tgt.get("class")
             pw = auth_tgt.get("pos_world")
-            if pw is not None and not auth_tgt.get("pos_jump_rejected"):
+            head_ok = _head_confirms_lock(head_objs, self._nav_lock_id, self._nav_lock_class)
+            if (
+                pw is not None
+                and not auth_tgt.get("pos_jump_rejected")
+                and (head_ok or _is_head_sourced(auth_tgt))
+            ):
                 self._nav_lock_world = list(pw)
             self._nav_lock_miss = 0
         else:
@@ -1421,6 +1450,12 @@ class RgbdPureDualPipeline:
                 rp,
                 ry,
             )
+
+        # 无 head 确认 → 不 export 导航目标 (motion search; log: EE-only 2.5m 偏 2.5m)
+        if nav_tgt is not None and nav_stage != "grasp":
+            if not _head_confirms_lock(head_objs, self._nav_lock_id, self._nav_lock_class):
+                if self._nav_lock_id is None or _is_ee_sourced(nav_tgt) or nav_tgt.get("nav_coast"):
+                    nav_tgt = None
 
         use_grasp = nav_stage == "grasp" and grasp_tgt is not None
         grasp_objs = ee_objs_raw

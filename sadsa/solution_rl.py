@@ -91,6 +91,7 @@ class AlgSolution:
         self._ee_only_no_head_frames = 0
         self._nav_stall_turn_rad = 0.0
         self._nav_stall_dist_start: float | None = None
+        self._nav_ignore_perc_until_head = False
         self.ee_only_unlock_frames = max(12, int(os.getenv("ATEC_TASKB_EE_ONLY_UNLOCK_FRAMES", "18")))
         self.nav_stall_turn_rad = float(os.getenv("ATEC_TASKB_NAV_STALL_TURN_RAD", "1.15"))
         self.nav_stall_min_dist_m = float(os.getenv("ATEC_TASKB_NAV_STALL_MIN_DIST", "2.0"))
@@ -816,9 +817,7 @@ class AlgSolution:
                 )
             target_nav = perception_output.get("target_nav")
             if isinstance(target_nav, dict) and not target_nav.get("skip_camera_correction"):
-                if perception_output.get("nav_lock_id") is not None:
-                    pass
-                elif not _is_head_sourced(target_nav):
+                if not _is_head_sourced(target_nav) and perception_output.get("nav_lock_id") is None:
                     self._correct_object_with_camera_pose(
                         target_nav, ee_cam_pos_w, ee_cam_rot_w, *EE_INTR, robot_pos, robot_yaw,
                     )
@@ -850,9 +849,7 @@ class AlgSolution:
                 )
             target_nav = perception_output.get("target_nav")
             if isinstance(target_nav, dict) and not target_nav.get("skip_camera_correction"):
-                if perception_output.get("nav_lock_id") is not None:
-                    pass
-                elif _is_head_sourced(target_nav):
+                if _is_head_sourced(target_nav):
                     self._correct_object_with_camera_pose(
                         target_nav, head_cam_pos_w, head_cam_rot_w, *HEAD_INTR, robot_pos, robot_yaw,
                     )
@@ -1834,6 +1831,7 @@ class AlgSolution:
         self._nav_heading_error_f = None
         self._nav_turn_sign = 0
         self._nav_turn_sign_hold = 0
+        self._nav_ignore_perc_until_head = False
 
     def _nav_approach_stalled(self, nav_info: dict[str, Any], target_dist: float) -> bool:
         phase = str(nav_info.get("phase", ""))
@@ -1869,12 +1867,18 @@ class AlgSolution:
         lock_class = perception_output.get("nav_lock_class")
         head_n = int(perception_output.get("head_count_raw") or 0)
         ee_only = bool(perception_output.get("nav_lock_ee_only"))
+        if self._nav_ignore_perc_until_head:
+            if head_n > 0 and not ee_only and perception_output.get("nav_lock_id") is not None:
+                self._nav_ignore_perc_until_head = False
+            else:
+                return None
         if lock_id is not None and (ee_only or str(raw_nav.get("source_camera")) == "lock_coast") and head_n == 0:
             self._ee_only_no_head_frames += 1
         else:
             self._ee_only_no_head_frames = 0
         if self._ee_only_no_head_frames >= self.ee_only_unlock_frames:
             self._clear_fuse_nav_lock("ee-only lock without head confirmation")
+            self._nav_ignore_perc_until_head = True
             return None
 
         if lock_id is not None and lock_class and raw_nav.get("class") not in {None, lock_class}:

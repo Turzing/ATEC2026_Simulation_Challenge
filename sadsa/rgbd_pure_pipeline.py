@@ -78,7 +78,7 @@ CAMERA_CFG = {
         "depth_max_near": 2.25,
         "val_refine_p": 30,
         "min_blob_sat": 32,
-        "min_blob_val": 54,
+        "min_blob_val": 42,
         "mid_pale_sat_min": 16,
         "mid_pale_val_min": 48,
         "min_relief_med": 0.007,
@@ -1291,6 +1291,27 @@ class RgbdPureCamera:
         self._debug["bottom_strip"] = mask * 255
         return self._dets_from_mask(mask, rgb, depth, robot_pos, robot_yaw)
 
+    def _detect_head_far_yellow(
+        self, rgb: np.ndarray, depth: np.ndarray, robot_pos, robot_yaw,
+    ) -> List[dict]:
+        """head 1.2~6m 远距黄物 (fusion relief 漏检时 head=0 的根因)."""
+        h, w = depth.shape
+        valid = self._valid_depth(depth, near=False) & (depth >= 1.0) & (depth <= 6.5)
+        roi = self._roi(h, w, near=False)
+        hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+        hue, sat, val = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+        mask = (
+            roi & valid
+            & (hue >= HEAD_HUE_LO) & (hue <= HEAD_HUE_HI)
+            & (sat >= 14) & (val >= 36)
+        ).astype(np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+        dets = self._dets_from_mask(mask, rgb, depth, robot_pos, robot_yaw)
+        for d in dets or []:
+            d["head_far_fallback"] = True
+            d["pos_confidence"] = min(float(d.get("pos_confidence") or 0.5), 0.62)
+        return dets
+
     def _detect_midfield_yellow(
         self, rgb: np.ndarray, depth: np.ndarray, robot_pos, robot_yaw,
     ) -> List[dict]:
@@ -1354,7 +1375,10 @@ class RgbdPureCamera:
         if self.camera_name == "head" and len(dets) == 0:
             st = depth_stats(depth)
             p10 = float(st.get("p10", 99.0))
-            if self._scene_near(depth):
+            far_dets = self._detect_head_far_yellow(rgb, depth, robot_pos, robot_yaw)
+            if far_dets:
+                dets = far_dets
+            elif self._scene_near(depth):
                 strip_dets = self._detect_bottom_strip(rgb, depth, robot_pos, robot_yaw)
                 if strip_dets:
                     dets = strip_dets
