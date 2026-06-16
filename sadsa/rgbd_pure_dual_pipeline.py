@@ -673,11 +673,13 @@ def _head_confirms_lock(
 
 
 def _can_acquire_nav_lock(seed: Optional[dict], head_objs: List[dict]) -> bool:
-    """有检出就锁; EE 独检须等 head 出帧 (log: ee-only banana heading 1.78rad 纯转)."""
-    if seed is None:
+    """必须 head 确认才首锁 (log: ee-only 错锁 → 转圈 30s)."""
+    if seed is None or not head_objs:
         return False
-    if _is_ee_sourced(seed) and not head_objs:
-        return False
+    if _is_ee_sourced(seed) and not _head_confirms_lock(head_objs, seed.get("id"), seed.get("class")):
+        same = [o for o in head_objs if o.get("class") == seed.get("class")]
+        if not same:
+            return False
     return True
 
 
@@ -774,11 +776,6 @@ def _acquire_nav_lock(
 
     if head_nav is not None and _eligible(head_nav, False):
         return head_nav
-    if ee_nav is not None and head_objs and not _is_ee_phantom_near(ee_nav, head_objs):
-        if not _is_far_ee_nav_unreliable(ee_nav):
-            ed = float(ee_nav.get("depth_m") or ee_nav.get("nav_depth_m") or 99.0)
-            if ed <= EE_NAV_LOCK_MAX_DEPTH_M and bool(ee_nav.get("world_reliable")):
-                return ee_nav
     return None
 
 
@@ -1184,6 +1181,9 @@ class RgbdPureDualPipeline:
                 return refresh_locked_grasp(self._frozen_grasp, rp, ry)
             return None
         cand = _finalize_ee(ee_grasp, rp, ry, arm_q)
+        if ee_d < 1.35:
+            self._frozen_grasp = dict(cand)
+            return refresh_locked_grasp(self._frozen_grasp, rp, ry)
         if ee_d < GRASP_LOCK_DIST_M and (
             cand.get("grasp_reliable") or ee_d < GRASP_PHASE_DIST_M
         ):
@@ -1270,6 +1270,16 @@ class RgbdPureDualPipeline:
         head_d = _obj_dist(head_nav)
 
         locked = lock_ref
+        if self._nav_lock_id is not None:
+            live = _find_in_pool(head_objs, self._nav_lock_id, self._nav_lock_class, None)
+            if live is None:
+                live = _find_in_pool(ee_objs, self._nav_lock_id, self._nav_lock_class, None)
+            if live is not None and live.get("pos_world") is not None:
+                self._nav_lock_world = list(live["pos_world"])
+                self._nav_lock_miss = 0
+                locked = live
+                lock_ref = live
+
         if locked is None and self._nav_lock_id is None:
             seed = _acquire_nav_lock(head_objs, ee_objs, head_nav, ee_nav, head_d, ee_d)
             if seed is not None and not _can_acquire_nav_lock(seed, head_objs):
@@ -1331,27 +1341,11 @@ class RgbdPureDualPipeline:
 
         if auth_tgt is not None:
             nav_dist = _nav_dist_conservative(auth_tgt)
-            pw = auth_tgt.get("pos_world")
-            if pw is not None and self._nav_lock_world is not None:
-                jump = float(
-                    np.linalg.norm(
-                        np.asarray(pw, dtype=np.float32)[:2] - np.asarray(self._nav_lock_world, dtype=np.float32)[:2]
-                    )
-                )
-                if jump > POS_JUMP_REJECT_FAR_M:
-                    auth_tgt = dict(auth_tgt)
-                    auth_tgt["pos_world"] = list(self._nav_lock_world)
-                    auth_tgt["pos_jump_rejected"] = True
             if self._nav_lock_id is None:
                 self._nav_lock_id = int(auth_tgt["id"])
                 self._nav_lock_class = auth_tgt.get("class")
             pw = auth_tgt.get("pos_world")
-            head_ok = _head_confirms_lock(head_objs, self._nav_lock_id, self._nav_lock_class)
-            if (
-                pw is not None
-                and not auth_tgt.get("pos_jump_rejected")
-                and (head_ok or _is_head_sourced(auth_tgt))
-            ):
+            if pw is not None:
                 self._nav_lock_world = list(pw)
             self._nav_lock_miss = 0
         else:
@@ -1436,26 +1430,6 @@ class RgbdPureDualPipeline:
             nav_tgt = auth_tgt
         if nav_tgt is None and locked is not None:
             nav_tgt = locked
-        if (
-            nav_tgt is not None
-            and self._nav_lock_world is not None
-            and nav_tgt.get("pos_world") is not None
-        ):
-            jump = float(
-                np.linalg.norm(
-                    np.asarray(nav_tgt["pos_world"], dtype=np.float32)[:2]
-                    - np.asarray(self._nav_lock_world, dtype=np.float32)[:2]
-                )
-            )
-            if jump > POS_JUMP_REJECT_FAR_M:
-                nav_tgt = _coast_nav_from_lock(
-                    int(self._nav_lock_id),
-                    self._nav_lock_class,
-                    self._nav_lock_world,
-                    rp,
-                    ry,
-                )
-                nav_tgt["pos_jump_rejected"] = True
         if (
             nav_tgt is None
             and self._nav_lock_id is not None

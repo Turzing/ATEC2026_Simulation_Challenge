@@ -1184,8 +1184,13 @@ class AlgSolution:
             lin_x = 0.45 * approach_scale
         lin_y = 0.0
         ang_z = float(np.clip(heading_error * self.heading_kp, -self.max_ang_vel, self.max_ang_vel))
-        if remaining > 1.0:
-            ang_z *= 0.72
+        if remaining > 2.0:
+            ang_z = float(np.clip(ang_z, -0.38, 0.38))
+        elif remaining > 1.2:
+            ang_z = float(np.clip(ang_z, -0.48, 0.48))
+        if abs(heading_error) < 0.22:
+            ang_z *= 0.55
+            lin_x = max(lin_x, 0.55 * approach_scale)
 
         if abs(heading_error) > self.turn_then_go_yaw_threshold and lin_x < 0.20:
             phase = "turn_to_target"
@@ -1768,7 +1773,7 @@ class AlgSolution:
             if abs(bearing) > 0.12:
                 ang = float(np.clip(bearing * self.heading_kp, -0.55, 0.55))
                 return np.array([0.0, 0.0, ang], dtype=np.float32)
-        return np.array([0.0, 0.0, self.search_yaw_rate], dtype=np.float32)
+        return np.array([0.25, 0.0, self.search_yaw_rate * 0.85], dtype=np.float32)
 
     def _build_search_nav_info(self, nav_input: dict[str, Any], target: dict[str, Any] | None) -> dict[str, Any]:
         robot = nav_input.get("robot") or {}
@@ -1868,7 +1873,7 @@ class AlgSolution:
             self._fuse_pos_world = pw.copy()
             self._nav_heading_error_f = None
         else:
-            alpha = 0.35
+            alpha = 0.62
             self._fuse_pos_world = (1.0 - alpha) * self._fuse_pos_world + alpha * pw
             pw = self._fuse_pos_world.copy()
         self._fuse_pos_world = pw.copy()
@@ -2450,6 +2455,9 @@ class AlgSolution:
 
         tracked_pos = self._safe_numpy(target_nav.get("pos_world"), np.zeros(3, dtype=np.float32))
         tracked_class = target_nav.get("class")
+        lock_id = None
+        if isinstance(perception_output, dict):
+            lock_id = perception_output.get("nav_lock_id")
         candidates: list[dict[str, Any]] = []
 
         if isinstance(perception_output, dict):
@@ -2476,6 +2484,8 @@ class AlgSolution:
             if not isinstance(candidate, dict):
                 continue
             if tracked_class is not None and candidate.get("class") not in {None, tracked_class}:
+                continue
+            if lock_id is not None and candidate.get("id") not in {None, lock_id}:
                 continue
             candidate_pos = candidate.get("pos_world")
             if candidate_pos is None:
@@ -2600,7 +2610,11 @@ class AlgSolution:
         else:
             self._log("[TaskB-GRASP] LegPostureController unavailable, will rely on sit_down_actor only.")
         self._reset_sit_down_tracking()
-        self._pending_grasp_target = dict(target_grasp)
+        grasp_pw = target_grasp.get("grasp_pos_world") or target_grasp.get("pos_world")
+        fresh = dict(target_grasp)
+        if grasp_pw is not None:
+            fresh["grasp_pos_world"] = list(grasp_pw)
+        self._pending_grasp_target = fresh
         self._task_state = "CROUCHING"
         self._log(
             "[TaskB-GRASP] start crouch "

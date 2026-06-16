@@ -78,7 +78,7 @@ CAMERA_CFG = {
         "depth_max_near": 2.25,
         "val_refine_p": 30,
         "min_blob_sat": 32,
-        "min_blob_val": 42,
+        "min_blob_val": 36,
         "mid_pale_sat_min": 16,
         "mid_pale_val_min": 48,
         "min_relief_med": 0.007,
@@ -1371,24 +1371,28 @@ class RgbdPureCamera:
         mask = self._build_fusion_mask(rgb, depth)
         dets = self._dets_from_mask(mask, rgb, depth, robot_pos, robot_yaw)
 
-        if self.camera_name == "head" and len(dets) == 0:
+        if self.camera_name == "head":
             st = depth_stats(depth)
             p10 = float(st.get("p10", 99.0))
             far_dets = self._detect_head_far_yellow(rgb, depth, robot_pos, robot_yaw)
             if far_dets:
-                dets = far_dets
-            elif self._scene_near(depth):
-                strip_dets = self._detect_bottom_strip(rgb, depth, robot_pos, robot_yaw)
-                if strip_dets:
-                    dets = strip_dets
-            elif 1.0 <= p10 <= 5.5:
-                mid_dets = self._detect_midfield_yellow(rgb, depth, robot_pos, robot_yaw)
-                if mid_dets:
-                    dets = mid_dets
-                else:
-                    edge_dets = self._detect_edge_yellow(rgb, depth, robot_pos, robot_yaw)
-                    if edge_dets:
-                        dets = edge_dets
+                if not dets:
+                    dets = far_dets
+                elif all(float(o.get("depth_m") or 99.0) > 2.0 for o in dets):
+                    dets = self._merge_dets(list(dets) + far_dets)
+            if len(dets) == 0:
+                if self._scene_near(depth):
+                    strip_dets = self._detect_bottom_strip(rgb, depth, robot_pos, robot_yaw)
+                    if strip_dets:
+                        dets = strip_dets
+                elif 1.0 <= p10 <= 5.5:
+                    mid_dets = self._detect_midfield_yellow(rgb, depth, robot_pos, robot_yaw)
+                    if mid_dets:
+                        dets = mid_dets
+                    else:
+                        edge_dets = self._detect_edge_yellow(rgb, depth, robot_pos, robot_yaw)
+                        if edge_dets:
+                            dets = edge_dets
 
         dets = self._merge_dets(dets)
         dets.sort(key=lambda x: x.get("depth_m") or 999.0)
