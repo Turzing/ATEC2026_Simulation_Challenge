@@ -120,13 +120,8 @@ def _synthesize_grasp_from_head(obj: dict, robot_pos, robot_yaw, arm_q) -> dict:
 
 
 def _close_dist(obj: Optional[dict]) -> float:
-    if not obj:
-        return 999.0
-    d_depth = _obj_dist(obj)
-    d_robot = float(obj.get("dist_to_robot") or 0.0)
-    if d_robot > 0.08:
-        return min(d_depth, d_robot)
-    return d_depth
+    """grasp 门控用保守距离: depth 与 dist 取较大值, 防假近 depth 提前蹲下."""
+    return _nav_dist_conservative(obj)
 
 
 def _motion_level(obs) -> float:
@@ -315,6 +310,12 @@ class _TemporalMedian:
             m["yaw_rel"] = float(np.arctan2(med_r[1], med_r[0]))
             m["nav_yaw_rel"] = m["yaw_rel"]
             m["nav_depth_m"] = float(m.get("nav_depth_m") or m.get("depth_m") or m["dist_to_robot"])
+            # depth 历史中值若明显小于 pos 水平距 → 同步, 避免假近 depth 触发 grasp
+            d_r = float(m["dist_to_robot"])
+            d_m = float(m.get("depth_m") or d_r)
+            if d_r - d_m > 0.42:
+                m["depth_m"] = d_r
+                m["nav_depth_m"] = d_r
 
         shaky = motion > MOTION_FREEZE_THRESH
         if cam == "ee":
@@ -512,6 +513,18 @@ def _grasp_quality(obj: dict) -> float:
     return q
 
 
+def _bbox_center_penalty(obj: dict, img_w: float = 640.0, img_h: float = 480.0) -> float:
+    """bbox 中心离画面中心越远惩罚越大 (EE 近距抓取优先居中目标)."""
+    uv = obj.get("centroid_uv") or obj.get("centroid")
+    if uv is None:
+        return 1.0
+    try:
+        u, v = float(uv[0]), float(uv[1])
+    except (TypeError, ValueError, IndexError):
+        return 1.0
+    return float(np.hypot(u - img_w * 0.5, v - img_h * 0.55) / max(img_w, img_h))
+
+
 def _best_ee_grasp(
     objs: List[dict],
     ref: Optional[dict] = None,
@@ -522,10 +535,15 @@ def _best_ee_grasp(
         locked = _find_in_pool(objs, ref.get("id"), ref.get("class"))
         if locked is not None:
             return locked
+        same = [o for o in objs if o.get("class") == ref.get("class")]
+        if same:
+            near = [o for o in same if _obj_dist(o) < 1.35]
+            pool = near if near else same
+            return min(pool, key=lambda o: (_bbox_center_penalty(o), _obj_dist(o)))
     pool = [o for o in objs if o.get("grasp_reliable")] or objs
-    scored = [(_grasp_quality(o), _obj_dist(o), o) for o in pool]
-    scored.sort(key=lambda x: (-x[0], x[1]))
-    return scored[0][2]
+    scored = [(_grasp_quality(o), _bbox_center_penalty(o), _obj_dist(o), o) for o in pool]
+    scored.sort(key=lambda x: (-x[0], x[1], x[2]))
+    return scored[0][3]
 
 
 def _world_xy_dist(a: dict, b: dict) -> float:
@@ -852,9 +870,18 @@ def _export_ee_for_motion(
             return []
         ee_tgt = _find_in_pool(ee_objs, auth_tgt.get("id"), auth_tgt.get("class"))
         if ee_tgt is None:
+            same = [o for o in ee_objs if o.get("class") == auth_tgt.get("class")]
+            if same:
+                ee_tgt = min(same, key=lambda o: (_bbox_center_penalty(o), _obj_dist(o)))
+        if ee_tgt is None:
             ee_tgt = auth_tgt if auth_cam == "ee" else None
-        if ee_tgt is None or not (
-            ee_tgt.get("grasp_reliable") or ee_tgt.get("nav_from_head")
+        if ee_tgt is None:
+            return []
+        near_ok = _obj_dist(ee_tgt) < 1.35 and _bbox_center_penalty(ee_tgt) < 0.42
+        if not (
+            ee_tgt.get("grasp_reliable")
+            or ee_tgt.get("nav_from_head")
+            or near_ok
         ):
             return []
         exp = _safe_ee_export(ee_tgt, head_objs, ee_objs)
@@ -1114,9 +1141,11 @@ class RgbdPureDualPipeline:
         )
         ee_grasp_nav = ee_grasp if _strict_lock_match(ee_grasp, lock_ref_obj) else None
         ee_grasp_ok = ee_grasp_nav is not None and bool(ee_grasp_nav.get("grasp_reliable"))
-        head_close = head_d < GRASP_APPROACH_DIST_M
+        head_close = _nav_dist_conservative(head_nav) < GRASP_APPROACH_DIST_M
+        lock_dist = _nav_dist_conservative(locked or lock_ref_obj or auth_tgt)
         want_grasp = (
             close_d < GRASP_APPROACH_DIST_M
+            and lock_dist < GRASP_APPROACH_DIST_M + 0.08
             and lock_ref_obj is not None
             and (ee_grasp_ok or head_close)
         )

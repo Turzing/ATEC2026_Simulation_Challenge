@@ -1043,6 +1043,12 @@ class RgbdPureCamera:
         depth_m = self._robust_depth(ys, xs, depth, bbox)
         if depth_m is None:
             return None
+        dmin_gate = self._depth_min()
+        if self.camera_name == "ee" and depth_m < 1.45:
+            blob_d = depth[ys, xs]
+            blob_d = blob_d[(blob_d > dmin_gate) & (blob_d < DEPTH_MAX)]
+            if blob_d.size >= 4:
+                depth_m = float(np.percentile(blob_d, 12))
         if self.camera_name == "ee" and relief is not None:
             rm = float(np.median(relief[ys, xs]))
             if len(ys) > 1200 and rm < 0.007 and float(np.mean(val[ys, xs])) < 90:

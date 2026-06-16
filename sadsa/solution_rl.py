@@ -875,14 +875,20 @@ class AlgSolution:
                 continue
             self._correct_object_with_camera_pose(obj, cam_pos_w, cam_rot_w, fx, fy, cx, cy, robot_pos, robot_yaw)
 
-    def _pick_reproject_uv_depth(self, obj: dict) -> tuple[float, float, float] | None:
-        """head 优先 nav_anchor + 近端 depth，避免 centroid 打到地面."""
-        anchor_uv = obj.get("nav_anchor_uv")
-        anchor_depth = obj.get("nav_anchor_depth") or obj.get("nav_depth_m")
+    def _pick_reproject_uv_depth(
+        self, obj: dict, *, prefer_centroid: bool = False,
+    ) -> tuple[float, float, float] | None:
+        """head 优先 nav_anchor; prefer_centroid 时仅用 bbox 中心 (GT 校正 fallback)."""
         centroid_uv = obj.get("centroid_uv") or obj.get("centroid")
         depth_m = obj.get("depth_m")
-        uv = anchor_uv if anchor_uv is not None else centroid_uv
-        depth = anchor_depth if anchor_uv is not None and anchor_depth is not None else depth_m
+        if prefer_centroid:
+            uv = centroid_uv
+            depth = depth_m
+        else:
+            anchor_uv = obj.get("nav_anchor_uv") or obj.get("grasp_anchor_uv")
+            anchor_depth = obj.get("nav_anchor_depth") or obj.get("grasp_anchor_depth") or obj.get("nav_depth_m")
+            uv = anchor_uv if anchor_uv is not None else centroid_uv
+            depth = anchor_depth if anchor_uv is not None and anchor_depth is not None else depth_m
         if uv is None or depth is None:
             return None
         try:
@@ -894,6 +900,34 @@ class AlgSolution:
         if depth_f <= 0.01 or depth_f > 100.0:
             return None
         return u, v, depth_f
+
+    def _correction_pose_plausible(
+        self, p_robot: np.ndarray, p_world: np.ndarray,
+    ) -> bool:
+        if p_robot[2] < -0.55 or p_robot[2] > 0.42:
+            return False
+        if p_world[2] < -0.12 or p_world[2] > 1.05:
+            return False
+        return True
+
+    def _reproject_with_camera(
+        self,
+        u: float, v: float, depth_m_f: float,
+        cam_pos_w: np.ndarray, cam_rot_w: np.ndarray,
+        fx: float, fy: float, cx: float, cy: float,
+        robot_pos: np.ndarray, robot_yaw: float,
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        x = (u - cx) / fx * depth_m_f
+        y = (v - cy) / fy * depth_m_f
+        p_cam = np.array([x, y, depth_m_f], dtype=np.float32)
+        try:
+            p_world = cam_pos_w + cam_rot_w @ p_cam
+            p_robot = self._world_to_robot_frame(p_world, robot_pos, robot_yaw)
+        except Exception:
+            return None
+        if not self._correction_pose_plausible(p_robot, p_world):
+            return None
+        return p_world, p_robot
 
     def _correct_object_with_camera_pose(
         self,
@@ -929,33 +963,30 @@ class AlgSolution:
             except Exception:
                 old_grasp_robot = None
 
-        # 像素坐标转相机坐标 (OpenCV: X=右, Y=下, Z=前)
-        x = (u - cx) / fx * depth_m_f
-        y = (v - cy) / fy * depth_m_f
-        z = depth_m_f
-        p_cam = np.array([x, y, z], dtype=np.float32)
-
-        # 相机坐标转世界坐标
-        try:
-            p_world = cam_pos_w + cam_rot_w @ p_cam
-        except Exception:
+        reproj = self._reproject_with_camera(
+            u, v, depth_m_f, cam_pos_w, cam_rot_w, fx, fy, cx, cy, robot_pos, robot_yaw,
+        )
+        if reproj is None:
+            fb = self._pick_reproject_uv_depth(obj, prefer_centroid=True)
+            if fb is not None and fb != picked:
+                reproj = self._reproject_with_camera(
+                    fb[0], fb[1], fb[2], cam_pos_w, cam_rot_w, fx, fy, cx, cy, robot_pos, robot_yaw,
+                )
+        if reproj is None:
             return
+        p_world, p_robot = reproj
 
         obj["pos_world"] = [float(p_world[0]), float(p_world[1]), float(p_world[2])]
         obj["pose_source"] = "gt_camera"
+        obj["pos_robot"] = [float(p_robot[0]), float(p_robot[1]), float(p_robot[2])]
+        obj["dist_to_robot"] = float(np.linalg.norm(p_robot[:2]))
+        obj["yaw_rel"] = float(math.atan2(p_robot[1], p_robot[0]))
+        obj["nav_yaw_rel"] = obj["yaw_rel"]
+        obj["nav_depth_m"] = depth_m_f
+        obj["depth_m"] = depth_m_f
+        obj["world_reliable"] = True
 
-        try:
-            p_robot = self._world_to_robot_frame(p_world, robot_pos, robot_yaw)
-            obj["pos_robot"] = [float(p_robot[0]), float(p_robot[1]), float(p_robot[2])]
-            obj["dist_to_robot"] = float(np.linalg.norm(p_robot[:2]))
-            obj["yaw_rel"] = float(math.atan2(p_robot[1], p_robot[0]))
-            obj["nav_yaw_rel"] = obj["yaw_rel"]
-            obj["nav_depth_m"] = depth_m_f
-            obj["world_reliable"] = True
-        except Exception:
-            p_robot = None
-
-        if p_robot is not None and old_grasp_robot is not None:
+        if old_grasp_robot is not None:
             try:
                 new_grasp_robot = p_robot + old_grasp_robot
                 c, s = math.cos(robot_yaw), math.sin(robot_yaw)
