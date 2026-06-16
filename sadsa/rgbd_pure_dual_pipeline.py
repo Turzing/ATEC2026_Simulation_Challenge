@@ -24,6 +24,7 @@ from config import (
     EE_PHANTOM_NEAR_M,
     MIN_LOCK_POINT_COUNT,
     MIN_NAV_LOCK_CONF,
+    POS_JUMP_REJECT_FAR_M,
     PROPRIO_ARM_LEN,
     PROPRIO_ARM_START,
     PROPRIO_BASE_ANG_VEL,
@@ -773,7 +774,9 @@ def _is_far_ee_nav_unreliable(obj: dict) -> bool:
     if obj.get("nav_from_head") or obj.get("grasp_reliable"):
         return False
     depth = float(obj.get("nav_depth_m") or obj.get("depth_m") or 0.0)
-    if depth < 2.05:
+    if depth > 3.20:
+        return True
+    if depth < 1.85:
         return False
     pr = obj.get("pos_robot")
     if pr is None:
@@ -1166,10 +1169,22 @@ class RgbdPureDualPipeline:
         )
         if auth_tgt is not None:
             nav_dist = _nav_dist_conservative(auth_tgt)
+            pw = auth_tgt.get("pos_world")
+            if pw is not None and self._nav_lock_world is not None:
+                jump = float(
+                    np.linalg.norm(
+                        np.asarray(pw, dtype=np.float32)[:2] - np.asarray(self._nav_lock_world, dtype=np.float32)[:2]
+                    )
+                )
+                if jump > POS_JUMP_REJECT_FAR_M:
+                    auth_tgt = dict(auth_tgt)
+                    auth_tgt["pos_world"] = list(self._nav_lock_world)
+                    auth_tgt["pos_jump_rejected"] = True
             self._nav_lock_id = int(auth_tgt["id"])
             self._nav_lock_class = auth_tgt.get("class")
             pw = auth_tgt.get("pos_world")
-            self._nav_lock_world = list(pw) if pw is not None else self._nav_lock_world
+            if pw is not None and not auth_tgt.get("pos_jump_rejected"):
+                self._nav_lock_world = list(pw)
             self._nav_lock_miss = 0
         else:
             self._nav_lock_miss += 1
