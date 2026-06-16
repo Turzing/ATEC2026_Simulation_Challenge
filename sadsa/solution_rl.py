@@ -563,8 +563,30 @@ class AlgSolution:
             # 如果获取失败，返回 None 让其他方法处理
             return None
 
+    def _scene_camera_pose(self, cam_obj) -> tuple[np.ndarray, np.ndarray] | None:
+        """Isaac Lab Camera: pos_w + quat_w_ros (OpenCV +Z 光轴)."""
+        if isinstance(cam_obj, (list, tuple)):
+            cam_obj = cam_obj[0] if cam_obj else None
+        if cam_obj is None or not hasattr(cam_obj, "data"):
+            return None
+        cam_data = cam_obj.data
+        if hasattr(cam_data, "pos_w"):
+            pos_world = np.array(cam_data.pos_w[0].cpu().numpy(), dtype=np.float32)
+        elif hasattr(cam_data, "root_pos_w"):
+            pos_world = np.array(cam_data.root_pos_w[0].cpu().numpy(), dtype=np.float32)
+        else:
+            return None
+        if hasattr(cam_data, "quat_w_ros"):
+            quat = cam_data.quat_w_ros[0].cpu().numpy()
+        elif hasattr(cam_data, "root_quat_w"):
+            quat = cam_data.root_quat_w[0].cpu().numpy()
+        else:
+            return None
+        w, x, y, z = float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3])
+        return pos_world, self._quat_to_rot_matrix(w, x, y, z)
+
     def _get_ground_truth_camera_pose(self, camera_name: str) -> tuple[np.ndarray, np.ndarray] | None:
-        """从环境中获取相机的真实世界位姿"""
+        """从 scene 传感器读取相机真实世界位姿 (pos_w / quat_w_ros)."""
         if self.env is None:
             return None
 
@@ -580,51 +602,44 @@ class AlgSolution:
             if scene is None:
                 return None
 
-            candidate_names = [
-                camera_name,
-                f"{camera_name}_camera",
-                "camera_front",
-                "camera_ee",
-                "eye_camera",
-                "rgbd_camera",
-                "camera_0",
-                "camera_top",
-                "head_camera",
-                "camera_head",
-            ]
+            if "head" in camera_name:
+                candidate_names = ["head_camera", camera_name, "camera_head"]
+            elif "ee" in camera_name:
+                candidate_names = ["ee_camera", camera_name, "camera_ee"]
+            else:
+                candidate_names = [
+                    camera_name,
+                    f"{camera_name}_camera",
+                    "head_camera",
+                    "ee_camera",
+                ]
 
             found = None
             for name in candidate_names:
                 try:
                     cam_obj = scene[name]
-                    if isinstance(cam_obj, (list, tuple)):
-                        cam_obj = cam_obj[0]
-                    if hasattr(cam_obj, 'data') and hasattr(cam_obj.data, 'root_pos_w'):
-                        found = (name, cam_obj)
-                        break
                 except (KeyError, IndexError):
                     continue
+                pose = self._scene_camera_pose(cam_obj)
+                if pose is not None:
+                    found = (name, pose)
+                    break
 
             if found is None:
                 available = []
                 for key in list(scene.keys())[:50]:
-                    val = scene[key]
-                    if isinstance(val, (list, tuple)) and len(val) > 0:
-                        val = val[0]
-                    if hasattr(val, 'data') and hasattr(val.data, 'root_pos_w'):
-                        available.append(key)
-                if not self._perception_error_printed and self._step_count % 30 == 0:
-                    self._log(f"[CAM] camera '{camera_name}' not found. Available: {available}")
+                    try:
+                        val = scene[key]
+                        if self._scene_camera_pose(val) is not None:
+                            available.append(key)
+                    except (KeyError, TypeError):
+                        continue
+                if self._step_count % 30 == 0:
+                    self._log(f"[CAM] camera '{camera_name}' not found. Available sensors: {available}")
                 return None
 
-            name, cam_obj = found
-            pos_world = np.array(cam_obj.data.root_pos_w.cpu().numpy()[0], dtype=np.float32)
-            quat = cam_obj.data.root_quat_w.cpu().numpy()[0]
-            w, x, y, z = float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3])
-            rot_matrix = self._quat_to_rot_matrix(w, x, y, z)
-
+            name, (pos_world, rot_matrix) = found
             if self._step_count % 60 == 0:
-                # Compute camera-frame forward vector in world frame
                 forward_world = rot_matrix @ np.array([0.0, 0.0, 1.0], dtype=np.float32)
                 self._log(
                     f"[CAM] '{name}' pos=[{pos_world[0]:.2f}, {pos_world[1]:.2f}, {pos_world[2]:.2f}] "
@@ -632,7 +647,7 @@ class AlgSolution:
                 )
             return pos_world, rot_matrix
         except Exception as exc:
-            if not self._perception_error_printed and self._step_count % 30 == 0:
+            if self._step_count % 30 == 0:
                 self._log(f"[CAM] camera '{camera_name}' error: {type(exc).__name__}: {exc}")
             return None
 
@@ -760,17 +775,32 @@ class AlgSolution:
 
         corrected_any = False
 
-        # 获取 EE 相机真实位姿并校正
+        def _is_head_sourced(obj: dict) -> bool:
+            if not isinstance(obj, dict):
+                return False
+            if obj.get("nav_from_head"):
+                return True
+            src = str(obj.get("source_camera") or obj.get("source") or "")
+            return "head" in src.lower()
+
+        # 获取 EE 相机真实位姿并校正 (跳过 head mirror，由 head 相机校正)
         ee_cam_pose = self._get_ground_truth_camera_pose("ee_camera")
         if ee_cam_pose is not None:
             ee_cam_pos_w, ee_cam_rot_w = ee_cam_pose
             ee_objects = perception_output.get("ee_objects", [])
             n_before = len(ee_objects)
-            self._correct_objects_with_camera_pose(ee_objects, ee_cam_pos_w, ee_cam_rot_w, EE_INTR, robot_pos, robot_yaw)
+            for obj in ee_objects:
+                if obj.get("skip_camera_correction") or _is_head_sourced(obj):
+                    continue
+                self._correct_object_with_camera_pose(
+                    obj, ee_cam_pos_w, ee_cam_rot_w, *EE_INTR, robot_pos, robot_yaw,
+                )
             target_nav = perception_output.get("target_nav")
             if isinstance(target_nav, dict) and not target_nav.get("skip_camera_correction"):
-                if not target_nav.get("nav_from_head"):
-                    self._correct_object_with_camera_pose(target_nav, ee_cam_pos_w, ee_cam_rot_w, *EE_INTR, robot_pos, robot_yaw)
+                if not _is_head_sourced(target_nav):
+                    self._correct_object_with_camera_pose(
+                        target_nav, ee_cam_pos_w, ee_cam_rot_w, *EE_INTR, robot_pos, robot_yaw,
+                    )
             target_grasp = perception_output.get("target_grasp")
             if isinstance(target_grasp, dict):
                 src = str(target_grasp.get("source") or target_grasp.get("camera") or "")
@@ -783,19 +813,35 @@ class AlgSolution:
                 pw = ee_cam_pos_w
                 self._log(f"[CORR] EE camera correction applied, {n_before} objects at pos=[{pw[0]:.2f}, {pw[1]:.2f}, {pw[2]:.2f}]")
 
-        # 获取 head 相机真实位姿并校正 head 检测物体
+        # 获取 head 相机真实位姿并校正 head 检测 + head mirror (ee_objects)
         head_cam_pose = self._get_ground_truth_camera_pose("head_camera")
         if head_cam_pose is not None:
             head_cam_pos_w, head_cam_rot_w = head_cam_pose
             head_objects = perception_output.get("head_objects", [])
-            self._correct_objects_with_camera_pose(head_objects, head_cam_pos_w, head_cam_rot_w, HEAD_INTR, robot_pos, robot_yaw)
+            self._correct_objects_with_camera_pose(
+                head_objects, head_cam_pos_w, head_cam_rot_w, HEAD_INTR, robot_pos, robot_yaw,
+            )
+            for obj in perception_output.get("ee_objects", []):
+                if obj.get("skip_camera_correction") or not _is_head_sourced(obj):
+                    continue
+                self._correct_object_with_camera_pose(
+                    obj, head_cam_pos_w, head_cam_rot_w, *HEAD_INTR, robot_pos, robot_yaw,
+                )
+            target_nav = perception_output.get("target_nav")
+            if isinstance(target_nav, dict) and not target_nav.get("skip_camera_correction"):
+                if _is_head_sourced(target_nav):
+                    self._correct_object_with_camera_pose(
+                        target_nav, head_cam_pos_w, head_cam_rot_w, *HEAD_INTR, robot_pos, robot_yaw,
+                    )
             target_grasp = perception_output.get("target_grasp")
             if isinstance(target_grasp, dict):
                 src = str(target_grasp.get("source") or target_grasp.get("camera") or "")
                 head_objs = perception_output.get("head_objects", [])
-                is_from_head = "head" in src.lower() or target_grasp in head_objs
-                if is_from_head:
-                    self._correct_object_with_camera_pose(target_grasp, head_cam_pos_w, head_cam_rot_w, *HEAD_INTR, robot_pos, robot_yaw)
+                is_from_head = _is_head_sourced(target_grasp) or "head" in src.lower() or target_grasp in head_objs
+                if is_from_head and not target_grasp.get("skip_camera_correction"):
+                    self._correct_object_with_camera_pose(
+                        target_grasp, head_cam_pos_w, head_cam_rot_w, *HEAD_INTR, robot_pos, robot_yaw,
+                    )
             corrected_any = True
             if self._step_count % 60 == 0:
                 pw = head_cam_pos_w
@@ -825,9 +871,29 @@ class AlgSolution:
         """批量校正物体位置"""
         fx, fy, cx, cy = fx_fy_cx_cy
         for obj in objects:
-            if obj.get("skip_camera_correction") or obj.get("nav_from_head"):
+            if obj.get("skip_camera_correction"):
                 continue
             self._correct_object_with_camera_pose(obj, cam_pos_w, cam_rot_w, fx, fy, cx, cy, robot_pos, robot_yaw)
+
+    def _pick_reproject_uv_depth(self, obj: dict) -> tuple[float, float, float] | None:
+        """head 优先 nav_anchor + 近端 depth，避免 centroid 打到地面."""
+        anchor_uv = obj.get("nav_anchor_uv")
+        anchor_depth = obj.get("nav_anchor_depth") or obj.get("nav_depth_m")
+        centroid_uv = obj.get("centroid_uv") or obj.get("centroid")
+        depth_m = obj.get("depth_m")
+        uv = anchor_uv if anchor_uv is not None else centroid_uv
+        depth = anchor_depth if anchor_uv is not None and anchor_depth is not None else depth_m
+        if uv is None or depth is None:
+            return None
+        try:
+            u = float(uv[0])
+            v = float(uv[1])
+            depth_f = float(depth)
+        except (TypeError, ValueError, IndexError):
+            return None
+        if depth_f <= 0.01 or depth_f > 100.0:
+            return None
+        return u, v, depth_f
 
     def _correct_object_with_camera_pose(
         self,
@@ -839,21 +905,29 @@ class AlgSolution:
         robot_yaw: float,
     ) -> None:
         """使用相机真实位姿校正单个物体位置"""
-        depth_m = obj.get("depth_m")
-        centroid_uv = obj.get("centroid_uv") or obj.get("centroid")
-        if depth_m is None or centroid_uv is None:
+        picked = self._pick_reproject_uv_depth(obj)
+        if picked is None:
             return
+        u, v, depth_m_f = picked
 
-        # Handle both tuple and list forms
-        try:
-            u = float(centroid_uv[0])
-            v = float(centroid_uv[1])
-        except (TypeError, IndexError, ValueError):
-            return
-
-        depth_m_f = float(depth_m)
-        if depth_m_f <= 0.01 or depth_m_f > 100.0:
-            return
+        old_pos_w = obj.get("pos_world")
+        old_gpw = obj.get("grasp_pos_world")
+        old_pos_robot = None
+        old_grasp_robot = None
+        if old_pos_w is not None:
+            try:
+                old_pos_robot = self._world_to_robot_frame(
+                    np.array(old_pos_w, dtype=np.float32), robot_pos, robot_yaw,
+                )
+            except Exception:
+                old_pos_robot = None
+        if old_gpw is not None and old_pos_robot is not None:
+            try:
+                old_grasp_robot = self._world_to_robot_frame(
+                    np.array(old_gpw, dtype=np.float32), robot_pos, robot_yaw,
+                ) - old_pos_robot
+            except Exception:
+                old_grasp_robot = None
 
         # 像素坐标转相机坐标 (OpenCV: X=右, Y=下, Z=前)
         x = (u - cx) / fx * depth_m_f
@@ -867,38 +941,35 @@ class AlgSolution:
         except Exception:
             return
 
-        # 更新物体的世界坐标
         obj["pos_world"] = [float(p_world[0]), float(p_world[1]), float(p_world[2])]
+        obj["pose_source"] = "gt_camera"
 
-        # 计算机器人坐标系下的坐标
         try:
             p_robot = self._world_to_robot_frame(p_world, robot_pos, robot_yaw)
             obj["pos_robot"] = [float(p_robot[0]), float(p_robot[1]), float(p_robot[2])]
             obj["dist_to_robot"] = float(np.linalg.norm(p_robot[:2]))
             obj["yaw_rel"] = float(math.atan2(p_robot[1], p_robot[0]))
+            obj["nav_yaw_rel"] = obj["yaw_rel"]
+            obj["nav_depth_m"] = depth_m_f
+            obj["world_reliable"] = True
         except Exception:
-            pass
+            p_robot = None
 
-        # 同时校正 grasp_pos_world 如果存在
-        grasp_offset = None
-        old_pos_w = obj.get("pos_world")
-        # 用比例关系校正 grasp_pos_world：原 grasp 相对原 pos 的偏移应该保持在机器人帧
-        if "grasp_pos_world" in obj and old_pos_w is not None:
+        if p_robot is not None and old_grasp_robot is not None:
             try:
-                old_gpw = obj["grasp_pos_world"]
-                old_grasp_robot = self._world_to_robot_frame(
-                    np.array(old_gpw, dtype=np.float32), robot_pos, robot_yaw)
-                old_pos_robot = self._world_to_robot_frame(
-                    np.array(old_pos_w, dtype=np.float32), robot_pos, robot_yaw)
-                grasp_offset_robot = old_grasp_robot - old_pos_robot
-                new_grasp_robot = p_robot + grasp_offset_robot
+                new_grasp_robot = p_robot + old_grasp_robot
                 c, s = math.cos(robot_yaw), math.sin(robot_yaw)
                 new_grasp_world = robot_pos + np.array([
                     c * new_grasp_robot[0] - s * new_grasp_robot[1],
                     s * new_grasp_robot[0] + c * new_grasp_robot[1],
                     new_grasp_robot[2],
                 ], dtype=np.float32)
-                obj["grasp_pos_world"] = [float(new_grasp_world[0]), float(new_grasp_world[1]), float(new_grasp_world[2])]
+                obj["grasp_pos_world"] = [
+                    float(new_grasp_world[0]), float(new_grasp_world[1]), float(new_grasp_world[2]),
+                ]
+                obj["grasp_pos_robot"] = [
+                    float(new_grasp_robot[0]), float(new_grasp_robot[1]), float(new_grasp_robot[2]),
+                ]
             except Exception:
                 pass
 
