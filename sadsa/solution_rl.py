@@ -1085,10 +1085,39 @@ class AlgSolution:
         )
 
     def _dynamic_stop_distance_for_target(self, target_nav: dict[str, Any]) -> float:
-        target_dist = self._safe_float(target_nav.get("dist_to_robot"), fallback=float("inf"))
+        target_dist = self._conservative_target_dist(target_nav)
         if target_nav.get("source_camera") == "head" or target_dist <= self.target_near_range:
             return self.dynamic_stop_distance_near
         return self.dynamic_stop_distance_far
+
+    def _conservative_target_dist(
+        self,
+        target_nav: dict[str, Any],
+        robot_pos_world: np.ndarray | None = None,
+    ) -> float:
+        """depth / dist_to_robot / world XY 取最大, 防假近 depth 提前蹲下."""
+        if robot_pos_world is None:
+            robot_pos_world, _, _ = self._resolve_robot_pose_world({}, {}, None)
+        robot_pos_world = self._safe_numpy(robot_pos_world, np.zeros(3, dtype=np.float32))
+        parts: list[float] = []
+        dr = self._safe_float(target_nav.get("dist_to_robot"), 0.0)
+        if dr > 0.05:
+            parts.append(dr)
+        dd = self._safe_float(target_nav.get("depth_m"), 0.0)
+        if dd > 0.05:
+            parts.append(dd)
+        nd = self._safe_float(target_nav.get("nav_depth_m"), 0.0)
+        if nd > 0.05:
+            parts.append(nd)
+        pw = self._safe_numpy(target_nav.get("pos_world"), np.zeros(3, dtype=np.float32))
+        if np.all(np.isfinite(pw[:2])):
+            hw = float(np.linalg.norm(pw[:2] - robot_pos_world[:2]))
+            if hw > 0.05:
+                parts.append(hw)
+        pr = self._safe_numpy(target_nav.get("pos_robot"), np.zeros(3, dtype=np.float32))
+        if np.all(np.isfinite(pr[:2])) and float(np.linalg.norm(pr[:2])) > 0.05:
+            parts.append(float(np.linalg.norm(pr[:2])))
+        return max(parts) if parts else float("inf")
 
     def _compute_dynamic_visual_cmd(
         self,
@@ -1186,6 +1215,7 @@ class AlgSolution:
             stopped = True
         elif (
             target_dist <= self.grasp_start_depth
+            and self._conservative_target_dist(target_nav, robot_pos_world) <= self.grasp_start_depth
             and abs(yaw_error) <= max(self.object_yaw_tolerance * 2.5, 0.35)
         ):
             lin_x = 0.0
@@ -2677,23 +2707,23 @@ class AlgSolution:
                     robot_pos_world,
                     robot_yaw,
                 )
-                dist_ok = self._safe_float(
-                    target_nav.get("dist_to_robot"), fallback=float("inf"),
-                ) <= self.grasp_start_depth
+                cons_dist = self._conservative_target_dist(target_nav, robot_pos_world)
+                dist_ok = cons_dist <= self.grasp_start_depth
                 heading_ok = abs(float(nav_info.get("heading_error") or 999.0)) <= max(
                     self.object_yaw_tolerance * 2.5, 0.35,
                 )
+                head_confirmed = (
+                    target_nav.get("source_camera") != "head"
+                    or int(target_nav.get("head_stable_count") or 0) >= self.target_head_confirm_steps
+                )
                 if (
                     matched_grasp_target is not None
+                    and dist_ok
+                    and heading_ok
+                    and head_confirmed
                     and (
                         nav_info.get("phase") == "ready_to_grasp"
                         or perception_phase == "grasp"
-                        or (dist_ok and heading_ok)
-                    )
-                    and (
-                        target_nav.get("source_camera") == "head"
-                        or perception_phase == "grasp"
-                        or dist_ok
                     )
                 ):
                     base_cmd = np.zeros(3, dtype=np.float32)

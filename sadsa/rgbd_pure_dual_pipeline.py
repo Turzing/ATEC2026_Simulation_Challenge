@@ -1142,7 +1142,7 @@ class RgbdPureDualPipeline:
         ee_grasp_nav = ee_grasp if _strict_lock_match(ee_grasp, lock_ref_obj) else None
         ee_grasp_ok = ee_grasp_nav is not None and bool(ee_grasp_nav.get("grasp_reliable"))
         head_close = _nav_dist_conservative(head_nav) < GRASP_APPROACH_DIST_M
-        lock_dist = _nav_dist_conservative(locked or lock_ref_obj or auth_tgt)
+        lock_dist = _nav_dist_conservative(locked or lock_ref_obj)
         want_grasp = (
             close_d < GRASP_APPROACH_DIST_M
             and lock_dist < GRASP_APPROACH_DIST_M + 0.08
