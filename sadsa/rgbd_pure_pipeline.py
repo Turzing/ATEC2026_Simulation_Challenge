@@ -1298,21 +1298,48 @@ class RgbdPureCamera:
         h, w = depth.shape
         st = depth_stats(depth)
         p10 = float(st.get("p10", 99.0))
-        if p10 < 1.25 or p10 > 4.8:
+        if p10 < 1.0 or p10 > 5.5:
             return []
         roi = np.zeros((h, w), dtype=bool)
         roi[int(h * 0.08) : int(h * 0.58), int(w * 0.10) : int(w * 0.90)] = True
         valid = (
             self._valid_depth(depth, near=False)
-            & (depth >= 1.15)
-            & (depth <= 4.6)
+            & (depth >= 1.0)
+            & (depth <= 5.0)
         )
         hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
         hue, sat, val = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
         mask = (
             roi & valid
             & (hue >= HEAD_HUE_LO) & (hue <= HEAD_HUE_HI)
-            & (sat >= 28) & (val >= 48)
+            & (sat >= 20) & (val >= 42)
+        ).astype(np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+        return self._dets_from_mask(mask, rgb, depth, robot_pos, robot_yaw)
+
+    def _detect_edge_yellow(
+        self, rgb: np.ndarray, depth: np.ndarray, robot_pos, robot_yaw,
+    ) -> List[dict]:
+        """画面左右边缘黄物 (截图: banana 在 FOV 左缘 head YOLO 漏检)."""
+        h, w = depth.shape
+        st = depth_stats(depth)
+        p10 = float(st.get("p10", 99.0))
+        if p10 < 1.0 or p10 > 5.5:
+            return []
+        valid = (
+            self._valid_depth(depth, near=False)
+            & (depth >= 1.0)
+            & (depth <= 5.0)
+        )
+        roi = np.zeros((h, w), dtype=bool)
+        roi[int(h * 0.05) : int(h * 0.62), : int(w * 0.18)] = True
+        roi[int(h * 0.05) : int(h * 0.62), int(w * 0.82) :] = True
+        hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+        hue, sat, val = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+        mask = (
+            roi & valid
+            & (hue >= HEAD_HUE_LO) & (hue <= HEAD_HUE_HI)
+            & (sat >= 18) & (val >= 40)
         ).astype(np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
         return self._dets_from_mask(mask, rgb, depth, robot_pos, robot_yaw)
@@ -1331,10 +1358,14 @@ class RgbdPureCamera:
                 strip_dets = self._detect_bottom_strip(rgb, depth, robot_pos, robot_yaw)
                 if strip_dets:
                     dets = strip_dets
-            elif 1.25 <= p10 <= 4.8:
+            elif 1.0 <= p10 <= 5.5:
                 mid_dets = self._detect_midfield_yellow(rgb, depth, robot_pos, robot_yaw)
                 if mid_dets:
                     dets = mid_dets
+                else:
+                    edge_dets = self._detect_edge_yellow(rgb, depth, robot_pos, robot_yaw)
+                    if edge_dets:
+                        dets = edge_dets
 
         dets = self._merge_dets(dets)
         dets.sort(key=lambda x: x.get("depth_m") or 999.0)
@@ -1348,7 +1379,7 @@ class RgbdPureCamera:
         raw = self.detect(rgb, depth, robot_pos, robot_yaw)
         tracks = self.tracker.update(raw)
         objects = []
-        min_hits = int(self._cfg.get("min_track_hits", MIN_TRACK_HITS))
+        min_hits = 1 if self.camera_name == "head" else int(self._cfg.get("min_track_hits", MIN_TRACK_HITS))
         for t in tracks:
             if self.tracker.tracks.get(t["track_id"], {}).get("hits", 0) < min_hits:
                 continue

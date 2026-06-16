@@ -88,6 +88,12 @@ class AlgSolution:
         self._nav_turn_sign_hold = 0
         self._fuse_lock_key: tuple[Any, Any] | None = None
         self._fuse_pos_world: np.ndarray | None = None
+        self._ee_only_no_head_frames = 0
+        self._nav_stall_turn_rad = 0.0
+        self._nav_stall_dist_start: float | None = None
+        self.ee_only_unlock_frames = max(12, int(os.getenv("ATEC_TASKB_EE_ONLY_UNLOCK_FRAMES", "18")))
+        self.nav_stall_turn_rad = float(os.getenv("ATEC_TASKB_NAV_STALL_TURN_RAD", "1.15"))
+        self.nav_stall_min_dist_m = float(os.getenv("ATEC_TASKB_NAV_STALL_MIN_DIST", "2.0"))
         self._release_step_count = 0
         self._arm_grasp_controller = None
         self._arm_controller_init_failed = False
@@ -1172,7 +1178,12 @@ class AlgSolution:
         goal_dist = float(np.linalg.norm([forward_error, lateral_error]))
 
         phase = "near_refine" if (
-            target_nav.get("source_camera") == "head" or target_dist <= self.target_near_range
+            (
+                target_nav.get("source_camera") == "head"
+                and not target_nav.get("nav_coast")
+                and not target_nav.get("nav_bearing_hint")
+            )
+            or target_dist <= self.target_near_range
         ) else "far_approach"
 
         approach_scale = float(np.clip(goal_dist / self.slow_down_radius, 0.0, 1.0))
@@ -1195,7 +1206,12 @@ class AlgSolution:
             lin_y = 0.0
             ang_z = 0.0
             phase = "near_refine" if (
-                target_nav.get("source_camera") == "head" or target_dist <= self.target_near_range
+                (
+                    target_nav.get("source_camera") == "head"
+                    and not target_nav.get("nav_coast")
+                    and not target_nav.get("nav_bearing_hint")
+                )
+                or target_dist <= self.target_near_range
             ) else "far_approach"
 
         stopped = False
@@ -1216,6 +1232,7 @@ class AlgSolution:
             "forward_error": forward_error,
             "lateral_error": lateral_error,
             "stopped": stopped,
+            "ang_z": float(ang_z),
         }
 
     def _compute_frozen_pregrasp_cmd(
@@ -1341,7 +1358,15 @@ class AlgSolution:
             return base_cmd, nav_info
         self._pregrasp_stall_steps = 0
         self._pregrasp_last_robot_xy = None
-        return self._compute_dynamic_visual_cmd(target_nav, target_pos_robot)
+        base_cmd, nav_info = self._compute_dynamic_visual_cmd(target_nav, target_pos_robot)
+        if self._nav_approach_stalled(nav_info, float(target_nav.get("dist_to_robot") or 0.0)):
+            self._clear_fuse_nav_lock(
+                f"turn stall dist={float(target_nav.get('dist_to_robot') or 0.0):.2f}m"
+            )
+            nav_info["phase"] = "search_stall"
+            nav_info["stopped"] = False
+            return np.array([0.0, 0.0, self.search_yaw_rate], dtype=np.float32), nav_info
+        return base_cmd, nav_info
 
     @staticmethod
     def _wrap_angle(angle: float) -> float:
@@ -1798,6 +1823,37 @@ class AlgSolution:
         merged["objects_remaining"] = list(nav_input.get("objects_remaining") or [])
         return merged
 
+    def _clear_fuse_nav_lock(self, reason: str = "") -> None:
+        if reason:
+            self._log(f"[NAV] fuse unlock: {reason}")
+        self._fuse_lock_key = None
+        self._fuse_pos_world = None
+        self._ee_only_no_head_frames = 0
+        self._nav_stall_turn_rad = 0.0
+        self._nav_stall_dist_start = None
+        self._nav_heading_error_f = None
+        self._nav_turn_sign = 0
+        self._nav_turn_sign_hold = 0
+
+    def _nav_approach_stalled(self, nav_info: dict[str, Any], target_dist: float) -> bool:
+        phase = str(nav_info.get("phase", ""))
+        if phase != "turn_to_target":
+            self._nav_stall_turn_rad = 0.0
+            self._nav_stall_dist_start = None
+            return False
+        if self._nav_stall_dist_start is None:
+            self._nav_stall_dist_start = target_dist
+        ang_z = abs(float(nav_info.get("ang_z") or nav_info.get("cmd_ang_z") or 0.0))
+        self._nav_stall_turn_rad += ang_z * 0.02
+        if (
+            self._nav_stall_turn_rad >= self.nav_stall_turn_rad
+            and target_dist >= self.nav_stall_min_dist_m
+            and self._nav_stall_dist_start is not None
+            and (self._nav_stall_dist_start - target_dist) < 0.12
+        ):
+            return True
+        return False
+
     def _fuse_perception_target(
         self,
         perception_output: dict[str, Any],
@@ -1811,6 +1867,16 @@ class AlgSolution:
 
         lock_id = perception_output.get("nav_lock_id")
         lock_class = perception_output.get("nav_lock_class")
+        head_n = int(perception_output.get("head_count_raw") or 0)
+        ee_only = bool(perception_output.get("nav_lock_ee_only"))
+        if lock_id is not None and (ee_only or str(raw_nav.get("source_camera")) == "lock_coast") and head_n == 0:
+            self._ee_only_no_head_frames += 1
+        else:
+            self._ee_only_no_head_frames = 0
+        if self._ee_only_no_head_frames >= self.ee_only_unlock_frames:
+            self._clear_fuse_nav_lock("ee-only lock without head confirmation")
+            return None
+
         if lock_id is not None and lock_class and raw_nav.get("class") not in {None, lock_class}:
             return None
         if raw_nav.get("pos_jump_rejected") and lock_id is None:

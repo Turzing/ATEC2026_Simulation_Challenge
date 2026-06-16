@@ -68,6 +68,8 @@ NAV_EE_FAR_MIN_M = 1.35          # >= 远距 EE 导航
 NAV_EE_TO_HEAD_M = 1.28          # 迟滞: 远→近
 NAV_HEAD_TO_EE_M = 1.42          # 迟滞: 近→远
 NAV_LOCK_MISS_MAX = 45           # 丢失多少帧后解锁重选 (~0.9s)
+EE_NAV_LOCK_MAX_DEPTH_M = 2.05   # EE 独锁最大深度 (log: 2.36m 偏 1.55m)
+EE_ONLY_HEAD_CONFIRM_MAX = 30    # EE-only 锁无 head 确认则解锁 (~0.6s)
 NAV_RELOCK_MAX_XY_M = 1.25       # 重锁不得离上一 lock_world 超过此距
 TARGET_MATCH_RADIUS = 0.55       # 判定同一导航目标
 HEAD_MIRROR_EE_MIN_M = 0.85
@@ -637,19 +639,32 @@ def _find_in_pool(
     return None
 
 
+def _head_confirms_lock(
+    head_objs: List[dict],
+    lock_id: Optional[int],
+    lock_class: Optional[str],
+) -> bool:
+    if lock_id is None or not head_objs:
+        return False
+    return _find_in_pool(head_objs, lock_id, lock_class, None) is not None
+
+
 def _find_locked_target(
     head_objs: List[dict],
     ee_objs: List[dict],
     lock_id: Optional[int],
     lock_class: Optional[str],
     lock_world: Optional[List[float]] = None,
+    ee_only_lock: bool = False,
 ) -> Optional[dict]:
     hit = _find_in_pool(head_objs, lock_id, lock_class, lock_world)
     if hit is not None:
         return hit
-    if lock_world is not None:
+    if lock_world is not None and not ee_only_lock:
         return None
-    return _find_in_pool(ee_objs, lock_id, lock_class, lock_world)
+    return _find_in_pool(
+        ee_objs, lock_id, lock_class, None if ee_only_lock else lock_world,
+    )
 
 
 def _coast_nav_from_lock(
@@ -701,6 +716,9 @@ def _acquire_nav_lock(
                 return False
             if _is_far_ee_nav_unreliable(o):
                 return False
+            depth = float(o.get("depth_m") or o.get("nav_depth_m") or 99.0)
+            if depth > EE_NAV_LOCK_MAX_DEPTH_M or not bool(o.get("world_reliable")):
+                return False
         else:
             if _is_head_nav_unreliable(o):
                 return False
@@ -738,7 +756,9 @@ def _acquire_nav_lock(
         return head_nav
     if ee_nav is not None and not _is_ee_phantom_near(ee_nav, head_objs):
         if not _is_far_ee_nav_unreliable(ee_nav):
-            return ee_nav
+            ed = float(ee_nav.get("depth_m") or ee_nav.get("nav_depth_m") or 99.0)
+            if ed <= EE_NAV_LOCK_MAX_DEPTH_M and bool(ee_nav.get("world_reliable")):
+                return ee_nav
     return None
 
 
@@ -1019,6 +1039,8 @@ class RgbdPureDualPipeline:
         self._nav_lock_class: Optional[str] = None
         self._nav_lock_world: Optional[List[float]] = None
         self._nav_lock_miss = 0
+        self._nav_lock_ee_only = False
+        self._nav_lock_ee_only_frames = 0
         self._last_ee_motion: List[dict] = []
         self._last_head_objs: List[dict] = []
         print(
@@ -1038,6 +1060,8 @@ class RgbdPureDualPipeline:
         self._nav_lock_class = None
         self._nav_lock_world = None
         self._nav_lock_miss = 0
+        self._nav_lock_ee_only = False
+        self._nav_lock_ee_only_frames = 0
         self._last_ee_motion = []
         self._last_head_objs = []
         self.frame_count = 0
@@ -1176,6 +1200,7 @@ class RgbdPureDualPipeline:
         lock_ref = _find_locked_target(
             head_objs, ee_objs,
             self._nav_lock_id, self._nav_lock_class, self._nav_lock_world,
+            ee_only_lock=self._nav_lock_ee_only,
         )
         ee_grasp = _best_ee_grasp(ee_objs, lock_ref or head_nav or ee_nav)
         ee_d = _obj_dist(ee_grasp or ee_nav)
@@ -1185,7 +1210,13 @@ class RgbdPureDualPipeline:
         if locked is None and self._nav_lock_id is None:
             seed = _acquire_nav_lock(head_objs, ee_objs, head_nav, ee_nav, head_d, ee_d)
             if seed is not None and seed.get("source_camera") == "ee":
-                if _is_far_ee_nav_unreliable(seed) or not bool(seed.get("world_reliable")):
+                sd = _obj_dist(seed)
+                if (
+                    not head_objs
+                    or sd > EE_NAV_LOCK_MAX_DEPTH_M
+                    or _is_far_ee_nav_unreliable(seed)
+                    or not bool(seed.get("world_reliable"))
+                ):
                     seed = None
                 elif head_objs:
                     hc = [o for o in head_objs if o.get("class") == seed.get("class")]
@@ -1196,7 +1227,32 @@ class RgbdPureDualPipeline:
                 self._nav_lock_class = seed.get("class")
                 pw = seed.get("pos_world")
                 self._nav_lock_world = list(pw) if pw is not None else None
+                self._nav_lock_ee_only = (
+                    seed.get("source_camera") == "ee"
+                    and not _head_confirms_lock(head_objs, self._nav_lock_id, self._nav_lock_class)
+                )
+                self._nav_lock_ee_only_frames = 0
                 locked = seed
+
+        if self._nav_lock_id is not None:
+            if _head_confirms_lock(head_objs, self._nav_lock_id, self._nav_lock_class):
+                self._nav_lock_ee_only = False
+                self._nav_lock_ee_only_frames = 0
+            elif self._nav_lock_ee_only:
+                self._nav_lock_ee_only_frames += 1
+            elif locked is not None and locked.get("source_camera") == "ee" and not head_objs:
+                self._nav_lock_ee_only = True
+                self._nav_lock_ee_only_frames = 0
+
+        if self._nav_lock_ee_only_frames >= EE_ONLY_HEAD_CONFIRM_MAX:
+            self._nav_lock_id = None
+            self._nav_lock_class = None
+            self._nav_lock_world = None
+            self._nav_lock_miss = 0
+            self._nav_lock_ee_only = False
+            self._nav_lock_ee_only_frames = 0
+            locked = None
+            lock_ref = None
 
         nav_dist = _nav_dist_conservative(locked or head_nav or ee_nav)
         lock_ref_obj = locked or head_nav or ee_nav
@@ -1381,6 +1437,7 @@ class RgbdPureDualPipeline:
             "nav_authority_mode": auth_mode,
             "nav_lock_id": self._nav_lock_id,
             "nav_lock_class": self._nav_lock_class,
+            "nav_lock_ee_only": self._nav_lock_ee_only,
             "nav_lock_stable": self._nav_lock_id is not None and self._nav_lock_miss == 0,
             "nav_pos_confidence": None if nav_tgt is None else nav_tgt.get("pos_confidence"),
             "navigation": {"camera": nav_cam, "target": nav_tgt, "objects_detailed": nav_objs},
