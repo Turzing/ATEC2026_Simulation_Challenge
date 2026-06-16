@@ -1138,6 +1138,12 @@ class AlgSolution:
         approach_scale = float(np.clip(goal_dist / self.slow_down_radius, 0.0, 1.0))
         heading_scale = max(self.min_heading_lin_scale, math.cos(min(abs(heading_error), math.pi / 2.0)))
         align_threshold = self.turn_then_go_yaw_threshold if forward_error > 0.25 else self.turn_then_go_heading_hold
+        if target_nav.get("source_camera") == "head":
+            align_threshold = min(align_threshold, self.turn_then_go_heading_hold, 0.12)
+            if target_dist > 0.35:
+                lat_frac = abs(lateral_error) / max(target_dist, 0.25)
+                if lat_frac > 0.08 or abs(lateral_error) > 0.10:
+                    align_threshold = min(align_threshold, 0.08)
 
         if abs(heading_error) > align_threshold:
             lin_x = 0.0
@@ -2465,12 +2471,15 @@ class AlgSolution:
         action_env: torch.Tensor | None = None
 
         if self._step_count <= self.stand_still_steps:
-            # 在 stand 期间也计算导航信息，但不执行移动
             nav_info["phase"] = "stand"
             if target_nav is not None:
                 _, nav_info = self._compute_nav_cmd_from_target_nav(target_nav)
                 nav_info["phase"] = "stand"
                 nav_info["stopped"] = True
+            elif self._step_count > max(8, self.stand_still_steps // 4):
+                base_cmd = np.array([0.0, 0.0, self.search_yaw_rate], dtype=np.float32)
+                nav_info["phase"] = "search"
+                nav_info["stopped"] = False
         elif self._task_state == "CROUCHING":
             robot = self._get_robot()
             controller = self._ensure_arm_grasp_controller()

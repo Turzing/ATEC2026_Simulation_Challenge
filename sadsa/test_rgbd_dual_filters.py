@@ -13,7 +13,7 @@ from rgbd_pure_dual_pipeline import (  # noqa: E402
     _nav_dist_conservative,
     _strict_lock_match,
 )
-from rgbd_utils import bbox_lateral_consistent, is_ee_sky_blob  # noqa: E402
+from rgbd_utils import bbox_lateral_consistent, is_ee_sky_blob, is_head_edge_phantom  # noqa: E402
 
 
 class TestRgbdDualFilters(unittest.TestCase):
@@ -65,6 +65,15 @@ class TestRgbdDualFilters(unittest.TestCase):
         self.assertFalse(_is_head_nav_unreliable(weak))
         jumped = dict(weak, pos_jump_rejected=True)
         self.assertTrue(_is_head_nav_unreliable(jumped))
+
+    def test_head_edge_phantom(self):
+        edge = {
+            "bbox": [520, 300, 600, 420],
+            "depth_m": 1.05,
+            "pos_robot": [1.35, -0.30, -0.51],
+        }
+        self.assertTrue(is_head_edge_phantom(edge))
+        self.assertTrue(_is_head_nav_unreliable(edge))
 
 
 if __name__ == "__main__":

@@ -224,6 +224,22 @@ def bbox_lateral_consistent(
     return abs(np.clip(img_b, -1.0, 1.0) - np.clip(rob_b, -1.0, 1.0)) <= tol
 
 
+def is_head_edge_phantom(obj: dict, *, img_w: int = IMG_W) -> bool:
+    """head bbox 贴画面边缘 → depth/3D 不可靠 (log: sugar 框在 u≈580 却报 1.05m 正前方)."""
+    bbox = obj.get("bbox")
+    if not bbox or len(bbox) != 4:
+        return False
+    cx = 0.5 * (float(bbox[0]) + float(bbox[2]))
+    bw = float(bbox[2]) - float(bbox[0])
+    depth = float(obj.get("depth_m") or obj.get("nav_depth_m") or 99.0)
+    at_edge = cx > img_w * 0.72 or cx < img_w * 0.28
+    if cx > img_w * 0.78 or cx < img_w * 0.22:
+        return True
+    if at_edge and bw < img_w * 0.24 and depth < 2.2:
+        return True
+    return False
+
+
 def is_ee_sky_blob(obj: dict, *, img_h: int = IMG_H, img_w: int = IMG_W) -> bool:
     """EE 框在画面上方 + 深度假近 → 地平线 phantom (log 里 conf 0.86 天空 mustard)."""
     bbox = obj.get("bbox")
@@ -270,6 +286,10 @@ def filter_plausible_objects(
         vm = float(o.get("blob_val_mean") or 0.0)
         bbox = o.get("bbox")
         if camera == "head":
+            if is_head_edge_phantom(o):
+                continue
+            if depth < 2.5 and not bbox_lateral_consistent(o):
+                continue
             if depth < 1.05 and sm < 46:
                 continue
             if depth < 0.80 and sm < 54:

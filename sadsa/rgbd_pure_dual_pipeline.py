@@ -47,6 +47,7 @@ from rgbd_utils import (
     filter_plausible_objects,
     head_nav_pos_confidence,
     is_ee_sky_blob,
+    is_head_edge_phantom,
     parse_ee_rgbd,
     parse_head_rgbd,
     refresh_ee_object_pose,
@@ -581,10 +582,15 @@ def _strict_lock_match(a: Optional[dict], b: Optional[dict]) -> bool:
 
 
 def _is_head_nav_unreliable(obj: dict) -> bool:
-    """仅拒 coast / 跳变; 不再要求 pointcloud 否则 head 远距全灭."""
+    """拒 coast/跳变/边缘假检/bbox-3D 横向不一致."""
     if obj.get("coast_frame"):
         return False
     if obj.get("pos_jump_rejected"):
+        return True
+    if is_head_edge_phantom(obj):
+        return True
+    depth = float(obj.get("depth_m") or obj.get("nav_depth_m") or 99.0)
+    if depth < 2.5 and not bbox_lateral_consistent(obj):
         return True
     return False
 
