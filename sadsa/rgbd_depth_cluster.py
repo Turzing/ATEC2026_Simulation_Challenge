@@ -31,15 +31,18 @@ from rgbd_utils import (
     sanitize_depth,
 )
 
-DEPTH_MIN = 0.20
+DEPTH_MIN = 0.18
 DEPTH_MAX = 8.0
-MIN_CLUSTER_PX = 20
-MAX_CLUSTERS = 16
-ROI_V_MIN = 0.10
-ROI_V_MAX = 0.94
-GROUND_PERCENTILE = 35
-PROTRUDE_M = 0.032
+MIN_CLUSTER_PX_HEAD = 10
+MIN_CLUSTER_PX_EE = 8
+MAX_CLUSTERS = 20
+ROI_V_MIN = 0.06
+ROI_V_MAX = 0.96
+PROTRUDE_HEAD_M = 0.016
+PROTRUDE_EE_M = 0.010
+LOCAL_GROUND_K = 21
 EE_GRASP_NEAR_M = 1.15
+MIN_SAMPLE_PTS = 3
 
 
 def _robot_to_world(p_robot: np.ndarray, robot_pos: np.ndarray, robot_yaw: float) -> np.ndarray:
@@ -156,44 +159,67 @@ class DepthClusterDetector:
         vv = np.meshgrid(np.arange(w), vs)[1]
         in_roi = (vv >= int(h * ROI_V_MIN)) & (vv <= int(h * ROI_V_MAX))
 
-        v0, v1 = int(h * ROI_V_MIN), int(h * 0.78)
-        roi = depth[v0:v1, :]
+        protrude_m = PROTRUDE_EE_M if self.camera_name == "ee" else PROTRUDE_HEAD_M
+        fill = np.where(valid, depth, np.median(depth[valid]) if np.any(valid) else 3.0)
+        local_ground = ndimage.median_filter(fill.astype(np.float32), size=LOCAL_GROUND_K)
+        relief = local_ground - depth
+
+        v0 = int(h * ROI_V_MIN)
+        roi = depth[v0:int(h * 0.82), :]
         roi_ok = roi[(roi > DEPTH_MIN) & (roi < DEPTH_MAX)]
         if roi_ok.size > 80:
-            ground_d = float(np.percentile(roi_ok, GROUND_PERCENTILE))
+            ground_d = float(np.percentile(roi_ok, 38))
         else:
             ground_d = float(np.median(depth[valid])) if np.any(valid) else 3.0
 
-        protrude = depth < (ground_d - PROTRUDE_M)
-        mask = (valid & in_roi & protrude).astype(np.uint8)
+        global_protrude = depth < (ground_d - protrude_m)
+        local_protrude = relief >= protrude_m
+        mask = (valid & in_roi & (global_protrude | local_protrude)).astype(np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
         self._last_mask = mask
         return mask
 
-    def _sample_world_pts(
+    def _backproject_cluster(
         self,
         ys: np.ndarray,
         xs: np.ndarray,
         depth: np.ndarray,
         robot_pos: np.ndarray,
         robot_yaw: float,
-    ) -> Optional[np.ndarray]:
+        depth_m: float,
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], float]:
+        """反投影簇 → pos_robot / pos_world；不做 world-Z 硬杀（solution_rl 会用 FK 再校正）。"""
         cam_cfg, cam_pos, cam_rot = self._cam_pose()
-        pts = []
-        step = 1 if len(ys) < 300 else 2
+        pts_w = []
+        step = 1 if len(ys) < 400 else 2
         for y, x in zip(ys[::step], xs[::step]):
             z = float(depth[y, x])
             if z <= DEPTH_MIN or z >= DEPTH_MAX:
                 continue
             pr = pixel_to_robot(float(x), float(y), z, cam_cfg, cam_pos, cam_rot)
-            pw = _robot_to_world(pr, robot_pos, robot_yaw)
-            if pw[2] < 0.02 or pw[2] > 0.50:
+            if not np.isfinite(pr).all():
                 continue
-            pts.append(pw)
-        if len(pts) < 4:
-            return None
-        return np.stack(pts, axis=0).astype(np.float32)
+            pts_w.append(_robot_to_world(pr, robot_pos, robot_yaw))
+
+        if len(pts_w) >= MIN_SAMPLE_PTS:
+            world_pts = np.stack(pts_w, axis=0).astype(np.float32)
+            pos_world = np.median(world_pts, axis=0)
+            z_extent = float(world_pts[:, 2].max() - world_pts[:, 2].min())
+            c, s = np.cos(robot_yaw), np.sin(robot_yaw)
+            rot_inv = np.array([[c, s, 0.0], [-s, c, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+            pos_robot = rot_inv @ (pos_world - robot_pos)
+            return pos_robot.astype(np.float32), pos_world.astype(np.float32), z_extent
+
+        cx, cy = float(np.median(xs)), float(np.median(ys))
+        pr = pixel_to_robot(cx, cy, depth_m, cam_cfg, cam_pos, cam_rot)
+        if not np.isfinite(pr).all():
+            return None, None, 0.08
+        pos_world = _robot_to_world(pr, robot_pos, robot_yaw)
+        c, s = np.cos(robot_yaw), np.sin(robot_yaw)
+        rot_inv = np.array([[c, s, 0.0], [-s, c, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+        pos_robot = rot_inv @ (pos_world - robot_pos)
+        return pos_robot.astype(np.float32), pos_world.astype(np.float32), 0.08
 
     def _grasp_quat(self, class_name: str, pos_world: np.ndarray, robot_pos: np.ndarray) -> np.ndarray:
         fixed = GRASP_FIXED_QUAT.get(str(class_name), DEFAULT_GRASP_FIXED_QUAT).copy()
@@ -215,31 +241,27 @@ class DepthClusterDetector:
         if n == 0:
             return []
 
-        cam_cfg, cam_pos, cam_rot = self._cam_pose()
         is_head = self.camera_name == "head"
         is_ee = self.camera_name == "ee"
+        min_px = MIN_CLUSTER_PX_EE if is_ee else MIN_CLUSTER_PX_HEAD
         dets: List[dict] = []
 
         for cid in range(1, n + 1):
             ys, xs = np.where(labeled == cid)
-            if len(ys) < MIN_CLUSTER_PX:
+            if len(ys) < min_px:
                 continue
 
             dvals = depth[ys, xs]
             dvals = dvals[(dvals > DEPTH_MIN) & (dvals < DEPTH_MAX)]
-            if dvals.size < 8:
+            if dvals.size < 6:
                 continue
 
-            depth_m = float(np.percentile(dvals, 15))
-            world_pts = self._sample_world_pts(ys, xs, depth, robot_pos, robot_yaw)
-            if world_pts is None:
+            depth_m = float(np.percentile(dvals, 12))
+            pos_robot, pos_world, z_extent = self._backproject_cluster(
+                ys, xs, depth, robot_pos, robot_yaw, depth_m,
+            )
+            if pos_robot is None or pos_world is None:
                 continue
-
-            pos_world = np.median(world_pts, axis=0)
-            z_extent = float(world_pts[:, 2].max() - world_pts[:, 2].min())
-            c, s = np.cos(robot_yaw), np.sin(robot_yaw)
-            rot_inv = np.array([[c, s, 0.0], [-s, c, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
-            pos_robot = rot_inv @ (pos_world - robot_pos)
 
             x1, x2 = int(xs.min()), int(xs.max())
             y1, y2 = int(ys.min()), int(ys.max())
@@ -247,7 +269,9 @@ class DepthClusterDetector:
             cx, cy = float(np.median(xs)), float(np.median(ys))
             cls, cls_conf = _classify_cluster(rgb, ys, xs, bbox, z_extent)
 
-            z_top = float(np.percentile(world_pts[:, 2], 92))
+            c, s = np.cos(robot_yaw), np.sin(robot_yaw)
+            rot_inv = np.array([[c, s, 0.0], [-s, c, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+            z_top = float(pos_world[2]) + max(0.04, z_extent * 0.45)
             grasp_world = pos_world.copy()
             grasp_world[2] = z_top - GRASP_DEPTH_OFFSET
             grasp_robot = rot_inv @ (grasp_world - robot_pos)
@@ -271,7 +295,7 @@ class DepthClusterDetector:
                 "nav_yaw_rel": yaw_rel,
                 "pos_robot": pos_robot.tolist(),
                 "pos_world": pos_world.tolist(),
-                "pos_from_pointcloud": True,
+                "pos_from_pointcloud": len(ys) >= MIN_SAMPLE_PTS + 4,
                 "nav_point_count": int(len(ys)),
                 "nav_anchor_uv": [cx, float(y2)],
                 "nav_anchor_depth": depth_m,

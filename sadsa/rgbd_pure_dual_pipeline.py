@@ -43,6 +43,7 @@ from rgbd_pure_pipeline import RgbdPureCamera, _robot_to_world, _yaw_from_gravit
 from rgbd_utils import (
     GRASP_RELIABLE_DEPTH_M,
     MIN_NAV_POS_CONF,
+    RGBD_SIMPLE,
     _is_head_fallback_det,
     _to_numpy,
     bbox_lateral_consistent,
@@ -491,6 +492,11 @@ def _is_ee_phantom_near(ee_o: dict, head_objs: List[dict]) -> bool:
 
 
 def _filter_phantom_ee(ee_objs: List[dict], head_objs: List[dict]) -> List[dict]:
+    if RGBD_SIMPLE:
+        return [
+            eo for eo in ee_objs
+            if not is_ee_sky_blob(eo) and not is_ee_floor_phantom(eo)
+        ]
     kept = []
     for eo in ee_objs:
         if _is_ee_phantom_near(eo, head_objs):
@@ -1194,9 +1200,10 @@ class RgbdPureDualPipeline:
         self._nav_lock_ee_only_frames = 0
         self._last_ee_motion: List[dict] = []
         self._last_head_objs: List[dict] = []
+        mode = "depth-cluster" if RGBD_SIMPLE else "legacy-fusion"
         print(
-            "[RgbdPureDual] simple-dual | head-nav | ee-sky-only | "
-            f"coast={DETECTION_COAST_FRAMES}f"
+            f"[RgbdPureDual] {mode} | head-nav | ee-grasp | "
+            f"coast={'off' if RGBD_SIMPLE else str(DETECTION_COAST_FRAMES) + 'f'}"
         )
 
     def reset(self):
@@ -1323,29 +1330,33 @@ class RgbdPureDualPipeline:
             ee_stats = ee_meta.get("depth_stats") or depth_stats(e_depth)
 
         head_objs = [_as_head_nav(o) for o in head_objs]
-        ee_objs = self._class_stable.apply(ee_objs, "ee")
-        head_objs = self._class_stable.apply(head_objs, "head")
-        head_objs = self._temporal.apply(head_objs, "head", rp, ry, motion)
-        ee_objs = self._temporal.apply(ee_objs, "ee", rp, ry, motion)
+        if not RGBD_SIMPLE:
+            ee_objs = self._class_stable.apply(ee_objs, "ee")
+            head_objs = self._class_stable.apply(head_objs, "head")
+            head_objs = self._temporal.apply(head_objs, "head", rp, ry, motion)
+            ee_objs = self._temporal.apply(ee_objs, "ee", rp, ry, motion)
         head_objs = [_finalize_head(o, rp, ry, grav) for o in head_objs]
         ee_objs = [_finalize_ee(o, rp, ry, arm_q) for o in ee_objs]
-        head_objs = [self._pos_gate.apply(o, "head", rp, ry) for o in head_objs]
-        ee_objs = [self._pos_gate.apply(o, "ee", rp, ry) for o in ee_objs]
+        if not RGBD_SIMPLE:
+            head_objs = [self._pos_gate.apply(o, "head", rp, ry) for o in head_objs]
+            ee_objs = [self._pos_gate.apply(o, "ee", rp, ry) for o in ee_objs]
 
         ee_objs = filter_plausible_objects(ee_objs, "ee")
         ee_objs = _filter_phantom_ee(ee_objs, head_objs)
         ee_near = _obj_dist(_best_nav_target(ee_objs) or _best_ee_grasp(ee_objs))
         head_objs = filter_plausible_objects(head_objs, "head", ee_near_m=ee_near)
-        ee_objs = _drop_ee_class_conflict(ee_objs, head_objs)
+        if not RGBD_SIMPLE:
+            ee_objs = _drop_ee_class_conflict(ee_objs, head_objs)
 
-        if not head_objs and self._last_head_objs:
-            head_objs = [
-                self._refresh_coast_obj(o, rp, ry) for o in self._last_head_objs
-            ]
-        if not ee_objs and self._last_ee_motion:
-            ee_objs = [
-                self._refresh_coast_obj(o, rp, ry) for o in self._last_ee_motion
-            ]
+        if not RGBD_SIMPLE:
+            if not head_objs and self._last_head_objs:
+                head_objs = [
+                    self._refresh_coast_obj(o, rp, ry) for o in self._last_head_objs
+                ]
+            if not ee_objs and self._last_ee_motion:
+                ee_objs = [
+                    self._refresh_coast_obj(o, rp, ry) for o in self._last_ee_motion
+                ]
 
         head_objs.sort(key=_obj_dist)
         ee_objs.sort(key=_obj_dist)
