@@ -1078,6 +1078,8 @@ class RgbdPureCamera:
         is_head = self.camera_name == "head"
         is_ee = self.camera_name == "ee"
         x1, y1, x2, y2 = bbox
+        if y2 < h * 0.52:
+            return None
 
         # ── head: 点云 + 底边 anchor 导航 (近端 depth, 避免 bbox 底边打到地面) ──
         if is_head:

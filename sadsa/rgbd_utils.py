@@ -240,8 +240,25 @@ def is_head_edge_phantom(obj: dict, *, img_w: int = IMG_W) -> bool:
     return False
 
 
+def is_sky_phantom_bbox(obj: dict, *, img_h: int = IMG_H) -> bool:
+    """物体在地面: bbox 底边应在画面下半区; 否则是天空/地平线假检 (截图红框打天)."""
+    bbox = obj.get("bbox")
+    if not bbox or len(bbox) != 4:
+        return False
+    y1, y2 = float(bbox[1]), float(bbox[3])
+    if y2 < img_h * 0.52:
+        return True
+    cy = 0.5 * (y1 + y2)
+    bh = max(y2 - y1, 1.0)
+    if cy < img_h * 0.36 and bh > img_h * 0.10:
+        return True
+    return False
+
+
 def is_ee_sky_blob(obj: dict, *, img_h: int = IMG_H, img_w: int = IMG_W) -> bool:
     """EE 框在画面上方 + 深度假近 → 地平线 phantom (log 里 conf 0.86 天空 mustard)."""
+    if is_sky_phantom_bbox(obj, img_h=img_h):
+        return True
     bbox = obj.get("bbox")
     if not bbox or len(bbox) != 4:
         return False
@@ -286,6 +303,8 @@ def filter_plausible_objects(
         vm = float(o.get("blob_val_mean") or 0.0)
         bbox = o.get("bbox")
         if camera == "head":
+            if is_sky_phantom_bbox(o):
+                continue
             if is_head_edge_phantom(o):
                 continue
             if depth < 2.5 and not bbox_lateral_consistent(o):
@@ -590,15 +609,21 @@ def align_nav_pos_to_bbox_ray(
     cam_cfg: dict,
     cam_rot_matrix: np.ndarray,
 ) -> dict:
-    """用 bbox 中心像素射线定导航方位 (fix: 3D 横向偏 90° 导致转圈)."""
+    """bbox 底边像素射线定方位; head 点云时只修横向."""
     out = dict(obj)
     bbox = out.get("bbox")
     pr = out.get("pos_robot")
     if not bbox or len(bbox) != 4 or pr is None:
         return out
+    if out.get("pos_from_pointcloud"):
+        return out
     try:
         cx = 0.5 * (float(bbox[0]) + float(bbox[2]))
-        cy = 0.5 * (float(bbox[1]) + float(bbox[3]))
+        cy = float(bbox[3]) - 1.0
+        anchor_uv = out.get("nav_anchor_uv")
+        if anchor_uv is not None and len(anchor_uv) == 2:
+            cx = float(anchor_uv[0])
+            cy = float(anchor_uv[1])
         depth = float(
             out.get("nav_anchor_depth")
             or out.get("nav_depth_m")

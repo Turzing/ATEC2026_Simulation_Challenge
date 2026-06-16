@@ -53,6 +53,7 @@ from rgbd_utils import (
     head_nav_pos_confidence,
     is_ee_sky_blob,
     is_head_edge_phantom,
+    is_sky_phantom_bbox,
     parse_ee_rgbd,
     parse_head_rgbd,
     refresh_ee_object_pose,
@@ -202,7 +203,8 @@ def _finalize_ee(o: dict, robot_pos, robot_yaw, arm_joints) -> dict:
 def _finalize_head(o: dict, robot_pos, robot_yaw, grav) -> dict:
     cam_pos = compute_dynamic_head_cam_pos(grav)
     out = refresh_head_object_pose(o, robot_pos, robot_yaw, cam_pos)
-    out = align_nav_pos_to_bbox_ray(out, robot_pos, robot_yaw, cam_pos, HEAD_CAM, HEAD_CAM_ROT_MATRIX)
+    if not out.get("pos_from_pointcloud"):
+        out = align_nav_pos_to_bbox_ray(out, robot_pos, robot_yaw, cam_pos, HEAD_CAM, HEAD_CAM_ROT_MATRIX)
     out["camera"] = "head"
     out["role"] = "nav"
     return _enrich_nav(out) or out
@@ -597,6 +599,8 @@ def _is_head_nav_unreliable(obj: dict) -> bool:
     if obj.get("coast_frame"):
         return False
     if obj.get("pos_jump_rejected"):
+        return True
+    if is_sky_phantom_bbox(obj):
         return True
     if is_head_edge_phantom(obj):
         return True
