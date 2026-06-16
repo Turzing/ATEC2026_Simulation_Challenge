@@ -231,8 +231,13 @@ MIN_NAV_LOCK_CONF = 0.38        # 新锁目标最低置信
 EE_PHANTOM_NEAR_M = 1.85        # EE 假近距阈值
 EE_PHANTOM_HEAD_GAP_M = 0.35    # head 最近比 EE 远此值 → 判 EE 假近
 DETECTION_COAST_FRAMES = 14     # YOLO 漏检时保持上一帧目标帧数
-HEAD_NAV_BOTTOM_FRAC = 0.72     # bbox 底边分位用于水平定位
+HEAD_NAV_BOTTOM_FRAC = 0.72     # bbox 底边分位用于 horizontal 定位
 HEAD_NAV_Z_PERCENTILE = 42      # 点云 robot-Z 分位 (近表面)
+EE_SKY_CY_FRAC = 0.38           # EE bbox 中心高于此 → 天空假检
+EE_NAV_ROBOT_Z_MIN = -0.35      # EE 导航比通用 ROBOT_Z_MIN 更严
+BBOX_LATERAL_TOL = 0.52         # 图像左右 vs pos_robot 横向符号一致性
+MIN_LOCK_POINT_COUNT = 8        # head 新锁最少点云点数
+CLASS_FLIP_CONF = 0.72          # track id 改类需超过此 pos_confidence
 
 # =============================================================================
 # 夹爪参数 (用于 is_holding 判定)

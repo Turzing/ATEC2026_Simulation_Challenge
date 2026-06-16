@@ -780,6 +780,10 @@ class RgbdPureCamera:
             return True
         if cy > h * 0.60 and area > 900 and mean_r < 0.007 and mean_s < 46:
             return True
+        if cy < h * 0.38 and mean_r < 0.012 and area < 1800:
+            return True
+        if cy < h * 0.30 and mean_s >= 40 and mean_v >= 70:
+            return True
         return False
 
     def _robust_depth(

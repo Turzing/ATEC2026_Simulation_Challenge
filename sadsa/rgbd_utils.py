@@ -14,10 +14,15 @@ import cv2
 import numpy as np
 
 from config import (
+    BBOX_LATERAL_TOL,
     DEFAULT_ARM_JOINTS,
     EE_CAM,
     EE_CAM_POS_ROBOT,
     EE_CAM_ROT_MATRIX,
+    EE_NAV_ROBOT_Z_MIN,
+    EE_PHANTOM_HEAD_GAP_M,
+    EE_PHANTOM_NEAR_M,
+    EE_SKY_CY_FRAC,
     GRASP_DEPTH_OFFSET,
     GRIPPER_TIP_OFFSET_ENABLE,
     GRIPPER_TIP_OFFSET_M,
@@ -26,14 +31,14 @@ from config import (
     HEAD_CAM_ROT_MATRIX,
     HEAD_NAV_BOTTOM_FRAC,
     HEAD_NAV_Z_PERCENTILE,
-    MIN_NAV_POINT_COUNT,
+    IMG_H,
+    IMG_W,
     MIN_NAV_LOCK_CONF,
+    MIN_NAV_POINT_COUNT,
     MIN_NAV_POS_CONF,
     MOTION_GRASP_HEIGHT_OFFSET,
     POS_JUMP_REJECT_FAR_M,
     POS_JUMP_REJECT_NEAR_M,
-    EE_PHANTOM_HEAD_GAP_M,
-    EE_PHANTOM_NEAR_M,
 )
 
 CAMERA_MODELS = {
@@ -194,6 +199,52 @@ ROBOT_Z_MIN = -0.78
 ROBOT_Z_MAX = 0.28
 
 
+def bbox_lateral_consistent(
+    obj: dict,
+    *,
+    img_w: int = IMG_W,
+    tol: float = BBOX_LATERAL_TOL,
+) -> bool:
+    """bbox 在图像左/右应与 pos_robot 横向符号一致, 否则 depth 锚点错位."""
+    bbox = obj.get("bbox")
+    pr = obj.get("pos_robot")
+    if not bbox or len(bbox) != 4 or pr is None:
+        return True
+    try:
+        cx = 0.5 * (float(bbox[0]) + float(bbox[2]))
+        px, py = float(pr[0]), float(pr[1])
+    except (TypeError, ValueError):
+        return True
+    if abs(px) < 0.22 and abs(py) < 0.22:
+        return True
+    img_b = (cx - img_w * 0.5) / max(img_w * 0.5, 1.0)
+    rob_b = py / max(float(np.hypot(px, py)), 0.18)
+    if abs(img_b) < 0.06 or abs(rob_b) < 0.06:
+        return True
+    return abs(np.clip(img_b, -1.0, 1.0) - np.clip(rob_b, -1.0, 1.0)) <= tol
+
+
+def is_ee_sky_blob(obj: dict, *, img_h: int = IMG_H, img_w: int = IMG_W) -> bool:
+    """EE 框在画面上方 + 深度假近 → 地平线 phantom (log 里 conf 0.86 天空 mustard)."""
+    bbox = obj.get("bbox")
+    if not bbox or len(bbox) != 4:
+        return False
+    cy = 0.5 * (float(bbox[1]) + float(bbox[3]))
+    if cy >= img_h * EE_SKY_CY_FRAC:
+        return False
+    depth = float(obj.get("depth_m") or obj.get("nav_depth_m") or 99.0)
+    pr = obj.get("pos_robot")
+    pz = float(pr[2]) if pr is not None else 0.0
+    if depth < 2.4 and cy < img_h * 0.32:
+        return True
+    if pz < EE_NAV_ROBOT_Z_MIN and depth < 2.2:
+        return True
+    cx = 0.5 * (float(bbox[0]) + float(bbox[2]))
+    if cy < img_h * 0.28 and (cx < img_w * 0.12 or cx > img_w * 0.88):
+        return True
+    return False
+
+
 def filter_plausible_objects(
     objects: list,
     camera: str,
@@ -230,7 +281,16 @@ def filter_plausible_objects(
                     continue
                 if depth < 0.55 and cy > 140 and sm < 62 and 55 < vm < 155:
                     continue
-        if camera == "ee" and depth < 0.35 and sm < 40:
+        if camera == "ee":
+            if depth < 0.35 and sm < 40:
+                continue
+            if is_ee_sky_blob(o):
+                continue
+            if pz < EE_NAV_ROBOT_Z_MIN and not o.get("grasp_reliable"):
+                continue
+            if not bbox_lateral_consistent(o):
+                continue
+        if camera == "head" and not bbox_lateral_consistent(o):
             continue
         out.append(o)
     return out
