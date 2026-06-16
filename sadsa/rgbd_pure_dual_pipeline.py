@@ -666,6 +666,14 @@ def _resolve_live_lock_hit(
         for pool in (head_objs, ee_objs):
             by_id = _find_in_pool_by_id(pool, lock_id)
             if by_id is not None:
+                if (
+                    lock_class
+                    and by_id.get("class")
+                    and by_id.get("class") != lock_class
+                    and lock_world is not None
+                    and _world_xy_dist(by_id, {"pos_world": lock_world}) > 0.75
+                ):
+                    continue
                 return by_id
     live = _find_in_pool(head_objs, lock_id, lock_class, None)
     if live is not None:
@@ -1366,6 +1374,16 @@ class RgbdPureDualPipeline:
                 head_objs, ee_objs,
                 self._nav_lock_id, self._nav_lock_class, self._nav_lock_world,
             )
+            if live is not None and live.get("pos_world") is not None:
+                new_cls = live.get("class")
+                if (
+                    self._nav_lock_class
+                    and new_cls
+                    and new_cls != self._nav_lock_class
+                    and self._nav_lock_world is not None
+                    and _world_xy_dist(live, {"pos_world": self._nav_lock_world}) > 0.85
+                ):
+                    live = None
             if live is not None and live.get("pos_world") is not None:
                 self._nav_lock_id = int(live["id"])
                 if live.get("class"):

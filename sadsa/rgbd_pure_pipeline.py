@@ -885,24 +885,35 @@ class RgbdPureCamera:
 
     @staticmethod
     def _classify_2d_shape(
-        bbox: List[int], area: int, sat_mean: float, depth_m: Optional[float] = None,
+        bbox: List[int],
+        area: int,
+        sat_mean: float,
+        depth_m: Optional[float] = None,
+        hue_mean: float = 0.0,
     ) -> Tuple[str, float]:
         x1, y1, x2, y2 = bbox
         bw, bh = max(1, x2 - x1 + 1), max(1, y2 - y1 + 1)
         asp = max(bw, bh) / min(bw, bh)
         fill = area / max(bw * bh, 1)
         vert, horiz = bh >= bw * 1.20, bw >= bh * 1.20
-        if fill > 0.36 and asp < 1.50:
+        yellow = sat_mean >= 22 and HEAD_HUE_LO <= hue_mean <= HEAD_HUE_HI
+        if yellow and horiz and asp >= 1.12:
+            return "banana", min(0.90, 0.66 + 0.12 * (asp - 1.12))
+        if yellow and vert and asp >= 1.35 and sat_mean >= 42:
+            return "mustard_bottle", min(0.86, 0.58 + 0.10 * (asp - 1.35))
+        if fill > 0.36 and asp < 1.50 and not yellow:
             conf = 0.72 if (depth_m is not None and depth_m < 1.30) else 0.65
             return "sugar_box", conf
-        if vert and asp >= 1.32:
+        if vert and asp >= 1.32 and sat_mean >= 38:
             return "mustard_bottle", min(0.86, 0.56 + 0.11 * (asp - 1.32))
         if horiz and asp >= 1.22:
             return "banana", min(0.84, 0.54 + 0.13 * (asp - 1.22))
         if asp >= 1.72:
             return ("mustard_bottle", 0.64) if vert else ("banana", 0.66)
-        if asp < 1.16:
+        if asp < 1.16 and not yellow:
             return "sugar_box", 0.60
+        if yellow:
+            return "banana", 0.68
         return "sugar_box", 0.55
 
     def _classify_object(
@@ -915,8 +926,11 @@ class RgbdPureCamera:
         sat_mean: float,
         depth_m: float,
         use_3d: bool,
+        hue_mean: float = 0.0,
     ) -> Tuple[str, float, Optional[List[float]]]:
-        name_2d, conf_2d = self._classify_2d_shape(bbox, area, sat_mean, depth_m)
+        name_2d, conf_2d = self._classify_2d_shape(
+            bbox, area, sat_mean, depth_m, hue_mean=hue_mean,
+        )
         if not use_3d:
             return name_2d, conf_2d, None
         pts = self._blob_points_robot(ys, xs, depth, depth_m)
@@ -1023,6 +1037,7 @@ class RgbdPureCamera:
     def _blob_det(
         self, ys, xs, depth, h, w, robot_pos, robot_yaw,
         val: Optional[np.ndarray] = None, sat: Optional[np.ndarray] = None,
+        hue: Optional[np.ndarray] = None,
         relief: Optional[np.ndarray] = None,
     ) -> Optional[dict]:
         if self._is_shadow_shape(ys, xs, val, sat, h, w, relief):
@@ -1059,6 +1074,7 @@ class RgbdPureCamera:
             return None
         vm = float(np.mean(val[ys, xs])) if val is not None else 128.0
         sm = float(np.mean(sat[ys, xs])) if sat is not None else 64.0
+        hm = float(np.mean(hue[ys, xs])) if hue is not None else 0.0
         if sm < self._cfg.get("min_blob_sat", MIN_BLOB_SAT_MEAN):
             if (
                 self.camera_name == "head"
@@ -1080,9 +1096,14 @@ class RgbdPureCamera:
         if relief is not None and self.camera_name == "head":
             rm = float(np.median(relief[ys, xs]))
             asp = max(bw, bh) / max(min(bw, bh), 1)
+            blob_area = bw * bh
             if rm < 0.006 and vm < 78 and sm < 44 and len(ys) > 500:
                 return None
             if rm < 0.007 and len(ys) > 700 and asp > 1.8 and vm < 84:
+                return None
+            if blob_area < 760 and rm < 0.010 and sm < 18:
+                return None
+            if depth_m < 1.20 and sm < 16 and vm > 150 and blob_area < 1100:
                 return None
         cx, cy = float(np.median(xs)), float(np.median(ys))
         is_head = self.camera_name == "head"
@@ -1149,7 +1170,7 @@ class RgbdPureCamera:
                 return None
             pos_w = _robot_to_world(pos_r, robot_pos, robot_yaw)
             cls, cls_conf, geom_ext = self._classify_object(
-                bbox, len(ys), ys, xs, depth, sm, depth_m, use_3d=True,
+                bbox, len(ys), ys, xs, depth, sm, depth_m, use_3d=True, hue_mean=hm,
             )
             conf = float(min(0.94, 0.45 + cls_conf * 0.55))
             yaw_rel = float(np.arctan2(pos_r[1], pos_r[0]))
@@ -1175,6 +1196,7 @@ class RgbdPureCamera:
                 "nav_point_count": nav_point_count,
                 "blob_sat_mean": sm,
                 "blob_val_mean": vm,
+                "blob_hue_mean": hm,
                 "source": "rgbd_nav_head",
                 "camera": "head",
                 "role": "nav",
@@ -1184,7 +1206,7 @@ class RgbdPureCamera:
 
         use_3d = is_ee and (len(ys) >= 24 or depth_m < EE_GRASP_NEAR_M)
         cls, cls_conf, geom_ext = self._classify_object(
-            bbox, len(ys), ys, xs, depth, sm, depth_m, use_3d=use_3d,
+            bbox, len(ys), ys, xs, depth, sm, depth_m, use_3d=use_3d, hue_mean=hm,
         )
         pts = self._blob_points_robot(ys, xs, depth, depth_m)
         use_grasp_pc = pts is not None and len(pts) >= EE_GRASP_MIN_POINTS and depth_m < EE_GRASP_NEAR_M
@@ -1263,7 +1285,7 @@ class RgbdPureCamera:
         robot_yaw,
     ) -> List[dict]:
         hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
-        val, sat = hsv[:, :, 2], hsv[:, :, 1]
+        val, sat, hue = hsv[:, :, 2], hsv[:, :, 1], hsv[:, :, 0]
         near = self._scene_near(depth)
         valid = self._valid_depth(depth, near)
         ground = self._ground_depth(depth, valid)
@@ -1278,7 +1300,7 @@ class RgbdPureCamera:
             ys, xs = np.where(labeled == cid)
             det = self._blob_det(
                 ys, xs, depth, h, w, robot_pos, robot_yaw,
-                val=val, sat=sat, relief=relief,
+                val=val, sat=sat, hue=hue, relief=relief,
             )
             if det is not None:
                 dets.append(det)
@@ -1332,7 +1354,7 @@ class RgbdPureCamera:
         roi = self._roi(h, w, near=False)
         ground = self._ground_depth(depth, valid)
         relief = ground - depth
-        rmin = float(self._cfg.get("relief_min", 0.012)) * 0.42
+        rmin = float(self._cfg.get("relief_min", 0.012)) * 0.55
         hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
         hue, sat, val = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
         warm = ((hue >= 4) & (hue <= 38)) | (hue <= 10)
@@ -1356,8 +1378,9 @@ class RgbdPureCamera:
         roi[int(h * 0.05) : int(h * 0.62), int(w * 0.06) : int(w * 0.94)] = True
         ground = self._ground_depth(depth, valid)
         relief = ground - depth
-        rmin = float(self._cfg.get("relief_min", 0.012)) * 0.48
+        rmin = float(self._cfg.get("relief_min", 0.012)) * 0.62
         mask = (roi & valid & (relief >= rmin) & (relief <= RELIEF_MAX)).astype(np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
         dets = self._dets_from_mask(mask, rgb, depth, robot_pos, robot_yaw)
         for d in dets or []:
@@ -1417,6 +1440,32 @@ class RgbdPureCamera:
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
         return self._dets_from_mask(mask, rgb, depth, robot_pos, robot_yaw)
 
+    @staticmethod
+    def _prune_fallback_phantoms(dets: List[dict]) -> List[dict]:
+        kept: List[dict] = []
+        for d in dets or []:
+            if not (
+                d.get("head_depth_fallback")
+                or d.get("head_neutral_fallback")
+            ):
+                kept.append(d)
+                continue
+            bbox = d.get("bbox")
+            if not bbox or len(bbox) != 4:
+                continue
+            area = int((bbox[2] - bbox[0] + 1) * (bbox[3] - bbox[1] + 1))
+            sm = float(d.get("blob_sat_mean") or 0.0)
+            vm = float(d.get("blob_val_mean") or 0.0)
+            depth = float(d.get("depth_m") or 99.0)
+            if area < 720:
+                continue
+            if depth < 1.05 and sm < 18 and vm > 145:
+                continue
+            if depth < 0.95 and sm < 24:
+                continue
+            kept.append(d)
+        return kept
+
     def detect(self, rgb: np.ndarray, depth: np.ndarray, robot_pos, robot_yaw) -> List[dict]:
         from rgbd_utils import align_rgb_to_depth
         depth = sanitize_depth(depth)
@@ -1438,7 +1487,9 @@ class RgbdPureCamera:
                 strip_dets = self._detect_bottom_strip(rgb, depth, robot_pos, robot_yaw)
                 if strip_dets:
                     layers.extend(strip_dets)
-            if p10 < 7.0:
+            if p10 < 7.0 and not any(
+                float(o.get("depth_m") or 99.0) < 2.2 for o in layers
+            ):
                 for extra in (
                     self._detect_midfield_yellow(rgb, depth, robot_pos, robot_yaw),
                     self._detect_edge_yellow(rgb, depth, robot_pos, robot_yaw),
@@ -1449,7 +1500,7 @@ class RgbdPureCamera:
             if layers:
                 dets = self._merge_dets(layers)
 
-        dets = self._merge_dets(dets)
+        dets = self._prune_fallback_phantoms(self._merge_dets(dets))
         dets.sort(key=lambda x: x.get("depth_m") or 999.0)
         return dets
 

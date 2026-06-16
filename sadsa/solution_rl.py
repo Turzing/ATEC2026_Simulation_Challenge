@@ -2545,19 +2545,22 @@ class AlgSolution:
         if not gt_objects:
             return None
 
-        candidates = [obj for obj in gt_objects if target_class is None or obj.get("class") == target_class]
-        if not candidates:
-            candidates = gt_objects
+        def _xy_dist(obj: dict[str, Any]) -> float:
+            gt_pw = self._safe_numpy(obj.get("pos_world"), np.zeros(3, dtype=np.float32))
+            return float(np.linalg.norm(gt_pw[:2] - target_pos_np[:2]))
 
-        best = min(
-            candidates,
-            key=lambda obj: float(
-                np.linalg.norm(
-                    self._safe_numpy(obj.get("pos_world"), np.zeros(3, dtype=np.float32))[:2] - target_pos_np[:2]
-                )
-            ),
-        )
-        return best
+        best_any = min(gt_objects, key=_xy_dist)
+        any_dist = _xy_dist(best_any)
+
+        if target_class:
+            candidates = [obj for obj in gt_objects if obj.get("class") == target_class]
+            if candidates:
+                best_class = min(candidates, key=_xy_dist)
+                class_dist = _xy_dist(best_class)
+                if class_dist > 0.55 and any_dist + 0.25 < class_dist:
+                    return best_any
+                return best_class
+        return best_any
 
     def _gt_target_xy_distance(
         self,
@@ -2607,6 +2610,9 @@ class AlgSolution:
         robot_pos_world: np.ndarray,
     ) -> tuple[bool, str]:
         if not isinstance(target, dict):
+            return False, ""
+        cons_dist = self._conservative_target_dist(target, robot_pos_world)
+        if cons_dist <= 1.15:
             return False, ""
         gt_err = self._gt_perc_xy_error(target)
         if gt_err is not None and gt_err > self.grasp_gt_max_err:
@@ -2675,9 +2681,11 @@ class AlgSolution:
         gt_dist = self._gt_target_xy_distance(target_nav, robot_pos_world)
         gt_err = self._gt_perc_xy_error(target_nav)
         if gt_dist is not None:
-            if gt_dist > self.grasp_gt_max_dist:
+            if gt_dist > self.grasp_gt_max_dist and cons_dist > self.grasp_gt_max_dist:
                 return False
             if gt_err is not None and gt_err > self.grasp_gt_max_err:
+                if cons_dist <= self.grasp_start_depth:
+                    return True
                 return False
             cons_dist = max(cons_dist, gt_dist)
         return cons_dist <= self.grasp_start_depth
@@ -2845,15 +2853,27 @@ class AlgSolution:
         for candidate in candidates:
             if not isinstance(candidate, dict):
                 continue
+            cand_dist = float(
+                np.linalg.norm(
+                    self._safe_numpy(candidate.get("pos_world"), np.zeros(3, dtype=np.float32))[:2]
+                    - tracked_pos[:2]
+                )
+            )
             if tracked_class is not None and candidate.get("class") not in {None, tracked_class}:
-                continue
+                if not (
+                    lock_id is not None
+                    and candidate.get("id") is not None
+                    and int(candidate.get("id")) == int(lock_id)
+                    and cand_dist <= 0.85
+                ):
+                    continue
             if lock_id is not None and candidate.get("id") not in {None, lock_id}:
-                continue
+                if cand_dist > self.target_near_match_radius * 2.0:
+                    continue
             candidate_pos = candidate.get("pos_world")
             if candidate_pos is None:
                 continue
-            candidate_pos_np = self._safe_numpy(candidate_pos, np.zeros(3, dtype=np.float32))
-            if float(np.linalg.norm(candidate_pos_np[:2] - tracked_pos[:2])) <= self.target_near_match_radius * 2.0:
+            if cand_dist <= self.target_near_match_radius * 2.0:
                 compatible.append(candidate)
 
         if compatible:
