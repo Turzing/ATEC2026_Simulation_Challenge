@@ -152,14 +152,15 @@ class DepthClusterDetector:
             pos = pos_def.copy()
         return cam_cfg, pos.astype(np.float32), rot.astype(np.float32)
 
-    def _build_mask(self, depth: np.ndarray) -> np.ndarray:
+    def _build_mask(self, depth: np.ndarray, *, protrude_scale: float = 1.0) -> np.ndarray:
         h, w = depth.shape
         valid = (depth > DEPTH_MIN) & (depth < DEPTH_MAX) & np.isfinite(depth)
         vs = np.arange(h, dtype=np.float32)
         vv = np.meshgrid(np.arange(w), vs)[1]
         in_roi = (vv >= int(h * ROI_V_MIN)) & (vv <= int(h * ROI_V_MAX))
 
-        protrude_m = PROTRUDE_EE_M if self.camera_name == "ee" else PROTRUDE_HEAD_M
+        base = PROTRUDE_EE_M if self.camera_name == "ee" else PROTRUDE_HEAD_M
+        protrude_m = max(0.004, float(base) * float(protrude_scale))
         fill = np.where(valid, depth, np.median(depth[valid]) if np.any(valid) else 3.0).astype(np.float32)
         k = LOCAL_GROUND_K | 1
         local_ground = cv2.GaussianBlur(fill, (k, k), 0)
@@ -239,6 +240,9 @@ class DepthClusterDetector:
         depth = sanitize_depth(depth)
         mask = self._build_mask(depth)
         labeled, n = ndimage.label(mask)
+        if n == 0:
+            mask = self._build_mask(depth, protrude_scale=0.45)
+            labeled, n = ndimage.label(mask)
         if n == 0:
             return []
 

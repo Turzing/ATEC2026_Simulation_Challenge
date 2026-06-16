@@ -235,6 +235,12 @@ class AlgSolution:
         self.grasp_gt_max_dist = float(os.getenv("ATEC_TASKB_GRASP_GT_MAX_DIST", "1.05"))
         self.grasp_gt_max_err = float(os.getenv("ATEC_TASKB_GRASP_GT_MAX_ERR", "0.45"))
         self.grasp_heading_tolerance = float(os.getenv("ATEC_TASKB_GRASP_HEADING_TOL", "0.28"))
+        self.static_two_step = os.getenv("ATEC_TASKB_STATIC_TWO_STEP", "1").lower() not in {"0", "false", "no"}
+        self.coarse_approach_dist = float(os.getenv("ATEC_TASKB_COARSE_APPROACH_DIST", "1.32"))
+        self.static_perceive_settle_steps = max(3, int(os.getenv("ATEC_TASKB_STATIC_PERCEIVE_SETTLE", "8")))
+        self.static_perceive_max_steps = max(10, int(os.getenv("ATEC_TASKB_STATIC_PERCEIVE_MAX_STEPS", "30")))
+        self._static_nav_hint: dict[str, Any] | None = None
+        self._static_perceive_steps = 0
         self.bin_drop_radius = float(os.getenv("ATEC_TASKB_BIN_DROP_RADIUS", "1.0"))
         self.release_steps = max(1, int(os.getenv("ATEC_TASKB_RELEASE_STEPS", "25")))
         self.default_bin_center = np.asarray(BIN_CENTER, dtype=np.float32)
@@ -360,6 +366,8 @@ class AlgSolution:
         self._locked_target_world = None
         self._release_step_count = 0
         self._pending_grasp_status = None
+        self._static_nav_hint = None
+        self._static_perceive_steps = 0
         self._reset_sit_down_tracking()
         if self._leg_posture_controller is not None:
             self._leg_posture_controller.state = "IDLE"
@@ -812,6 +820,10 @@ class AlgSolution:
         if pos_robot_np is not None:
             out["dist_to_robot"] = self._safe_float(out.get("dist_to_robot"), float(np.linalg.norm(pos_robot_np[:2])))
             out["yaw_rel"] = self._safe_float(out.get("yaw_rel"), float(math.atan2(pos_robot_np[1], pos_robot_np[0])))
+        if source_camera == "head" or out.get("source") == "depth_cluster":
+            out.setdefault("confirmed", True)
+            out.setdefault("visible", True)
+            out.setdefault("head_stable_count", self.target_head_confirm_steps)
         return out
 
     def _collect_pipeline_objects(
@@ -862,6 +874,8 @@ class AlgSolution:
             
             # 使用相机真实位姿校正 EE 相机物体位置
             self._correct_ee_camera_objects(perception_output, gt_pos, gt_yaw)
+            if not self.static_two_step:
+                self._refresh_grasp_phase_after_correction(perception_output, gt_pos, gt_yaw)
             
         except Exception as exc:
             if not self._perception_error_printed:
@@ -1298,6 +1312,14 @@ class AlgSolution:
             stopped = True
             phase = "refine_hold"
 
+        if stopped and phase == "refine_hold":
+            stage_dist = self._grasp_stage_dist(target_nav)
+            if (
+                stage_dist <= self.grasp_start_depth + 0.10
+                and abs(heading_error) <= self.grasp_heading_tolerance
+            ):
+                phase = "ready_to_grasp"
+
         base_cmd = np.array([lin_x, lin_y, ang_z], dtype=np.float32)
         return base_cmd, {
             "phase": phase,
@@ -1356,7 +1378,7 @@ class AlgSolution:
             self._grasp_range_ok(
                 target_nav,
                 robot_pos_world,
-                self._conservative_target_dist(target_nav, robot_pos_world),
+                self._grasp_stage_dist(target_nav, robot_pos_world),
             )
             and abs(yaw_error) <= self.grasp_heading_tolerance
         ):
@@ -1404,13 +1426,13 @@ class AlgSolution:
                 )
                 self._clear_frozen_pregrasp()
 
-        cons_dist = self._conservative_target_dist(target_nav, robot_pos_world)
+        cons_dist = self._grasp_stage_dist(target_nav, robot_pos_world)
         if (
             self._locked_goal_xy is None
             and bool(target_nav.get("confirmed", False))
             and bool(target_nav.get("visible", True))
             and target_nav["dist_to_robot"] <= self.target_freeze_distance
-            and cons_dist <= self.grasp_start_depth - 0.05
+            and cons_dist <= self.grasp_start_depth + 0.05
             and target_nav.get("source_camera") == "head"
             and not bool(target_nav.get("nav_coast"))
             and int(target_nav.get("head_stable_count", 0)) >= self.target_head_confirm_steps
@@ -2680,6 +2702,83 @@ class AlgSolution:
         out["depth_m"] = out["dist_to_robot"]
         return out
 
+    def _grasp_stage_dist(
+        self,
+        target_nav: dict[str, Any] | None,
+        robot_pos_world: np.ndarray | None = None,
+    ) -> float:
+        """抓取距离: 优先 depth (FK 校正前 world XY 常偏大)."""
+        if not isinstance(target_nav, dict):
+            return float("inf")
+        parts: list[float] = []
+        for key in ("depth_m", "nav_depth_m", "dist_to_robot"):
+            v = self._safe_float(target_nav.get(key), 0.0)
+            if v > 0.05:
+                parts.append(v)
+        if target_nav.get("pose_source") == "gt_camera" and robot_pos_world is not None:
+            pw = self._safe_numpy(target_nav.get("pos_world"), np.zeros(3, dtype=np.float32))
+            if np.all(np.isfinite(pw[:2])):
+                hw = float(np.linalg.norm(pw[:2] - robot_pos_world[:2]))
+                if hw > 0.05:
+                    parts.append(hw)
+        if parts:
+            return min(parts)
+        if robot_pos_world is None:
+            robot_pos_world, _, _ = self._resolve_robot_pose_world({}, {}, None)
+        return self._conservative_target_dist(target_nav, robot_pos_world)
+
+    def _refresh_grasp_phase_after_correction(
+        self,
+        perception_output: dict[str, Any] | None,
+        robot_pos_world: np.ndarray | None,
+        robot_yaw: float | None,
+    ) -> None:
+        """FK 校正后再判 grasp 阶段 (perception.process 里 phase 用的是未校正坐标)."""
+        if not isinstance(perception_output, dict):
+            return
+        lock_id = perception_output.get("nav_lock_id")
+        if lock_id is None or robot_pos_world is None or robot_yaw is None:
+            return
+        head_objs = perception_output.get("head_objects") or []
+        if len(head_objs) < 1:
+            return
+
+        target_nav = perception_output.get("target_nav")
+        head_hit = None
+        for ho in head_objs:
+            try:
+                if int(ho.get("id", -1)) == int(lock_id):
+                    head_hit = ho
+                    break
+            except (TypeError, ValueError):
+                continue
+        if head_hit is None:
+            head_hit = min(
+                head_objs,
+                key=lambda o: self._grasp_stage_dist(o, robot_pos_world),
+            )
+        ref = target_nav if isinstance(target_nav, dict) else head_hit
+        stage_dist = self._grasp_stage_dist(ref, robot_pos_world)
+        if stage_dist > self.grasp_start_depth + 0.20:
+            return
+
+        perception_output["phase"] = "grasp"
+        perception_output["_grasp_stage"] = "grasp"
+        perception_output["grasp_reliable"] = True
+        if not perception_output.get("target_grasp"):
+            tg = dict(head_hit)
+            tg["grasp_reliable"] = True
+            if tg.get("pos_world") and not tg.get("grasp_pos_world"):
+                from config import GRASP_DEPTH_OFFSET
+
+                pw = self._safe_numpy(tg.get("pos_world"), np.zeros(3, dtype=np.float32))
+                gp = pw.copy()
+                gp[2] = float(pw[2]) - float(GRASP_DEPTH_OFFSET)
+                tg["grasp_pos_world"] = gp.tolist()
+                pr = self._world_to_robot_frame(gp, robot_pos_world, robot_yaw)
+                tg["grasp_pos_robot"] = pr.tolist()
+            perception_output["target_grasp"] = tg
+
     def _nav_lock_matches_target(
         self,
         lock_id: Any,
@@ -2699,21 +2798,21 @@ class AlgSolution:
         self,
         target_nav: dict[str, Any] | None,
         robot_pos_world: np.ndarray,
-        cons_dist: float,
+        cons_dist: float | None = None,
     ) -> bool:
         if target_nav is None:
             return False
+        stage_dist = cons_dist if cons_dist is not None else self._grasp_stage_dist(target_nav, robot_pos_world)
         gt_dist = self._gt_target_xy_distance(target_nav, robot_pos_world)
         gt_err = self._gt_perc_xy_error(target_nav)
         if gt_dist is not None:
-            if gt_dist > self.grasp_gt_max_dist and cons_dist > self.grasp_gt_max_dist:
+            if gt_dist > self.grasp_gt_max_dist and stage_dist > self.grasp_gt_max_dist:
                 return False
             if gt_err is not None and gt_err > self.grasp_gt_max_err:
-                if cons_dist <= self.grasp_start_depth:
+                if stage_dist <= self.grasp_start_depth:
                     return True
                 return False
-            cons_dist = max(cons_dist, gt_dist)
-        return cons_dist <= self.grasp_start_depth
+        return stage_dist <= self.grasp_start_depth
 
     def _maybe_print_locked_target_gt_debug(self, nav_info: dict[str, Any]) -> None:
         target = nav_info.get("target")
@@ -2821,19 +2920,25 @@ class AlgSolution:
     ) -> bool:
         if not isinstance(perception_output, dict) or target_nav is None:
             return False
-        if not self._grasp_range_ok(target_nav, robot_pos_world, cons_dist):
+        stage_dist = self._grasp_stage_dist(target_nav, robot_pos_world)
+        if not self._grasp_range_ok(target_nav, robot_pos_world, stage_dist):
             return False
         src = str(target_nav.get("source_camera") or "")
         if src in {"lock_coast"} or bool(target_nav.get("nav_coast")):
             return False
-        if str(perception_output.get("phase", "approach")) != "grasp":
+        phase = str(perception_output.get("phase", "approach"))
+        if phase != "grasp" and stage_dist > self.grasp_start_depth + 0.12:
             return False
         if perception_output.get("nav_lock_id") is None:
             return False
         head_n = len(perception_output.get("head_objects") or [])
         if head_n < 1:
             return False
-        if not perception_output.get("target_grasp") and not perception_output.get("grasp_reliable"):
+        if (
+            not perception_output.get("target_grasp")
+            and not perception_output.get("grasp_reliable")
+            and stage_dist > self.grasp_start_depth + 0.05
+        ):
             return False
         return True
 
@@ -2997,6 +3102,80 @@ class AlgSolution:
 
         return action_env
 
+        return True
+
+    def _start_crouch_for_static_approach(
+        self,
+        target_nav: dict[str, Any],
+        perception_output: dict[str, Any] | None,
+    ) -> bool:
+        """粗导航到位: 停稳后趴下，静止后再 RANSAC 精感知 (不传 grasp 目标)."""
+        robot = self._get_robot()
+        if robot is None:
+            self._log("[TaskB-STATIC] robot unavailable, skip crouch.")
+            return False
+        lock_id = perception_output.get("nav_lock_id") if isinstance(perception_output, dict) else None
+        lock_class = perception_output.get("nav_lock_class") if isinstance(perception_output, dict) else None
+        self._static_nav_hint = {
+            "id": lock_id if lock_id is not None else target_nav.get("id"),
+            "class": lock_class or target_nav.get("class"),
+            "pos_world": target_nav.get("pos_world"),
+            "pos_robot": target_nav.get("pos_robot"),
+            "depth_m": target_nav.get("depth_m"),
+        }
+        if self._leg_posture_controller is not None:
+            try:
+                self._leg_posture_controller.start_crouch(robot)
+            except Exception as exc:
+                self._log(f"[TaskB-STATIC] start_crouch failed: {exc}")
+        self._reset_sit_down_tracking()
+        self._pending_grasp_target = None
+        self._static_perceive_steps = 0
+        self._task_state = "CROUCHING"
+        stage_d = self._grasp_stage_dist(target_nav)
+        self._log(
+            "[TaskB-STATIC] coarse approach done, start crouch → static RANSAC "
+            f"lock={self._static_nav_hint.get('id')}:{self._static_nav_hint.get('class')} "
+            f"stage_dist={stage_d:.2f}m"
+        )
+        return True
+
+    def _run_static_ransac_perceive(
+        self,
+        obs: dict[str, Any],
+        robot_pos_world: np.ndarray,
+        robot_yaw: float,
+    ) -> dict[str, Any] | None:
+        """趴下静止后单帧 EE depth → RANSAC + 聚类."""
+        if not hasattr(self.perception, "process_static_grasp"):
+            self._log("[TaskB-STATIC] perception lacks process_static_grasp")
+            return None
+        gt_pose = self._get_ground_truth_robot_pose()
+        gt_pos = gt_pose[0] if gt_pose is not None else robot_pos_world
+        gt_yaw = gt_pose[1] if gt_pose is not None else robot_yaw
+        try:
+            out = self.perception.process_static_grasp(
+                obs,
+                nav_hint=self._static_nav_hint,
+                gt_robot_pos=gt_pos,
+                gt_robot_yaw=gt_yaw,
+            )
+            self._correct_ee_camera_objects(out, gt_pos, gt_yaw)
+            tg = out.get("target_grasp")
+            if isinstance(tg, dict):
+                self._log(
+                    "[TaskB-STATIC] RANSAC hit "
+                    f"id={tg.get('id')} class={tg.get('class')} "
+                    f"pos_w={np.asarray(tg.get('pos_world'), dtype=np.float32).round(3).tolist()} "
+                    f"n_ee={len(out.get('ee_objects') or [])}"
+                )
+            else:
+                self._log(f"[TaskB-STATIC] RANSAC miss (ee_n={len(out.get('ee_objects') or [])})")
+            return out
+        except Exception as exc:
+            self._log(f"[TaskB-STATIC] static perceive failed: {type(exc).__name__}: {exc}")
+            return None
+
     def _start_crouch_then_grasp(self, target_grasp: dict[str, Any] | None) -> bool:
         """到达目标后先蹲下，再开始抓取。"""
         if target_grasp is None:
@@ -3043,6 +3222,7 @@ class AlgSolution:
             self._pending_grasp_target = None
             self._clear_locked_target()
             self._log("[TaskB-GRASP] stand up complete without success, return to APPROACH_OBJECT")
+        self._static_nav_hint = None
 
     def predicts(self, obs, current_score):
         del current_score
@@ -3145,7 +3325,11 @@ class AlgSolution:
                     crouch_ready = False
 
                 if crouch_ready:
-                    if self._pending_grasp_target is not None and controller is not None:
+                    if self.static_two_step:
+                        self._task_state = "STATIC_PERCEIVE"
+                        self._static_perceive_steps = 0
+                        self._log("[TaskB-STATIC] crouch stable, enter STATIC_PERCEIVE (RANSAC)")
+                    elif self._pending_grasp_target is not None and controller is not None:
                         self._pending_grasp_target = self._refresh_grasp_target_from_perception(
                             self._pending_grasp_target,
                             perception_output,
@@ -3184,6 +3368,78 @@ class AlgSolution:
                         self._reset_sit_down_tracking()
                         self._task_state = "STAND_UP"
                         self._log("[TaskB-GRASP] arm grasp controller unavailable after crouch, standing up.")
+        elif self._task_state == "STATIC_PERCEIVE":
+            robot = self._get_robot()
+            controller = self._ensure_arm_grasp_controller()
+            action_env = self._generate_sit_down_action_tensor(obs)
+            base_cmd = np.zeros(3, dtype=np.float32)
+            nav_info = self._make_pipeline_nav_info(
+                perception_output,
+                pose_source,
+                self._static_nav_hint,
+                phase="static_perceive",
+                stopped=True,
+            )
+            self._static_perceive_steps += 1
+            if robot is None or controller is None:
+                self._log("[TaskB-STATIC] robot/controller missing, abort static perceive.")
+                self._task_state = "APPROACH_OBJECT"
+                self._static_nav_hint = None
+            elif self._static_perceive_steps >= self.static_perceive_settle_steps:
+                static_out = self._run_static_ransac_perceive(obs, robot_pos_world, robot_yaw)
+                grasp_tgt = None
+                if isinstance(static_out, dict):
+                    grasp_tgt = self._prepare_pipeline_object(
+                        static_out.get("target_grasp"),
+                        "ee",
+                        robot_pos_world,
+                        robot_yaw,
+                    )
+                if grasp_tgt is not None:
+                    grasp_tgt = self._enrich_grasp_target_with_gt(grasp_tgt)
+                    grasp_tgt = self._select_grasp_target(
+                        self._static_nav_hint,
+                        grasp_tgt,
+                        static_out,
+                        robot_pos_world,
+                        robot_yaw,
+                    ) or grasp_tgt
+                    self._pending_grasp_target = dict(grasp_tgt)
+                    try:
+                        grasp_pos_world = self._grasp_reference_world(self._pending_grasp_target)
+                        current_ee_quat_w = controller.get_ee_pose()[1]
+                        controller.start_grasp(
+                            self._pending_grasp_target,
+                            grasp_pos_world,
+                            current_ee_quat_w=current_ee_quat_w,
+                        )
+                        self._task_state = "GRASPING"
+                        self._log(
+                            "[TaskB-STATIC] static RANSAC → grasp started "
+                            f"id={self._pending_grasp_target.get('id')} "
+                            f"class={self._pending_grasp_target.get('class')}"
+                        )
+                    except Exception as exc:
+                        self._log(f"[TaskB-STATIC] start_grasp after RANSAC failed: {exc}")
+                        self._pending_grasp_status = "failed"
+                        try:
+                            self._leg_posture_controller.start_stand_up(robot)
+                        except Exception:
+                            pass
+                        self._reset_sit_down_tracking()
+                        self._task_state = "STAND_UP"
+                elif self._static_perceive_steps >= self.static_perceive_max_steps:
+                    self._log(
+                        f"[TaskB-STATIC] RANSAC timeout after {self._static_perceive_steps} steps, stand up."
+                    )
+                    self._pending_grasp_status = "failed"
+                    try:
+                        self._leg_posture_controller.start_stand_up(robot)
+                    except Exception:
+                        pass
+                    self._reset_sit_down_tracking()
+                    self._task_state = "STAND_UP"
+                    self._static_nav_hint = None
         elif self._task_state == "GRASPING":
             robot = self._get_robot()
             scene = self._get_scene()
@@ -3327,58 +3583,71 @@ class AlgSolution:
                         extra=nav_info,
                     )
                 perception_phase = None if perception_output is None else str(perception_output.get("phase", "approach"))
-                matched_grasp_target = self._select_grasp_target(
-                    target_nav,
-                    target_grasp,
-                    perception_output,
-                    robot_pos_world,
-                    robot_yaw,
+                cons_dist = self._grasp_stage_dist(target_nav, robot_pos_world)
+                dist_ok = cons_dist <= self.coarse_approach_dist if self.static_two_step else self._grasp_range_ok(
+                    target_nav, robot_pos_world, cons_dist,
                 )
-                cons_dist = self._conservative_target_dist(target_nav, robot_pos_world)
-                dist_ok = self._grasp_range_ok(target_nav, robot_pos_world, cons_dist)
                 heading_ok = abs(float(nav_info.get("heading_error") or 999.0)) <= self.grasp_heading_tolerance
                 lock_id = perception_output.get("nav_lock_id") if isinstance(perception_output, dict) else None
-                lock_match = self._nav_lock_matches_target(lock_id, matched_grasp_target)
-                grasp_ready = self._perception_grasp_ready(
-                    perception_output, target_nav, cons_dist, robot_pos_world,
-                )
-                if (
-                    matched_grasp_target is not None
-                    and lock_match
-                    and dist_ok
-                    and heading_ok
-                    and grasp_ready
-                    and nav_info.get("phase") == "ready_to_grasp"
-                ):
-                    base_cmd = np.zeros(3, dtype=np.float32)
-                    nav_info["phase"] = "start_grasp"
-                    nav_info["stopped"] = True
-                    # 改为先蹲下再抓取，与 solution_gt 对齐
-                    started = self._start_crouch_then_grasp(matched_grasp_target)
-                    if not started:
-                        # 如果无法启动蹲下流程，回退到直接抓取逻辑
-                        self._log("[TaskB-GRASP] crouch start failed, fall back to direct grasp (if available).")
-                        # 尝试直接启动抓取控制器；若都不可用则保持 approach
-                        ctrl = self._ensure_arm_grasp_controller()
-                        if ctrl is not None:
-                            try:
-                                matched_grasp_target = self._enrich_grasp_target_with_gt(matched_grasp_target)
-                                grasp_pos_world = self._grasp_reference_world(matched_grasp_target)
-                                current_ee_quat_w = ctrl.get_ee_pose()[1]
-                                ctrl.start_grasp(matched_grasp_target, grasp_pos_world, current_ee_quat_w=current_ee_quat_w)
-                                self._pending_grasp_target = dict(matched_grasp_target)
-                                # 无 sit-down actor 时直接进入 GRASPING 阶段
-                                self._task_state = "GRASPING"
-                                self._log("[TaskB-GRASP] direct grasp started (no sit-down).")
-                            except Exception as exc:
-                                self._log(f"[TaskB-GRASP] direct grasp also failed: {exc}")
+                if self.static_two_step:
+                    approach_ready = (
+                        target_nav is not None
+                        and lock_id is not None
+                        and dist_ok
+                        and heading_ok
+                        and bool(nav_info.get("stopped"))
+                        and str(nav_info.get("phase", "")) in ("ready_to_grasp", "refine_hold")
+                    )
+                    if approach_ready:
+                        base_cmd = np.zeros(3, dtype=np.float32)
+                        nav_info["phase"] = "start_static_crouch"
+                        nav_info["stopped"] = True
+                        self._start_crouch_for_static_approach(target_nav, perception_output)
+                else:
+                    matched_grasp_target = self._select_grasp_target(
+                        target_nav,
+                        target_grasp,
+                        perception_output,
+                        robot_pos_world,
+                        robot_yaw,
+                    )
+                    lock_match = self._nav_lock_matches_target(lock_id, matched_grasp_target)
+                    grasp_ready = self._perception_grasp_ready(
+                        perception_output, target_nav, cons_dist, robot_pos_world,
+                    )
+                    if (
+                        matched_grasp_target is not None
+                        and lock_match
+                        and dist_ok
+                        and heading_ok
+                        and grasp_ready
+                        and nav_info.get("phase") == "ready_to_grasp"
+                    ):
+                        base_cmd = np.zeros(3, dtype=np.float32)
+                        nav_info["phase"] = "start_grasp"
+                        nav_info["stopped"] = True
+                        started = self._start_crouch_then_grasp(matched_grasp_target)
+                        if not started:
+                            self._log("[TaskB-GRASP] crouch start failed, fall back to direct grasp (if available).")
+                            ctrl = self._ensure_arm_grasp_controller()
+                            if ctrl is not None:
+                                try:
+                                    matched_grasp_target = self._enrich_grasp_target_with_gt(matched_grasp_target)
+                                    grasp_pos_world = self._grasp_reference_world(matched_grasp_target)
+                                    current_ee_quat_w = ctrl.get_ee_pose()[1]
+                                    ctrl.start_grasp(matched_grasp_target, grasp_pos_world, current_ee_quat_w=current_ee_quat_w)
+                                    self._pending_grasp_target = dict(matched_grasp_target)
+                                    self._task_state = "GRASPING"
+                                    self._log("[TaskB-GRASP] direct grasp started (no sit-down).")
+                                except Exception as exc:
+                                    self._log(f"[TaskB-GRASP] direct grasp also failed: {exc}")
+                                    self._task_state = "APPROACH_OBJECT"
+                                    self._pending_grasp_target = None
+                                    self._clear_locked_target()
+                            else:
                                 self._task_state = "APPROACH_OBJECT"
                                 self._pending_grasp_target = None
                                 self._clear_locked_target()
-                        else:
-                            self._task_state = "APPROACH_OBJECT"
-                            self._pending_grasp_target = None
-                            self._clear_locked_target()
             else:
                 base_cmd = self._compute_search_cmd(perception_output)
                 search_phase = "search"

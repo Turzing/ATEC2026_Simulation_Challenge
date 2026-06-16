@@ -16,6 +16,8 @@ import numpy as np
 
 # 默认: 纯 depth 聚类 (ATEC_RGBD_SIMPLE=0 才走旧 fusion 管线)
 RGBD_SIMPLE = os.getenv("ATEC_RGBD_SIMPLE", "1").strip().lower() not in ("0", "false", "no")
+# 两步走: 粗导航(head depth) → 停稳趴下 → 静态 EE RANSAC 抓取
+STATIC_TWO_STEP = os.getenv("ATEC_TASKB_STATIC_TWO_STEP", "1").strip().lower() not in ("0", "false", "no")
 
 from config import (
     BBOX_LATERAL_TOL,

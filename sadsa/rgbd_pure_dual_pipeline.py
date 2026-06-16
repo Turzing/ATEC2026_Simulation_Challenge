@@ -46,6 +46,7 @@ try:
         GRASP_RELIABLE_DEPTH_M,
         MIN_NAV_POS_CONF,
         RGBD_SIMPLE,
+        STATIC_TWO_STEP,
         _is_head_fallback_det,
         _to_numpy,
         bbox_lateral_consistent,
@@ -97,6 +98,12 @@ except ImportError:
         world_to_robot_frame,
     )
     RGBD_SIMPLE = os.getenv("ATEC_RGBD_SIMPLE", "1").strip().lower() not in ("0", "false", "no")
+    STATIC_TWO_STEP = os.getenv("ATEC_TASKB_STATIC_TWO_STEP", "1").strip().lower() not in ("0", "false", "no")
+
+try:
+    from depth_ransac_cluster import RansacClusterDetector
+except ImportError:
+    RansacClusterDetector = None  # type: ignore[misc, assignment]
 
 GRASP_PHASE_DIST_M = 1.10
 GRASP_APPROACH_DIST_M = 1.22   # head/lock 近距即请求 grasp 阶段
@@ -143,6 +150,15 @@ def _nav_dist_conservative(obj: Optional[dict]) -> float:
     return d_depth
 
 
+def _stage_dist(obj: Optional[dict]) -> float:
+    """阶段切换/抓取门控: depth-cluster 只用 depth (静态外参 world XY 常偏 1m+)."""
+    if not obj:
+        return 999.0
+    if RGBD_SIMPLE or obj.get("source") == "depth_cluster":
+        return _obj_dist(obj)
+    return _nav_dist_conservative(obj)
+
+
 def _synthesize_grasp_from_head(obj: dict, robot_pos, robot_yaw, arm_q) -> dict:
     """近距无 EE grasp 时, 直接沿用 head 3D 点生成 grasp (不再走 EE 外参重投影)."""
     from config import GRASP_DEPTH_OFFSET
@@ -166,8 +182,8 @@ def _synthesize_grasp_from_head(obj: dict, robot_pos, robot_yaw, arm_q) -> dict:
 
 
 def _close_dist(obj: Optional[dict]) -> float:
-    """grasp 门控用保守距离: depth 与 dist 取较大值, 防假近 depth 提前蹲下."""
-    return _nav_dist_conservative(obj)
+    """grasp 门控距离; simple 模式 trust depth."""
+    return _stage_dist(obj)
 
 
 def _motion_level(obs) -> float:
@@ -623,12 +639,21 @@ def _same_nav_target(a: Optional[dict], b: Optional[dict], radius: float = TARGE
     return _world_xy_dist(a, b) < radius * 0.75
 
 
-def _strict_lock_match(a: Optional[dict], b: Optional[dict]) -> bool:
+def _strict_lock_match(
+    a: Optional[dict],
+    b: Optional[dict],
+    *,
+    id_only: bool = False,
+) -> bool:
     if a is None or b is None:
+        return False
+    aid, bid = a.get("id"), b.get("id")
+    if aid is not None and bid is not None and int(aid) == int(bid):
+        return True
+    if id_only:
         return False
     if a.get("class") and b.get("class") and a.get("class") != b.get("class"):
         return False
-    aid, bid = a.get("id"), b.get("id")
     if aid is not None and bid is not None:
         return int(aid) == int(bid)
     return _same_nav_target(a, b, radius=TARGET_MATCH_RADIUS * 0.65)
@@ -669,7 +694,7 @@ def _find_in_pool(
 ) -> Optional[dict]:
     if lock_id is not None:
         cands = [o for o in pool if int(o.get("id", -1)) == int(lock_id)]
-        if lock_class:
+        if lock_class and not RGBD_SIMPLE:
             cands = [o for o in cands if o.get("class") == lock_class]
         if cands:
             if lock_world is not None:
@@ -754,6 +779,8 @@ def _head_confirms_lock(
 ) -> bool:
     if lock_id is None or not head_objs:
         return False
+    if RGBD_SIMPLE:
+        return _find_in_pool_by_id(head_objs, lock_id) is not None
     return _find_in_pool(head_objs, lock_id, lock_class, None) is not None
 
 
@@ -761,6 +788,15 @@ def _can_acquire_nav_lock(seed: Optional[dict], head_objs: List[dict]) -> bool:
     """必须 head 确认才首锁 (log: ee-only / 同类远距 head → 错锁转圈)."""
     if seed is None or not head_objs:
         return False
+    if RGBD_SIMPLE:
+        sid = seed.get("id")
+        if sid is not None and _find_in_pool_by_id(head_objs, sid) is not None:
+            return True
+        if _is_head_sourced(seed):
+            return True
+        if seed.get("class"):
+            return any(o.get("class") == seed.get("class") for o in head_objs)
+        return True
     if _head_confirms_lock(head_objs, seed.get("id"), seed.get("class")):
         ho = _find_in_pool(head_objs, seed.get("id"), seed.get("class"), None)
         if ho is not None and seed.get("pos_world") and ho.get("pos_world"):
@@ -1230,9 +1266,16 @@ class RgbdPureDualPipeline:
         self._nav_lock_ee_only_frames = 0
         self._last_ee_motion: List[dict] = []
         self._last_head_objs: List[dict] = []
-        mode = "depth-cluster" if RGBD_SIMPLE else "legacy-fusion"
+        self._ransac = RansacClusterDetector() if RansacClusterDetector is not None else None
+        if STATIC_TWO_STEP:
+            mode = "two-step: head-coarse-nav → static-ee-ransac"
+        elif RGBD_SIMPLE:
+            mode = "depth-cluster"
+        else:
+            mode = "legacy-fusion"
         print(
-            f"[RgbdPureDual] {mode} | head-nav | ee-grasp | "
+            f"[RgbdPureDual] {mode} | head-nav | "
+            f"ee={'static-ransac' if STATIC_TWO_STEP else 'grasp'} | "
             f"coast={'off' if RGBD_SIMPLE else str(DETECTION_COAST_FRAMES) + 'f'}"
         )
 
@@ -1354,10 +1397,11 @@ class RgbdPureDualPipeline:
         ee_objs: List[dict] = []
         ee_meta: dict = {}
         ee_stats: dict = {}
-        e_rgb, e_depth = parse_ee_rgbd(obs)
-        if e_rgb is not None and e_depth is not None:
-            ee_objs, _, ee_meta = self.ee.process_frame(e_rgb, e_depth, rp, ry)
-            ee_stats = ee_meta.get("depth_stats") or depth_stats(e_depth)
+        if not STATIC_TWO_STEP:
+            e_rgb, e_depth = parse_ee_rgbd(obs)
+            if e_rgb is not None and e_depth is not None:
+                ee_objs, _, ee_meta = self.ee.process_frame(e_rgb, e_depth, rp, ry)
+                ee_stats = ee_meta.get("depth_stats") or depth_stats(e_depth)
 
         head_objs = [_as_head_nav(o) for o in head_objs]
         if not RGBD_SIMPLE:
@@ -1465,7 +1509,7 @@ class RgbdPureDualPipeline:
                 self._nav_lock_ee_only = True
                 self._nav_lock_ee_only_frames = 0
 
-        nav_dist = _nav_dist_conservative(locked or head_nav or ee_nav)
+        nav_dist = _stage_dist(locked or head_nav or ee_nav)
         lock_ref_obj = locked or head_nav or ee_nav
         close_d = min(
             _close_dist(locked),
@@ -1473,7 +1517,9 @@ class RgbdPureDualPipeline:
             _close_dist(ee_grasp),
             _close_dist(ee_nav),
         )
-        ee_grasp_nav = ee_grasp if _strict_lock_match(ee_grasp, lock_ref_obj) else None
+        ee_grasp_nav = ee_grasp if _strict_lock_match(
+            ee_grasp, lock_ref_obj, id_only=RGBD_SIMPLE,
+        ) else None
         ee_grasp_ok = ee_grasp_nav is not None and bool(ee_grasp_nav.get("grasp_reliable"))
         head_lock_hit = _resolve_live_lock_hit(
             head_objs, ee_objs,
@@ -1484,9 +1530,9 @@ class RgbdPureDualPipeline:
             and _head_confirms_lock(
                 head_objs, head_lock_hit.get("id"), head_lock_hit.get("class"),
             )
-            and _nav_dist_conservative(head_lock_hit) < GRASP_APPROACH_DIST_M
+            and _stage_dist(head_lock_hit) < GRASP_APPROACH_DIST_M
         )
-        lock_dist = _nav_dist_conservative(locked or lock_ref_obj)
+        lock_dist = _stage_dist(locked or lock_ref_obj)
         want_grasp = (
             self._nav_lock_id is not None
             and head_close
@@ -1494,14 +1540,22 @@ class RgbdPureDualPipeline:
             and lock_dist < GRASP_APPROACH_DIST_M + 0.08
             and lock_ref_obj is not None
             and _strict_lock_match(
-                lock_ref_obj, {"id": self._nav_lock_id, "class": self._nav_lock_class},
+                lock_ref_obj,
+                {"id": self._nav_lock_id, "class": self._nav_lock_class},
+                id_only=RGBD_SIMPLE,
             )
             and self._nav_lock_miss == 0
         )
+        if STATIC_TWO_STEP:
+            want_grasp = False
 
         nav_stage = _resolve_nav_stage(nav_dist, want_grasp, self._nav_stage)
         self._nav_stage = nav_stage
         phase = "grasp" if nav_stage == "grasp" else "approach"
+        if STATIC_TWO_STEP:
+            phase = "approach"
+            nav_stage = "near_head" if nav_dist < NAV_EE_TO_HEAD_M else "far_ee"
+            self._nav_stage = nav_stage
 
         auth_tgt, auth_cam, auth_mode = _resolve_authoritative_target(
             nav_stage, head_objs, ee_objs, head_nav, ee_nav,
@@ -1511,7 +1565,10 @@ class RgbdPureDualPipeline:
             if int(auth_tgt.get("id", -1)) != int(self._nav_lock_id):
                 auth_tgt = None
             elif self._nav_lock_class and auth_tgt.get("class") != self._nav_lock_class:
-                auth_tgt = None
+                if RGBD_SIMPLE and auth_tgt.get("class"):
+                    self._nav_lock_class = auth_tgt.get("class")
+                else:
+                    auth_tgt = None
 
         if auth_tgt is not None:
             nav_dist = _nav_dist_conservative(auth_tgt)
@@ -1577,6 +1634,8 @@ class RgbdPureDualPipeline:
         if want_grasp and nav_stage == "grasp" and grasp_tgt is None and head_lock_hit is not None:
             grasp_tgt = _synthesize_grasp_from_head(head_lock_hit, rp, ry, arm_q)
         elif not want_grasp:
+            grasp_tgt = None
+        if STATIC_TWO_STEP:
             grasp_tgt = None
 
         if nav_stage == "grasp" and ee_near < HEAD_DISABLE_DIST_M:
@@ -1698,6 +1757,77 @@ class RgbdPureDualPipeline:
             },
             "gripper": {"is_holding": False, "width": 0.04},
             "progress": {"total": TOTAL_OBJECTS, "inside_bin": 0, "remaining": TOTAL_OBJECTS},
+            "robot": {"pos_world": self.robot_pos.tolist(), "yaw": self.robot_yaw},
+        }
+
+    def process_static_grasp(
+        self,
+        obs,
+        nav_hint: Optional[dict] = None,
+        gt_robot_pos=None,
+        gt_robot_yaw=None,
+    ) -> dict:
+        """停稳/趴下后: EE depth → RANSAC 剔桌 → 欧氏聚类 (完全忽略 RGB)."""
+        if gt_robot_pos is not None and gt_robot_yaw is not None:
+            self.robot_pos = np.asarray(gt_robot_pos, dtype=np.float32).copy()
+            self.robot_yaw = float(gt_robot_yaw)
+        rp, ry = self.robot_pos, self.robot_yaw
+        arm_q = _read_arm_joints(obs)
+        if self._ransac is None:
+            raise ImportError(
+                "静态 RANSAC 感知需要 depth_ransac_cluster.py，请与 rgbd_utils.py 一起同步"
+            )
+        self._ransac.set_arm_joints(arm_q)
+        _, e_depth = parse_ee_rgbd(obs)
+        ee_objs_raw: List[dict] = []
+        ee_stats: dict = {}
+        if e_depth is not None:
+            ee_stats = depth_stats(e_depth)
+            raw = self._ransac.detect(e_depth, rp, ry, nav_hint=nav_hint)
+            ee_objs_raw = [_finalize_ee(o, rp, ry, arm_q) for o in raw]
+            ee_objs_raw = filter_plausible_objects(ee_objs_raw, "ee")
+
+        grasp_tgt = ee_objs_raw[0] if ee_objs_raw else None
+        if grasp_tgt is not None and nav_hint is not None:
+            hint_cls = nav_hint.get("class")
+            if hint_cls:
+                same = [o for o in ee_objs_raw if o.get("class") == hint_cls]
+                if same:
+                    grasp_tgt = same[0]
+
+        ee_list = [_object_summary(o, "ee") for o in ee_objs_raw]
+        return {
+            "mode": "static_grasp",
+            "roles": {"ee": "static_ransac_grasp", "head": "idle"},
+            "nav_stage": "grasp",
+            "nav_authority": "ee",
+            "nav_authority_mode": "static",
+            "nav_lock_id": nav_hint.get("id") if nav_hint else None,
+            "nav_lock_class": nav_hint.get("class") if nav_hint else None,
+            "nav_lock_ee_only": False,
+            "nav_lock_stable": grasp_tgt is not None,
+            "navigation": {"camera": "ee", "target": grasp_tgt, "objects_detailed": ee_objs_raw},
+            "target_nav": nav_hint,
+            "objects_nav": ee_objs_raw,
+            "ee_objects": ee_objs_raw,
+            "ee_objects_list": ee_list,
+            "grasp": {"camera": "ee", "target": grasp_tgt, "objects_detailed": ee_objs_raw},
+            "target_grasp": grasp_tgt,
+            "objects_grasp": ee_objs_raw,
+            "head_objects": [],
+            "head_objects_list": [],
+            "target": grasp_tgt,
+            "objects_remaining": ee_list,
+            "active_camera": "ee",
+            "phase": "grasp",
+            "grasp_reliable": grasp_tgt is not None,
+            "grasp_locked": False,
+            "head_dist_m": None,
+            "ee_dist_m": _obj_dist(grasp_tgt),
+            "head_count_raw": 0,
+            "ee_count_raw": len(ee_objs_raw),
+            "static_perceive": True,
+            "ee_depth_stats": ee_stats,
             "robot": {"pos_world": self.robot_pos.tolist(), "yaw": self.robot_yaw},
         }
 
