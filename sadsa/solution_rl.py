@@ -1792,6 +1792,38 @@ class AlgSolution:
         merged["objects_remaining"] = list(nav_input.get("objects_remaining") or [])
         return merged
 
+    def _build_target_from_perception_nav(
+        self,
+        perception_output: dict[str, Any],
+        robot_pos_world: np.ndarray,
+        robot_yaw: float,
+    ) -> dict[str, Any] | None:
+        nav_lock_id = perception_output.get("nav_lock_id")
+        raw_nav = perception_output.get("target_nav")
+        if nav_lock_id is None or not isinstance(raw_nav, dict):
+            return None
+        if raw_nav.get("pos_world") is None:
+            return None
+        lock_class = perception_output.get("nav_lock_class")
+        if lock_class and raw_nav.get("class") not in {None, lock_class}:
+            return None
+        nav_cam = str(raw_nav.get("source_camera") or "head")
+        if nav_cam == "lock_coast":
+            nav_cam = "head"
+        seeded = self._prepare_pipeline_object(raw_nav, nav_cam, robot_pos_world, robot_yaw)
+        if seeded is None:
+            return None
+        seeded["confirmed"] = True
+        seeded["visible"] = not bool(raw_nav.get("nav_coast")) and not bool(raw_nav.get("pos_jump_rejected"))
+        track_id = int(nav_lock_id)
+        if self._tracked_target is not None and int(self._tracked_target.get("id", -99)) == track_id:
+            self._tracked_target = self._update_tracking_state_from_candidate(self._tracked_target, seeded)
+        else:
+            self._tracked_target = self._make_tracking_state(seeded, stable_count=self.target_confirm_steps)
+            self._pending_target = None
+        self._target_lost_count = 0
+        return self._build_tracked_nav_target(self._tracked_target, robot_pos_world, robot_yaw)
+
     def _adapt_perception_output(
         self,
         obs: dict[str, Any],
@@ -1814,31 +1846,29 @@ class AlgSolution:
         preferred_candidates = self._normalize_camera_objects(preferred_raw, preferred_camera, robot_pos_world, robot_yaw)
         fallback_candidates = self._normalize_camera_objects(fallback_raw, fallback_camera, robot_pos_world, robot_yaw)
 
-        target = self._update_visual_target_tracking(
-            preferred_candidates,
-            fallback_candidates,
-            preferred_camera,
-            robot_pos_world,
-            robot_yaw,
-        )
-        if target is None:
-            raw_nav = perception_output.get("target_nav")
-            nav_lock_id = perception_output.get("nav_lock_id")
-            if (
-                isinstance(raw_nav, dict)
-                and raw_nav.get("pos_world") is not None
-                and nav_lock_id is not None
-                and not raw_nav.get("pos_jump_rejected")
-            ):
-                nav_cam = str(raw_nav.get("source_camera") or preferred_camera)
-                seeded = self._prepare_pipeline_object(raw_nav, nav_cam, robot_pos_world, robot_yaw)
-                has_head = bool(preferred_candidates) if preferred_camera == "head" else bool(fallback_candidates)
-                if (
-                    seeded is not None
-                    and self._tracking_candidate_allowed(seeded, has_head_candidates=has_head)
-                ):
-                    target = seeded
-                    target["confirmed"] = True
+        nav_lock_id = perception_output.get("nav_lock_id")
+        if nav_lock_id is not None:
+            target = self._build_target_from_perception_nav(perception_output, robot_pos_world, robot_yaw)
+        else:
+            target = self._update_visual_target_tracking(
+                preferred_candidates,
+                fallback_candidates,
+                preferred_camera,
+                robot_pos_world,
+                robot_yaw,
+            )
+            if target is None:
+                raw_nav = perception_output.get("target_nav")
+                if isinstance(raw_nav, dict) and raw_nav.get("pos_world") is not None and not raw_nav.get("pos_jump_rejected"):
+                    nav_cam = str(raw_nav.get("source_camera") or preferred_camera)
+                    seeded = self._prepare_pipeline_object(raw_nav, nav_cam, robot_pos_world, robot_yaw)
+                    has_head = bool(preferred_candidates) if preferred_camera == "head" else bool(fallback_candidates)
+                    if (
+                        seeded is not None
+                        and self._tracking_candidate_allowed(seeded, has_head_candidates=has_head)
+                    ):
+                        target = seeded
+                        target["confirmed"] = True
 
         bin_info = perception_output.get("bin") or {}
         bin_center = self._safe_numpy(bin_info.get("center_world"), self.default_bin_center)
@@ -2586,9 +2616,20 @@ class AlgSolution:
         if self._step_count <= self.stand_still_steps:
             nav_info["phase"] = "stand"
             if target_nav is not None:
-                _, nav_info = self._compute_nav_cmd_from_target_nav(target_nav)
-                nav_info["phase"] = "stand"
-                nav_info["stopped"] = True
+                base_cmd, nav_info = self._compute_nav_cmd_from_target_nav(target_nav)
+                heading_err = abs(float(nav_info.get("heading_error") or 0.0))
+                target_dist = float(nav_info.get("target_dist") or 0.0)
+                allow_move = (
+                    self._step_count > max(8, self.stand_still_steps // 3)
+                    and (heading_err > 0.20 or target_dist > 2.0)
+                )
+                if allow_move:
+                    nav_info["phase"] = str(nav_info.get("phase", "far_approach"))
+                    nav_info["stopped"] = bool(nav_info.get("stopped", False))
+                else:
+                    base_cmd = np.zeros(3, dtype=np.float32)
+                    nav_info["phase"] = "stand"
+                    nav_info["stopped"] = True
             elif self._step_count > max(8, self.stand_still_steps // 4):
                 base_cmd = np.array([0.0, 0.0, self.search_yaw_rate], dtype=np.float32)
                 nav_info["phase"] = "search"
