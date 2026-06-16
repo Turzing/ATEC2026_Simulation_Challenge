@@ -3693,7 +3693,7 @@ class AlgSolution:
             else:
                 base_cmd = self._compute_search_cmd(perception_output)
                 search_phase = "search"
-                if perception_output.get("nav_lock_id") is not None:
+                if isinstance(perception_output, dict) and perception_output.get("nav_lock_id") is not None:
                     search_phase = "search_coast"
                 elif self._fuse_lock_key is not None:
                     search_phase = "searching_lost_target"
