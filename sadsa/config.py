@@ -213,6 +213,13 @@ DEFAULT_GRASP_FIXED_QUAT = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
 # 抓取深度: 从物体顶面向下偏移量 (m), 确保夹爪啮合物体
 GRASP_DEPTH_OFFSET = 0.03
 
+# IK 末端为 gripper_base，指尖沿夹爪 local +Z 延伸 (~12cm，与 solution_gt ATEC_TASKB_FINGER_OFFSET 默认一致)
+# 感知先算指尖接触点，再回退为传给 start_grasp 的 trash_pos_w（DISABLE_FINGER_COMP=1 时 motion 不再补偿）
+GRIPPER_TIP_OFFSET_M = 0.12
+GRIPPER_TIP_OFFSET_ENABLE = True
+# solution_gt.start_grasp 会对 trash_pos_w 再 +world Z 此值，感知预扣以免双重抬高
+MOTION_GRASP_HEIGHT_OFFSET = 0.03
+
 # =============================================================================
 # 夹爪参数 (用于 is_holding 判定)
 # =============================================================================

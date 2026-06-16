@@ -1,15 +1,16 @@
 """
-RGB-D 双摄像头感知
+RGB-D 双摄像头感知 — 三段式 + 优先权
 
-分工 (固定):
-    ee   → 导航 + 抓取  (nav_depth_m / nav_yaw_rel / grasp_pos_world)
-    head → 仅导航       (无 grasp 字段)
+阶段 (距离迟滞):
+    far_ee   (>= ~1.35m) → EE 主导导航
+    near_head(< ~1.28m)  → head 主导导航
+    grasp    (< 1.10m)    → EE 独占抓取 (每帧重算)
 
-精度 (无 GT):
-    - rgb/depth 对齐, 修 blob broadcast 崩溃
-    - head/EE 动态外参 (倾身/臂关节)
-    - 近距冻结 EE grasp (蹲下不漂)
-    - head 近距/蹲下禁用, 本体假检过滤
+优先权 (非平权):
+    NAV_AUTHORITY: 每阶段唯一主导相机
+    NAV_FALLBACK:  仅 primary 丢失时降级
+    nav_lock_id:   全程锁定同一目标，防 EE/head 抢目标
+    ee_objects:    每帧只导出 1 条 (给 solution_rl)
 """
 
 from __future__ import annotations
@@ -52,11 +53,19 @@ GRASP_PHASE_DIST_M = 1.10
 GRASP_LOCK_DIST_M = 1.22
 GRASP_UNLOCK_DIST_M = 1.50
 HEAD_DISABLE_DIST_M = 1.05
-EE_NAV_PREFER_DIST_M = 1.35
+NAV_EE_FAR_MIN_M = 1.35          # >= 远距 EE 导航
+NAV_EE_TO_HEAD_M = 1.28          # 迟滞: 远→近
+NAV_HEAD_TO_EE_M = 1.42          # 迟滞: 近→远
+NAV_LOCK_MISS_MAX = 18           # 丢失多少帧后解锁重选
+TARGET_MATCH_RADIUS = 0.55       # 判定同一导航目标
 HEAD_MIRROR_EE_MIN_M = 0.85
 TEMPORAL_MEDIAN_N = 6
 GRASP_TEMPORAL_N = 10
 MOTION_FREEZE_THRESH = 0.35
+
+# 各阶段唯一主导相机 (非平权); 仅 primary 不可用时走 fallback
+NAV_AUTHORITY = {"far_ee": "ee", "near_head": "head", "grasp": "ee"}
+NAV_FALLBACK = {"far_ee": "head", "near_head": "ee", "grasp": None}
 
 
 def _obj_dist(obj: Optional[dict]) -> float:
@@ -264,9 +273,16 @@ def _nav_quality(obj: dict) -> float:
     return q
 
 
-def _best_nav_target(objs: List[dict]) -> Optional[dict]:
+def _best_nav_target(
+    objs: List[dict],
+    lock_id: Optional[int] = None,
+    lock_class: Optional[str] = None,
+) -> Optional[dict]:
     if not objs:
         return None
+    locked = _find_in_pool(objs, lock_id, lock_class)
+    if locked is not None:
+        return _enrich_nav(locked)
     ranked = sorted(objs, key=_obj_dist)
     best = ranked[0]
     bd, bq = _obj_dist(best), _nav_quality(best)
@@ -287,35 +303,146 @@ def _grasp_quality(obj: dict) -> float:
     return q
 
 
-def _best_ee_grasp(objs: List[dict]) -> Optional[dict]:
+def _best_ee_grasp(
+    objs: List[dict],
+    ref: Optional[dict] = None,
+) -> Optional[dict]:
     if not objs:
         return None
+    if ref is not None:
+        locked = _find_in_pool(objs, ref.get("id"), ref.get("class"))
+        if locked is not None:
+            return locked
     pool = [o for o in objs if o.get("grasp_reliable")] or objs
     scored = [(_grasp_quality(o), _obj_dist(o), o) for o in pool]
     scored.sort(key=lambda x: (-x[0], x[1]))
     return scored[0][2]
 
 
-def _pick_nav_target(
-    ee_tgt: Optional[dict],
-    head_tgt: Optional[dict],
-    ee_objs: List[dict],
+def _world_xy_dist(a: dict, b: dict) -> float:
+    pa, pb = a.get("pos_world"), b.get("pos_world")
+    if pa is None or pb is None:
+        return 999.0
+    try:
+        ax, ay = float(pa[0]), float(pa[1])
+        bx, by = float(pb[0]), float(pb[1])
+    except (TypeError, ValueError, IndexError):
+        return 999.0
+    return float(np.hypot(ax - bx, ay - by))
+
+
+def _same_nav_target(a: Optional[dict], b: Optional[dict], radius: float = TARGET_MATCH_RADIUS) -> bool:
+    if a is None or b is None:
+        return False
+    aid, bid = a.get("id"), b.get("id")
+    if aid is not None and bid is not None and int(aid) == int(bid):
+        return True
+    if a.get("class") and a.get("class") == b.get("class"):
+        return _world_xy_dist(a, b) < radius
+    return _world_xy_dist(a, b) < radius * 0.75
+
+
+def _find_in_pool(
+    pool: List[dict],
+    lock_id: Optional[int],
+    lock_class: Optional[str],
+) -> Optional[dict]:
+    if lock_id is not None:
+        for o in pool:
+            if int(o.get("id", -1)) == int(lock_id):
+                return o
+    if lock_class:
+        cands = [o for o in pool if o.get("class") == lock_class]
+        if cands:
+            return min(cands, key=_obj_dist)
+    return None
+
+
+def _find_locked_target(
     head_objs: List[dict],
-    ee_near: float,
+    ee_objs: List[dict],
+    lock_id: Optional[int],
+    lock_class: Optional[str],
+) -> Optional[dict]:
+    return _find_in_pool(head_objs, lock_id, lock_class) or _find_in_pool(ee_objs, lock_id, lock_class)
+
+
+def _acquire_nav_lock(
+    head_nav: Optional[dict],
+    ee_nav: Optional[dict],
+    head_d: float,
+    ee_d: float,
+) -> Optional[dict]:
+    """无锁时单次只选一个目标，近距优先 head."""
+    if head_nav and head_d < NAV_EE_TO_HEAD_M:
+        return head_nav
+    if ee_nav and (not head_nav or ee_d <= head_d + 0.20):
+        return ee_nav
+    return head_nav or ee_nav
+
+
+def _resolve_nav_stage(nav_dist: float, want_grasp: bool, prev: str) -> str:
+    if want_grasp:
+        return "grasp"
+    stage = prev if prev in ("far_ee", "near_head") else "far_ee"
+    if stage == "far_ee":
+        if nav_dist < NAV_EE_TO_HEAD_M:
+            stage = "near_head"
+    else:
+        if nav_dist > NAV_HEAD_TO_EE_M:
+            stage = "far_ee"
+    return stage
+
+
+def _resolve_authoritative_target(
+    nav_stage: str,
+    head_objs: List[dict],
+    ee_objs: List[dict],
+    head_nav: Optional[dict],
+    ee_nav: Optional[dict],
+    lock_id: Optional[int],
+    lock_class: Optional[str],
+) -> Tuple[Optional[dict], str, str]:
+    """
+    按阶段唯一主导相机选目标; primary 缺失才降级 fallback，二者不同时生效。
+    返回 (target, authority_camera, mode)  mode=primary|fallback|none
+    """
+    primary = NAV_AUTHORITY[nav_stage]
+    fallback = NAV_FALLBACK[nav_stage]
+    pools = {"head": head_objs, "ee": ee_objs}
+    navs = {"head": head_nav, "ee": ee_nav}
+
+    tgt = _find_in_pool(pools[primary], lock_id, lock_class)
+    if tgt is None:
+        tgt = navs[primary]
+    if tgt is not None:
+        return tgt, primary, "primary"
+
+    if fallback:
+        fb = _find_in_pool(pools[fallback], lock_id, lock_class)
+        if fb is None:
+            fb = navs[fallback]
+        if fb is not None:
+            return fb, fallback, "fallback"
+
+    return None, primary, "none"
+
+
+def _navigation_for_stage(
+    nav_stage: str,
+    auth_tgt: Optional[dict],
+    auth_cam: str,
+    ee_motion: List[dict],
+    ee_raw: List[dict],
+    head_objs: List[dict],
+    grasp_tgt: Optional[dict],
 ) -> Tuple[str, List[dict], Optional[dict]]:
-    if ee_near < EE_NAV_PREFER_DIST_M and ee_tgt:
-        return "ee", ee_objs, ee_tgt
-    if head_tgt and (not ee_tgt or _obj_dist(head_tgt) + 0.15 < _obj_dist(ee_tgt)):
-        return "head", head_objs, head_tgt
-    if ee_tgt and not head_tgt:
-        return "ee", ee_objs, ee_tgt
-    if head_tgt and not ee_tgt:
-        return "head", head_objs, head_tgt
-    if not ee_tgt and not head_tgt:
-        return "ee", ee_objs, None
-    if _nav_quality(head_tgt) > _nav_quality(ee_tgt) + 8.0:
-        return "head", head_objs, head_tgt
-    return "ee", ee_objs, ee_tgt
+    if nav_stage == "grasp":
+        objs = ee_raw if grasp_tgt else ee_motion
+        return "ee", objs, grasp_tgt or auth_tgt
+    if auth_cam == "head":
+        return "head", head_objs, auth_tgt
+    return "ee", ee_motion, auth_tgt
 
 
 def _is_far_ee_nav_unreliable(obj: dict) -> bool:
@@ -339,60 +466,29 @@ def _is_far_ee_nav_unreliable(obj: dict) -> bool:
     return False
 
 
-def _export_ee_for_motion(
-    ee_objs: List[dict],
-    head_nav: Optional[dict],
-    phase: str,
-    ee_near: float,
-    ee_nav: Optional[dict],
-) -> List[dict]:
-    """solution_rl approach 只读 ee_objects；剔除远距 EE 假检 + head 位姿注入."""
-    out = [o for o in ee_objs if not (phase == "approach" and _is_far_ee_nav_unreliable(o))]
-    if phase == "approach":
-        out = _inject_head_nav_into_ee(out, head_nav, phase, ee_near, ee_nav)
-        if head_nav is not None and out and out[0].get("nav_from_head"):
-            hd = _obj_dist(head_nav)
-            out = [out[0]] + [
-                o for o in out[1:]
-                if not (
-                    o.get("class") == head_nav.get("class")
-                    and _obj_dist(o) > hd + 0.6
-                    and _is_far_ee_nav_unreliable(o)
-                )
-            ]
-    else:
-        out = [stabilize_ee_nav_pose(o) for o in out]
-    return out
-
-
-def _ee_nav_lateral(obj: Optional[dict]) -> float:
-    if not obj:
-        return 0.0
-    pr = obj.get("pos_robot")
-    if pr is None:
-        return 0.0
-    try:
-        return abs(float(pr[1]))
-    except (TypeError, ValueError, IndexError):
-        return 0.0
-
-
-def _inject_head_nav_into_ee(
-    ee_objs: List[dict],
-    head_nav: Optional[dict],
-    phase: str,
-    ee_near: float,
-    ee_nav: Optional[dict] = None,
-) -> List[dict]:
-    """solution_rl approach 固定 preferred=ee；用 head 前向位姿覆盖 EE 侧视大横向误差."""
-    if phase != "approach" or head_nav is None:
+def _drop_ee_class_conflict(ee_objs: List[dict], head_objs: List[dict], radius: float = 0.55) -> List[dict]:
+    """同位置 head/EE 类别不一致 → 丢 EE（EE 侧视误分类率高）."""
+    if not head_objs:
         return ee_objs
-    hd = _obj_dist(head_nav)
-    if hd > 3.2:
-        return ee_objs
-    ee_lat = _ee_nav_lateral(ee_nav)
-    if ee_near < HEAD_MIRROR_EE_MIN_M and ee_lat < 0.55 and hd >= ee_near - 0.15:
-        return ee_objs
+    kept: List[dict] = []
+    for eo in ee_objs:
+        drop = False
+        for ho in head_objs:
+            if _world_xy_dist(eo, ho) > radius:
+                continue
+            if eo.get("class") == ho.get("class"):
+                continue
+            hc = float(ho.get("conf") or 0.0)
+            ec = float(eo.get("conf") or 0.0)
+            if hc + 0.03 >= ec:
+                drop = True
+                break
+        if not drop:
+            kept.append(eo)
+    return kept
+
+
+def _make_head_mirror(head_nav: dict) -> dict:
     mirror = dict(head_nav)
     for k in (
         "grasp_pos_robot", "grasp_pos_world", "grasp_quat_world",
@@ -401,12 +497,48 @@ def _inject_head_nav_into_ee(
         mirror.pop(k, None)
     mirror["grasp_reliable"] = False
     mirror["nav_from_head"] = True
-    cls = mirror.get("class")
-    kept = [
-        o for o in ee_objs
-        if not (cls is not None and o.get("class") == cls and _obj_dist(o) > hd * 0.80)
-    ]
-    return [mirror] + kept
+    return mirror
+
+
+def _export_ee_for_motion(
+    ee_objs: List[dict],
+    head_objs: List[dict],
+    auth_tgt: Optional[dict],
+    auth_cam: str,
+    nav_stage: str,
+    authority_mode: str,
+) -> List[dict]:
+    """
+    solution_rl 只读 ee_objects: 每阶段仅导出「主导相机」的单一目标，非平权多目标。
+    """
+    ee_objs = _drop_ee_class_conflict(ee_objs, head_objs)
+    if auth_tgt is None:
+        return []
+
+    if nav_stage == "grasp":
+        ee_tgt = _find_in_pool(ee_objs, auth_tgt.get("id"), auth_tgt.get("class"))
+        if ee_tgt is None and auth_cam == "ee":
+            ee_tgt = auth_tgt
+        if ee_tgt is None:
+            return []
+        return [stabilize_ee_nav_pose(dict(ee_tgt))]
+
+    if nav_stage == "near_head":
+        if auth_cam == "head":
+            return [_make_head_mirror(auth_tgt)]
+        ee_tgt = _find_in_pool(ee_objs, auth_tgt.get("id"), auth_tgt.get("class")) or auth_tgt
+        if ee_tgt and not _is_far_ee_nav_unreliable(ee_tgt):
+            return [stabilize_ee_nav_pose(dict(ee_tgt))]
+        return []
+
+    # far_ee: EE 主导，仅 head fallback
+    if auth_cam == "ee":
+        ee_tgt = _find_in_pool(ee_objs, auth_tgt.get("id"), auth_tgt.get("class")) or auth_tgt
+        if ee_tgt and not _is_far_ee_nav_unreliable(ee_tgt):
+            return [stabilize_ee_nav_pose(dict(ee_tgt))]
+    if authority_mode == "fallback" and auth_cam == "head":
+        return [_make_head_mirror(auth_tgt)]
+    return []
 
 
 class RgbdPureDualPipeline:
@@ -418,13 +550,24 @@ class RgbdPureDualPipeline:
         self.robot_yaw = float(ROBOT_INIT_YAW)
         self._temporal = _TemporalMedian()
         self._frozen_grasp: Optional[dict] = None
-        print("[RgbdPureDual] ee=nav+grasp | head=nav-only | grasp-lock | head-mirror-ee")
+        self._nav_stage = "far_ee"
+        self._nav_lock_id: Optional[int] = None
+        self._nav_lock_class: Optional[str] = None
+        self._nav_lock_miss = 0
+        print(
+            "[RgbdPureDual] 3-stage priority: far=ee>head | near=head>ee | grasp=ee-only "
+            f"(lock+single ee_objects, ee>={NAV_EE_FAR_MIN_M}m grasp<{GRASP_PHASE_DIST_M}m)"
+        )
 
     def reset(self):
         self.ee.reset()
         self.head.reset()
         self._temporal.reset()
         self._frozen_grasp = None
+        self._nav_stage = "far_ee"
+        self._nav_lock_id = None
+        self._nav_lock_class = None
+        self._nav_lock_miss = 0
         self.frame_count = 0
         self.robot_pos = ROBOT_INIT_POS.copy().astype(np.float32)
         self.robot_yaw = float(ROBOT_INIT_YAW)
@@ -455,10 +598,16 @@ class RgbdPureDualPipeline:
         rp,
         ry,
         arm_q,
+        *,
+        force_recalc: bool = False,
     ) -> Optional[dict]:
         if ee_d > GRASP_UNLOCK_DIST_M:
             self._frozen_grasp = None
             return None
+        if force_recalc:
+            if ee_grasp is None:
+                return None
+            return _finalize_ee(ee_grasp, rp, ry, arm_q)
         if ee_grasp is None:
             if self._frozen_grasp is not None:
                 return refresh_locked_grasp(self._frozen_grasp, rp, ry)
@@ -514,50 +663,114 @@ class RgbdPureDualPipeline:
         ee_objs = filter_plausible_objects(ee_objs, "ee")
         ee_near = _obj_dist(_best_nav_target(ee_objs) or _best_ee_grasp(ee_objs))
         head_objs = filter_plausible_objects(head_objs, "head", ee_near_m=ee_near)
+        ee_objs = _drop_ee_class_conflict(ee_objs, head_objs)
 
         head_objs.sort(key=_obj_dist)
         ee_objs.sort(key=_obj_dist)
 
-        ee_nav = _best_nav_target(ee_objs)
-        head_nav = _best_nav_target(head_objs)
-        ee_grasp = _best_ee_grasp(ee_objs)
+        ee_nav = _best_nav_target(ee_objs, self._nav_lock_id, self._nav_lock_class)
+        head_nav = _best_nav_target(head_objs, self._nav_lock_id, self._nav_lock_class)
+        lock_ref = _find_locked_target(head_objs, ee_objs, self._nav_lock_id, self._nav_lock_class)
+        ee_grasp = _best_ee_grasp(ee_objs, lock_ref or head_nav or ee_nav)
         ee_d = _obj_dist(ee_grasp or ee_nav)
+        head_d = _obj_dist(head_nav)
 
-        grasp_tgt = self._update_grasp_lock(ee_grasp or ee_nav, ee_d, rp, ry, arm_q)
-        phase = "grasp" if (grasp_tgt and ee_d < GRASP_PHASE_DIST_M) else "approach"
+        locked = lock_ref
+        if locked is None and self._nav_lock_id is None:
+            seed = _acquire_nav_lock(head_nav, ee_nav, head_d, ee_d)
+            if seed is not None:
+                self._nav_lock_id = int(seed["id"])
+                self._nav_lock_class = seed.get("class")
+                locked = seed
 
-        if phase == "grasp" and ee_near < HEAD_DISABLE_DIST_M:
+        nav_dist = _obj_dist(locked or head_nav or ee_nav)
+        ee_grasp_nav = ee_grasp if _same_nav_target(ee_grasp, locked or head_nav or ee_nav) else None
+        want_grasp = (
+            nav_dist < GRASP_PHASE_DIST_M
+            and ee_grasp_nav is not None
+            and (locked is not None or ee_nav is not None or head_nav is not None)
+        )
+
+        nav_stage = _resolve_nav_stage(nav_dist, want_grasp, self._nav_stage)
+        self._nav_stage = nav_stage
+        phase = "grasp" if nav_stage == "grasp" else "approach"
+
+        auth_tgt, auth_cam, auth_mode = _resolve_authoritative_target(
+            nav_stage, head_objs, ee_objs, head_nav, ee_nav,
+            self._nav_lock_id, self._nav_lock_class,
+        )
+        if auth_tgt is not None:
+            nav_dist = _obj_dist(auth_tgt)
+            if auth_mode == "primary":
+                self._nav_lock_id = int(auth_tgt["id"])
+                self._nav_lock_class = auth_tgt.get("class")
+                self._nav_lock_miss = 0
+            else:
+                self._nav_lock_miss += 1
+        else:
+            self._nav_lock_miss += 1
+
+        if self._nav_lock_miss >= NAV_LOCK_MISS_MAX:
+            self._nav_lock_id = None
+            self._nav_lock_class = None
+            self._nav_lock_miss = 0
+            seed = _acquire_nav_lock(head_nav, ee_nav, head_d, ee_d)
+            if seed is not None:
+                self._nav_lock_id = int(seed["id"])
+                self._nav_lock_class = seed.get("class")
+
+        grasp_src = ee_grasp_nav if _same_nav_target(ee_grasp_nav, auth_tgt) else None
+        if grasp_src is None and auth_tgt is not None:
+            grasp_src = _find_in_pool(ee_objs, auth_tgt.get("id"), auth_tgt.get("class"))
+        grasp_tgt = self._update_grasp_lock(
+            grasp_src,
+            _obj_dist(grasp_src or auth_tgt),
+            rp,
+            ry,
+            arm_q,
+            force_recalc=(nav_stage == "grasp"),
+        )
+
+        if nav_stage == "grasp" and ee_near < HEAD_DISABLE_DIST_M:
             head_objs = []
 
-        ee_objs = _export_ee_for_motion(ee_objs, head_nav, phase, ee_near, ee_nav)
-        if phase == "grasp":
-            ee_objs = [stabilize_ee_nav_pose(o) for o in ee_objs]
-
-        nav_cam, nav_objs, nav_tgt = _pick_nav_target(
-            ee_nav, head_nav, ee_objs, head_objs, ee_near,
+        ee_objs_raw = list(ee_objs)
+        ee_motion = _export_ee_for_motion(
+            ee_objs, head_objs, auth_tgt, auth_cam, nav_stage, auth_mode,
         )
-        if phase == "grasp":
-            nav_cam, nav_objs, nav_tgt = "ee", ee_objs, ee_nav or grasp_tgt
+        ee_objs = ee_motion
 
-        use_grasp = phase == "grasp" and grasp_tgt is not None
+        nav_cam, nav_objs, nav_tgt = _navigation_for_stage(
+            nav_stage, auth_tgt, auth_cam, ee_motion, ee_objs_raw, head_objs, grasp_tgt,
+        )
+
+        use_grasp = nav_stage == "grasp" and grasp_tgt is not None
+        grasp_objs = ee_objs_raw
+        if auth_tgt is not None:
+            g0 = _find_in_pool(ee_objs_raw, auth_tgt.get("id"), auth_tgt.get("class"))
+            grasp_objs = [g0] if g0 is not None else []
         ee_list = [_object_summary(o, "ee") for o in ee_objs]
         head_list = [_object_summary(o, "head") for o in head_objs]
 
         return {
-            "roles": {"ee": "nav_grasp", "head": "nav"},
+            "roles": {"ee": "nav_far+grasp", "head": "nav_near"},
+            "nav_stage": nav_stage,
+            "nav_authority": auth_cam,
+            "nav_authority_mode": auth_mode,
+            "nav_lock_id": self._nav_lock_id,
             "navigation": {"camera": nav_cam, "target": nav_tgt, "objects_detailed": nav_objs},
             "target_nav": nav_tgt,
             "objects_nav": nav_objs,
             "ee_objects": ee_objs,
             "ee_objects_list": ee_list,
-            "grasp": {"camera": "ee", "target": grasp_tgt, "objects_detailed": ee_objs},
+            "grasp": {"camera": "ee", "target": grasp_tgt, "objects_detailed": grasp_objs},
             "target_grasp": grasp_tgt,
-            "objects_grasp": ee_objs,
+            "objects_grasp": grasp_objs,
             "head_objects": head_objs,
             "head_objects_list": head_list,
             "target": grasp_tgt if use_grasp else nav_tgt,
             "objects_remaining": ee_list + head_list,
-            "active_camera": "ee" if use_grasp else nav_cam,
+            "active_camera": "ee" if use_grasp else auth_cam,
             "phase": phase,
             "grasp_reliable": bool(grasp_tgt and grasp_tgt.get("grasp_reliable")),
             "grasp_locked": bool(grasp_tgt and grasp_tgt.get("grasp_locked")),

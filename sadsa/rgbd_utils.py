@@ -19,9 +19,12 @@ from config import (
     EE_CAM_POS_ROBOT,
     EE_CAM_ROT_MATRIX,
     GRASP_DEPTH_OFFSET,
+    GRIPPER_TIP_OFFSET_ENABLE,
+    GRIPPER_TIP_OFFSET_M,
     HEAD_CAM,
     HEAD_CAM_POS_ROBOT,
     HEAD_CAM_ROT_MATRIX,
+    MOTION_GRASP_HEIGHT_OFFSET,
 )
 
 CAMERA_MODELS = {
@@ -264,6 +267,66 @@ def pixel_to_robot(
     return (np.asarray(cam_pos_robot, dtype=np.float32) + cam_rot_matrix @ p_cam).astype(np.float32)
 
 
+def quat_rotate_vec_wxyz(q_wxyz, v) -> np.ndarray:
+    """Rotate vector v by unit quaternion [w, x, y, z]."""
+    q = np.asarray(q_wxyz, dtype=np.float32).reshape(4)
+    v = np.asarray(v, dtype=np.float32).reshape(3)
+    w, qx, qy, qz = float(q[0]), float(q[1]), float(q[2]), float(q[3])
+    qv = np.array([qx, qy, qz], dtype=np.float32)
+    t = 2.0 * np.cross(qv, v)
+    return (v + w * t + np.cross(qv, t)).astype(np.float32)
+
+
+def compensate_grasp_for_gripper_base(
+    obj: dict,
+    robot_pos: np.ndarray,
+    robot_yaw: float,
+) -> dict:
+    """
+    grasp_pos 先按指尖接触点估计，再回退为 gripper_base IK 目标。
+
+    solution_gt: ee_body=gripper_base, DISABLE_FINGER_COMP 默认开 → 不再做指尖补偿；
+    start_grasp 还会对 trash_pos_w 沿 world +Z 加 MOTION_GRASP_HEIGHT_OFFSET。
+    """
+    if not GRIPPER_TIP_OFFSET_ENABLE:
+        return obj
+    out = dict(obj)
+    contact_w = out.get("grasp_pos_world")
+    if contact_w is None:
+        return out
+    contact_w = np.asarray(contact_w, dtype=np.float32)
+    tip = float(GRIPPER_TIP_OFFSET_M)
+    gq = out.get("grasp_quat_world")
+    if gq is not None:
+        z_world = quat_rotate_vec_wxyz(gq, np.array([0.0, 0.0, 1.0], dtype=np.float32))
+        zn = float(np.linalg.norm(z_world))
+        if zn > 1e-4:
+            z_world = z_world / zn
+        base_w = contact_w - z_world * tip
+    else:
+        contact_r = out.get("grasp_pos_robot")
+        if contact_r is None:
+            return out
+        cr = np.asarray(contact_r, dtype=np.float32)
+        horiz = float(np.hypot(cr[0], cr[1]))
+        if horiz < 0.05:
+            return out
+        dir_xy = cr[:2] / horiz
+        base_r = cr - np.array([dir_xy[0] * tip, dir_xy[1] * tip, 0.0], dtype=np.float32)
+        base_w = robot_to_world(base_r, robot_pos, robot_yaw)
+    base_w = base_w - np.array([0.0, 0.0, float(MOTION_GRASP_HEIGHT_OFFSET)], dtype=np.float32)
+    out["grasp_tip_contact_world"] = contact_w.tolist()
+    out["grasp_pos_world"] = base_w.tolist()
+    out["grasp_pos_robot"] = world_to_robot_frame(base_w, robot_pos, robot_yaw).tolist()
+    pos_r = out.get("pos_robot")
+    if pos_r is not None:
+        out["grasp_offset_robot"] = (
+            np.asarray(out["grasp_pos_robot"], dtype=np.float32) - np.asarray(pos_r, dtype=np.float32)
+        ).tolist()
+    out["gripper_base_compensated"] = True
+    return out
+
+
 def stabilize_ee_nav_pose(obj: dict) -> dict:
     """侧视 EE 远距时 pos_robot 横向偏差大，用 depth + yaw 拉回导航距离."""
     out = dict(obj)
@@ -340,7 +403,7 @@ def refresh_ee_object_pose(
     out["nav_yaw_rel"] = out["yaw_rel"]
     out["grasp_reliable"] = nav_d < GRASP_RELIABLE_DEPTH_M
     out["world_reliable"] = nav_d < WORLD_RELIABLE_DEPTH_M
-    return out
+    return compensate_grasp_for_gripper_base(out, robot_pos, robot_yaw)
 
 
 def refresh_head_object_pose(
