@@ -503,7 +503,7 @@ def refresh_head_object_pose(
     out["pos_confidence"] = conf
     out["world_reliable"] = (
         depth_f < WORLD_RELIABLE_DEPTH_M
-        and conf >= MIN_NAV_POS_CONF * 0.55
+        and conf >= MIN_NAV_POS_CONF * 0.40
     )
     return out
 
