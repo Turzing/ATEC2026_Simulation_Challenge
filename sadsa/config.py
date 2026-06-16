@@ -213,31 +213,27 @@ DEFAULT_GRASP_FIXED_QUAT = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
 # 抓取深度: 从物体顶面向下偏移量 (m), 确保夹爪啮合物体
 GRASP_DEPTH_OFFSET = 0.03
 
-# IK 末端为 gripper_base，指尖沿夹爪 local +Z 延伸 (~12cm，与 solution_gt ATEC_TASKB_FINGER_OFFSET 默认一致)
-# 感知先算指尖接触点，再回退为传给 start_grasp 的 trash_pos_w（DISABLE_FINGER_COMP=1 时 motion 不再补偿）
-GRIPPER_TIP_OFFSET_M = 0.12
-GRIPPER_TIP_OFFSET_ENABLE = True
-# solution_gt.start_grasp 会对 trash_pos_w 再 +world Z 此值，感知预扣以免双重抬高
-MOTION_GRASP_HEIGHT_OFFSET = 0.03
-
 # =============================================================================
-# 导航/抓取 3D 精度门控
+# RGBD 导航 / 锁 / phantom 过滤
 # =============================================================================
-POS_JUMP_REJECT_NEAR_M = 0.30   # 近距 world XY 单帧跳变上限
-POS_JUMP_REJECT_FAR_M = 0.45    # 远距
-MIN_NAV_POINT_COUNT = 10        # head 点云最少有效点
-MIN_NAV_POS_CONF = 0.35         # world_reliable 参考
-MIN_NAV_LOCK_CONF = 0.38        # 新锁目标最低置信
-EE_PHANTOM_NEAR_M = 1.85        # EE 假近距阈值
-EE_PHANTOM_HEAD_GAP_M = 0.35    # head 最近比 EE 远此值 → 判 EE 假近
-DETECTION_COAST_FRAMES = 14     # YOLO 漏检时保持上一帧目标帧数
-HEAD_NAV_BOTTOM_FRAC = 0.72     # bbox 底边分位用于 horizontal 定位
-HEAD_NAV_Z_PERCENTILE = 42      # 点云 robot-Z 分位 (近表面)
-EE_SKY_CY_FRAC = 0.38           # EE bbox 中心高于此 → 天空假检
-EE_NAV_ROBOT_Z_MIN = -0.35      # EE 导航比通用 ROBOT_Z_MIN 更严
-BBOX_LATERAL_TOL = 0.52         # 图像左右 vs pos_robot 横向符号一致性
-MIN_LOCK_POINT_COUNT = 8        # head 新锁最少点云点数
-CLASS_FLIP_CONF = 0.72          # track id 改类需超过此 pos_confidence
+POS_JUMP_REJECT_NEAR_M = 0.30
+POS_JUMP_REJECT_FAR_M = 0.45
+MIN_NAV_POINT_COUNT = 10
+MIN_NAV_POS_CONF = 0.35
+MIN_NAV_LOCK_CONF = 0.38
+EE_PHANTOM_NEAR_M = 1.85
+EE_PHANTOM_HEAD_GAP_M = 0.35
+DETECTION_COAST_FRAMES = 14
+HEAD_NAV_BOTTOM_FRAC = 0.72
+HEAD_NAV_Z_PERCENTILE = 42
+EE_SKY_CY_FRAC = 0.38
+EE_NAV_ROBOT_Z_MIN = -0.35
+BBOX_LATERAL_TOL = 0.52
+MIN_LOCK_POINT_COUNT = 8
+CLASS_FLIP_CONF = 0.72
+GRIPPER_TIP_OFFSET_ENABLE = False
+GRIPPER_TIP_OFFSET_M = 0.0
+MOTION_GRASP_HEIGHT_OFFSET = 0.0
 
 # =============================================================================
 # 夹爪参数 (用于 is_holding 判定)

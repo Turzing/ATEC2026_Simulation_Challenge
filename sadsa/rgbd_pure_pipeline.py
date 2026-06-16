@@ -21,6 +21,14 @@ import numpy as np
 from scipy import ndimage
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from rgbd_utils import RGBD_SIMPLE
+except ImportError:
+    RGBD_SIMPLE = os.getenv("ATEC_RGBD_SIMPLE", "1").strip().lower() not in ("0", "false", "no")
+try:
+    from rgbd_depth_cluster import DepthClusterDetector
+except ImportError:
+    DepthClusterDetector = None  # type: ignore[misc, assignment]
 from config import (
     CLASS_NAME_TO_ID,
     DEFAULT_GRASP_FIXED_QUAT,
@@ -286,6 +294,16 @@ class RgbdPureCamera:
         self._debug: Dict[str, np.ndarray] = {}
         self._arm_joints: Optional[np.ndarray] = None
         self._projected_gravity: Optional[np.ndarray] = None
+        self._simple_mode = RGBD_SIMPLE
+        if self._simple_mode:
+            if DepthClusterDetector is None:
+                raise ImportError(
+                    "ATEC_RGBD_SIMPLE=1 需要 taskb_perception/rgbd_depth_cluster.py，"
+                    "请与 rgbd_utils.py 一起同步到师姐机器"
+                )
+            self._depth_cluster = DepthClusterDetector(camera)
+        else:
+            self._depth_cluster = None
 
     def reset(self):
         self.tracker.reset()
@@ -299,12 +317,16 @@ class RgbdPureCamera:
             self._arm_joints = None
         else:
             self._arm_joints = np.asarray(arm_joints, dtype=np.float32).reshape(-1)[:6]
+        if self._depth_cluster is not None:
+            self._depth_cluster.set_arm_joints(arm_joints)
 
     def set_projected_gravity(self, grav) -> None:
         if grav is None:
             self._projected_gravity = None
         else:
             self._projected_gravity = np.asarray(grav, dtype=np.float32).reshape(3)
+        if self._depth_cluster is not None:
+            self._depth_cluster.set_projected_gravity(grav)
 
     def _cam_pos_robot(self) -> np.ndarray:
         if self.camera_name == "ee" and self._arm_joints is not None:
@@ -631,6 +653,90 @@ class RgbdPureCamera:
         }
         return fused
 
+    def _build_simple_mask(self, rgb: np.ndarray, depth: np.ndarray) -> np.ndarray:
+        """纯 RGBD: 地面凸起 + 低饱和盒 + 黄色，宽 ROI，无多层 fallback."""
+        h, w = depth.shape
+        near = self._scene_near(depth)
+        valid = self._valid_depth(depth, near)
+        roi = np.zeros((h, w), dtype=bool)
+        roi[int(h * 0.10):int(h * 0.96), int(w * 0.03):int(w * 0.97)] = True
+
+        ground = self._ground_depth(depth, valid)
+        relief = ground - depth
+        rmin = 0.018 if self.camera_name == "ee" else 0.024
+
+        v0, v1 = int(h * 0.12), int(h * 0.78)
+        roi_d = depth[v0:v1, :]
+        dmin = self._depth_min()
+        roi_valid = roi_d[(roi_d > dmin) & (roi_d < DEPTH_MAX)]
+        if roi_valid.size > 80:
+            ground_d = float(np.percentile(roi_valid, 35))
+        else:
+            ground_d = float(np.median(depth[valid])) if np.any(valid) else 3.0
+
+        fg_relief = (relief >= rmin) & (relief <= RELIEF_MAX)
+        protrude = depth < (ground_d - 0.028)
+
+        hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+        hue, sat, val = hsv[:, 0], hsv[:, 1], hsv[:, 2]
+        yellow = (hue >= 8) & (hue <= 52) & (sat >= 10) & (val >= 28)
+        low_sat_box = (sat < 38) & (val >= 55)
+
+        mask = (roi & valid & (fg_relief | protrude | yellow | low_sat_box)).astype(np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        self._debug = {
+            "relief": np.clip(relief / RELIEF_MAX * 255, 0, 255).astype(np.uint8),
+            "fusion": mask.astype(np.uint8) * 255,
+        }
+        return mask
+
+    def _classify_simple(
+        self,
+        bbox: List[int],
+        area: int,
+        hue_mean: float,
+        sat_mean: float,
+        val_mean: float,
+        z_extent: float,
+    ) -> Tuple[str, float]:
+        x1, y1, x2, y2 = bbox
+        bw, bh = max(1, x2 - x1 + 1), max(1, y2 - y1 + 1)
+        aspect = bw / bh
+        fill = area / max(bw * bh, 1)
+        vert, horiz = bh >= bw * 1.10, bw >= bh * 1.10
+        yellow = 15 <= hue_mean <= 45 and sat_mean >= 26
+
+        if sat_mean < 34 and val_mean > 68 and aspect < 1.55:
+            return "sugar_box", min(0.90, 0.72 + 0.05 * (34 - sat_mean) / 34)
+        if not yellow and aspect < 1.40 and fill > 0.30:
+            return "sugar_box", 0.74
+
+        scores = {"sugar_box": 0.15, "mustard_bottle": 0.15, "banana": 0.15}
+        if yellow:
+            scores["mustard_bottle"] += 0.30
+            scores["banana"] += 0.28
+        if horiz and aspect > 1.30:
+            scores["banana"] += 0.42
+            scores["mustard_bottle"] += 0.12
+        elif vert and aspect > 1.25:
+            scores["mustard_bottle"] += 0.38
+        elif aspect < 1.15:
+            scores["sugar_box"] += 0.40
+        if z_extent < 0.10 and aspect < 1.35:
+            scores["sugar_box"] += 0.35
+        if z_extent > 0.11 and aspect < 1.25 and yellow:
+            scores["mustard_bottle"] += 0.30
+        name = max(scores, key=scores.get)
+        return name, float(min(0.92, scores[name]))
+
+    def _detect_simple(
+        self, rgb: np.ndarray, depth: np.ndarray, robot_pos, robot_yaw,
+    ) -> List[dict]:
+        mask = self._build_simple_mask(rgb, depth)
+        dets = self._dets_from_mask(mask, rgb, depth, robot_pos, robot_yaw)
+        return self._merge_dets(dets or [])
+
     def _uv_depth_to_robot(self, u: float, v: float, z: float) -> np.ndarray:
         cam = self._cfg["cam"]
         p_cam = pixel_depth_to_cam(u, v, z, cam)
@@ -927,7 +1033,19 @@ class RgbdPureCamera:
         depth_m: float,
         use_3d: bool,
         hue_mean: float = 0.0,
+        val_mean: float = 128.0,
     ) -> Tuple[str, float, Optional[List[float]]]:
+        if self._simple_mode:
+            pts = self._blob_points_robot(ys, xs, depth, depth_m) if use_3d else None
+            z_extent = 0.08
+            ext: Optional[List[float]] = None
+            if pts is not None and len(pts) >= 5:
+                z_extent = float(pts[:, 2].max() - pts[:, 2].min())
+                ext = self._pca_sorted_extents(pts).tolist()
+            name, conf = self._classify_simple(
+                bbox, area, hue_mean, sat_mean, val_mean, z_extent,
+            )
+            return name, conf, ext
         name_2d, conf_2d = self._classify_2d_shape(
             bbox, area, sat_mean, depth_m, hue_mean=hue_mean,
         )
@@ -1045,13 +1163,17 @@ class RgbdPureCamera:
         ys, xs = self._refine_blob(ys, xs, depth, val, h)
         if len(ys) < 5:
             return None
-        if self._is_shadow_shape(ys, xs, val, sat, h, w, relief):
+        simple = self._simple_mode
+        if not simple and self._is_shadow_shape(ys, xs, val, sat, h, w, relief):
             return None
         x1, x2 = int(xs.min()), int(xs.max())
         y1, y2 = int(ys.min()), int(ys.max())
         bw, bh = x2 - x1 + 1, y2 - y1 + 1
-        min_a = int(self._cfg.get("min_area", MIN_AREA))
-        min_s = int(self._cfg.get("min_side", MIN_SIDE))
+        if simple:
+            min_a, min_s = 20, 5
+        else:
+            min_a = int(self._cfg.get("min_area", MIN_AREA))
+            min_s = int(self._cfg.get("min_side", MIN_SIDE))
         if min(bw, bh) < min_s or max(bw, bh) > MAX_SIDE or len(ys) < min_a:
             return None
         bbox = [x1, y1, x2, y2]
@@ -1075,37 +1197,37 @@ class RgbdPureCamera:
         vm = float(np.mean(val[ys, xs])) if val is not None else 128.0
         sm = float(np.mean(sat[ys, xs])) if sat is not None else 64.0
         hm = float(np.mean(hue[ys, xs])) if hue is not None else 0.0
-        if sm < self._cfg.get("min_blob_sat", MIN_BLOB_SAT_MEAN):
-            if (
-                self.camera_name == "head"
-                and depth_m >= 0.85
-                and sm >= 6
-                and vm >= 30
-                and relief is not None
-                and float(np.median(relief[ys, xs])) >= 0.005
-            ):
-                pass
-            else:
+        if not simple:
+            if sm < self._cfg.get("min_blob_sat", MIN_BLOB_SAT_MEAN):
+                if (
+                    self.camera_name == "head"
+                    and depth_m >= 0.85
+                    and sm >= 6
+                    and vm >= 30
+                    and relief is not None
+                    and float(np.median(relief[ys, xs])) >= 0.005
+                ):
+                    pass
+                else:
+                    return None
+            if self.camera_name == "head" and vm < self._cfg.get("min_blob_val", 62):
                 return None
-        if self.camera_name == "head" and vm < self._cfg.get("min_blob_val", 62):
-            return None
-        if self.camera_name == "head" and depth_m < 1.05 and sm < 46:
-            return None
-        if self.camera_name == "head" and depth_m < 0.80 and sm < 54:
-            return None
-        if relief is not None and self.camera_name == "head":
-            rm = float(np.median(relief[ys, xs]))
-            asp = max(bw, bh) / max(min(bw, bh), 1)
-            blob_area = bw * bh
-            if rm < 0.006 and vm < 78 and sm < 44 and len(ys) > 500:
+            if self.camera_name == "head" and depth_m < 1.05 and sm < 46:
                 return None
-            if rm < 0.007 and len(ys) > 700 and asp > 1.8 and vm < 84:
+            if self.camera_name == "head" and depth_m < 0.80 and sm < 54:
                 return None
+            if relief is not None and self.camera_name == "head":
+                rm = float(np.median(relief[ys, xs]))
+                asp = max(bw, bh) / max(min(bw, bh), 1)
+                if rm < 0.006 and vm < 78 and sm < 44 and len(ys) > 500:
+                    return None
+                if rm < 0.007 and len(ys) > 700 and asp > 1.8 and vm < 84:
+                    return None
         cx, cy = float(np.median(xs)), float(np.median(ys))
         is_head = self.camera_name == "head"
         is_ee = self.camera_name == "ee"
         x1, y1, x2, y2 = bbox
-        if y2 < h * 0.52:
+        if not simple and y2 < h * 0.52:
             if not (is_head and depth_m >= 1.2 and sm >= 14):
                 return None
 
@@ -1163,11 +1285,11 @@ class RgbdPureCamera:
                 nav_point_count = int(len(ys))
             if float(pos_r[2]) < -0.78 or float(pos_r[2]) > 0.28:
                 return None
-            if depth_m < 0.85 and sm < 58 and cy > h * 0.30 and abs(cx - w * 0.5) < w * 0.34:
+            if not simple and depth_m < 0.85 and sm < 58 and cy > h * 0.30 and abs(cx - w * 0.5) < w * 0.34:
                 return None
             pos_w = _robot_to_world(pos_r, robot_pos, robot_yaw)
             cls, cls_conf, geom_ext = self._classify_object(
-                bbox, len(ys), ys, xs, depth, sm, depth_m, use_3d=True, hue_mean=hm,
+                bbox, len(ys), ys, xs, depth, sm, depth_m, use_3d=True, hue_mean=hm, val_mean=vm,
             )
             conf = float(min(0.94, 0.45 + cls_conf * 0.55))
             yaw_rel = float(np.arctan2(pos_r[1], pos_r[0]))
@@ -1203,7 +1325,7 @@ class RgbdPureCamera:
 
         use_3d = is_ee and (len(ys) >= 24 or depth_m < EE_GRASP_NEAR_M)
         cls, cls_conf, geom_ext = self._classify_object(
-            bbox, len(ys), ys, xs, depth, sm, depth_m, use_3d=use_3d, hue_mean=hm,
+            bbox, len(ys), ys, xs, depth, sm, depth_m, use_3d=use_3d, hue_mean=hm, val_mean=vm,
         )
         pts = self._blob_points_robot(ys, xs, depth, depth_m)
         use_grasp_pc = pts is not None and len(pts) >= EE_GRASP_MIN_POINTS and depth_m < EE_GRASP_NEAR_M
@@ -1468,6 +1590,13 @@ class RgbdPureCamera:
         from rgbd_utils import align_rgb_to_depth
         depth = sanitize_depth(depth)
         rgb = align_rgb_to_depth(rgb, depth)
+        if self._simple_mode:
+            dets = self._depth_cluster.detect(rgb, depth, np.asarray(robot_pos, dtype=np.float32), float(robot_yaw))
+            dm = self._depth_cluster.get_debug_mask()
+            if dm is not None:
+                self._debug["fusion"] = dm
+            dets.sort(key=lambda x: x.get("depth_m") or 999.0)
+            return dets
         mask = self._build_fusion_mask(rgb, depth)
         dets = self._dets_from_mask(mask, rgb, depth, robot_pos, robot_yaw)
 

@@ -11,6 +11,7 @@ ee_objects: 给 solution_rl (approach 固定读 ee); head 目标 mirror 写入
 
 from __future__ import annotations
 
+import os
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -40,33 +41,62 @@ from config import (
     TOTAL_OBJECTS,
 )
 from rgbd_pure_pipeline import RgbdPureCamera, _robot_to_world, _yaw_from_gravity
-from rgbd_utils import (
-    GRASP_RELIABLE_DEPTH_M,
-    MIN_NAV_POS_CONF,
-    RGBD_SIMPLE,
-    _is_head_fallback_det,
-    _to_numpy,
-    bbox_lateral_consistent,
-    compensate_grasp_for_gripper_base,
-    compute_dynamic_ee_cam_pos,
-    compute_dynamic_head_cam_pos,
-    depth_stats,
-    filter_plausible_objects,
-    head_nav_pos_confidence,
-    is_ee_floor_phantom,
-    is_ee_sky_blob,
-    is_head_edge_phantom,
-    is_sky_phantom_bbox,
-    parse_ee_rgbd,
-    parse_head_rgbd,
-    refresh_ee_object_pose,
-    refresh_head_object_pose,
-    align_nav_pos_to_bbox_ray,
-    refresh_locked_grasp,
-    reject_pos_world_jump,
-    stabilize_ee_nav_pose,
-    world_to_robot_frame,
-)
+try:
+    from rgbd_utils import (
+        GRASP_RELIABLE_DEPTH_M,
+        MIN_NAV_POS_CONF,
+        RGBD_SIMPLE,
+        _is_head_fallback_det,
+        _to_numpy,
+        bbox_lateral_consistent,
+        compensate_grasp_for_gripper_base,
+        compute_dynamic_ee_cam_pos,
+        compute_dynamic_head_cam_pos,
+        depth_stats,
+        filter_plausible_objects,
+        head_nav_pos_confidence,
+        is_ee_floor_phantom,
+        is_ee_sky_blob,
+        is_head_edge_phantom,
+        is_sky_phantom_bbox,
+        parse_ee_rgbd,
+        parse_head_rgbd,
+        refresh_ee_object_pose,
+        refresh_head_object_pose,
+        align_nav_pos_to_bbox_ray,
+        refresh_locked_grasp,
+        reject_pos_world_jump,
+        stabilize_ee_nav_pose,
+        world_to_robot_frame,
+    )
+except ImportError:
+    from rgbd_utils import (
+        GRASP_RELIABLE_DEPTH_M,
+        MIN_NAV_POS_CONF,
+        _is_head_fallback_det,
+        _to_numpy,
+        bbox_lateral_consistent,
+        compensate_grasp_for_gripper_base,
+        compute_dynamic_ee_cam_pos,
+        compute_dynamic_head_cam_pos,
+        depth_stats,
+        filter_plausible_objects,
+        head_nav_pos_confidence,
+        is_ee_floor_phantom,
+        is_ee_sky_blob,
+        is_head_edge_phantom,
+        is_sky_phantom_bbox,
+        parse_ee_rgbd,
+        parse_head_rgbd,
+        refresh_ee_object_pose,
+        refresh_head_object_pose,
+        align_nav_pos_to_bbox_ray,
+        refresh_locked_grasp,
+        reject_pos_world_jump,
+        stabilize_ee_nav_pose,
+        world_to_robot_frame,
+    )
+    RGBD_SIMPLE = os.getenv("ATEC_RGBD_SIMPLE", "1").strip().lower() not in ("0", "false", "no")
 
 GRASP_PHASE_DIST_M = 1.10
 GRASP_APPROACH_DIST_M = 1.22   # head/lock 近距即请求 grasp 阶段

@@ -8,10 +8,14 @@ Isaac Lab Camera depth:
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, Optional, Tuple
 
 import cv2
 import numpy as np
+
+# 默认: 纯 depth 聚类 (ATEC_RGBD_SIMPLE=0 才走旧 fusion 管线)
+RGBD_SIMPLE = os.getenv("ATEC_RGBD_SIMPLE", "1").strip().lower() not in ("0", "false", "no")
 
 from config import (
     BBOX_LATERAL_TOL,
@@ -308,6 +312,30 @@ def _is_head_fallback_det(obj: dict) -> bool:
     )
 
 
+def _filter_plausible_simple(objects: list, camera: str) -> list:
+    """简化后滤: 只杀本体/天空/EE地板 phantom，保留真检."""
+    out = []
+    for o in objects:
+        pr = o.get("pos_robot")
+        if pr is None:
+            continue
+        try:
+            px, py, pz = float(pr[0]), float(pr[1]), float(pr[2])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if pz < -0.85 or pz > 0.32:
+            continue
+        if float(np.hypot(px, py)) < 0.10 and abs(py) < 0.16:
+            continue
+        if camera == "head" and is_sky_phantom_bbox(o):
+            continue
+        if camera == "ee":
+            if is_ee_sky_blob(o) or is_ee_floor_phantom(o):
+                continue
+        out.append(o)
+    return out
+
+
 def filter_plausible_objects(
     objects: list,
     camera: str,
@@ -315,6 +343,8 @@ def filter_plausible_objects(
     ee_near_m: float = 999.0,
 ) -> list:
     """剔除机器人本体误检、地下/悬空坐标"""
+    if RGBD_SIMPLE:
+        return _filter_plausible_simple(objects, camera)
     out = []
     for o in objects:
         pr = o.get("pos_robot")
