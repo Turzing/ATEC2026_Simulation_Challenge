@@ -1060,7 +1060,17 @@ class RgbdPureCamera:
         vm = float(np.mean(val[ys, xs])) if val is not None else 128.0
         sm = float(np.mean(sat[ys, xs])) if sat is not None else 64.0
         if sm < self._cfg.get("min_blob_sat", MIN_BLOB_SAT_MEAN):
-            return None
+            if (
+                self.camera_name == "head"
+                and depth_m >= 0.85
+                and sm >= 6
+                and vm >= 30
+                and relief is not None
+                and float(np.median(relief[ys, xs])) >= 0.005
+            ):
+                pass
+            else:
+                return None
         if self.camera_name == "head" and vm < self._cfg.get("min_blob_val", 62):
             return None
         if self.camera_name == "head" and depth_m < 1.05 and sm < 46:
@@ -1296,21 +1306,62 @@ class RgbdPureCamera:
     def _detect_head_far_yellow(
         self, rgb: np.ndarray, depth: np.ndarray, robot_pos, robot_yaw,
     ) -> List[dict]:
-        """head 1.2~6m 远距黄物 (fusion relief 漏检时 head=0 的根因)."""
+        """head 0.75~6m 远距黄物 (fusion relief 漏检时 head=0 的根因)."""
         h, w = depth.shape
-        valid = self._valid_depth(depth, near=False) & (depth >= 1.0) & (depth <= 6.5)
+        valid = self._valid_depth(depth, near=False) & (depth >= 0.75) & (depth <= 6.5)
         roi = self._roi(h, w, near=False)
         hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
         hue, sat, val = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
         mask = (
             roi & valid
             & (hue >= HEAD_HUE_LO) & (hue <= HEAD_HUE_HI)
-            & (sat >= 12) & (val >= 32)
+            & (sat >= 8) & (val >= 28)
         ).astype(np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
         dets = self._dets_from_mask(mask, rgb, depth, robot_pos, robot_yaw)
         for d in dets or []:
             d["head_far_fallback"] = True
+        return dets
+
+    def _detect_head_neutral_boxes(
+        self, rgb: np.ndarray, depth: np.ndarray, robot_pos, robot_yaw,
+    ) -> List[dict]:
+        """糖盒/cracker 等低饱和浅色盒体 (非黄 HSV 漏检)."""
+        h, w = depth.shape
+        valid = self._valid_depth(depth, near=False) & (depth >= 0.85) & (depth <= 5.5)
+        roi = self._roi(h, w, near=False)
+        ground = self._ground_depth(depth, valid)
+        relief = ground - depth
+        rmin = float(self._cfg.get("relief_min", 0.012)) * 0.42
+        hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+        hue, sat, val = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+        warm = ((hue >= 4) & (hue <= 38)) | (hue <= 10)
+        mask = (
+            roi & valid & (relief >= rmin) & (relief <= RELIEF_MAX)
+            & warm & (sat >= 5) & (sat <= 58) & (val >= 36) & (val <= 210)
+        ).astype(np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+        dets = self._dets_from_mask(mask, rgb, depth, robot_pos, robot_yaw)
+        for d in dets or []:
+            d["head_neutral_fallback"] = True
+        return dets
+
+    def _detect_head_depth_relief(
+        self, rgb: np.ndarray, depth: np.ndarray, robot_pos, robot_yaw,
+    ) -> List[dict]:
+        """深度凸起补检: 不依赖黄色, 远距地面物体."""
+        h, w = depth.shape
+        valid = self._valid_depth(depth, near=False) & (depth >= 0.95) & (depth <= 5.5)
+        roi = np.zeros((h, w), dtype=bool)
+        roi[int(h * 0.05) : int(h * 0.62), int(w * 0.06) : int(w * 0.94)] = True
+        ground = self._ground_depth(depth, valid)
+        relief = ground - depth
+        rmin = float(self._cfg.get("relief_min", 0.012)) * 0.48
+        mask = (roi & valid & (relief >= rmin) & (relief <= RELIEF_MAX)).astype(np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+        dets = self._dets_from_mask(mask, rgb, depth, robot_pos, robot_yaw)
+        for d in dets or []:
+            d["head_depth_fallback"] = True
         return dets
 
     def _detect_midfield_yellow(
@@ -1376,25 +1427,27 @@ class RgbdPureCamera:
         if self.camera_name == "head":
             st = depth_stats(depth)
             p10 = float(st.get("p10", 99.0))
-            far_dets = self._detect_head_far_yellow(rgb, depth, robot_pos, robot_yaw)
-            if far_dets:
-                if not dets:
-                    dets = far_dets
-                elif all(float(o.get("depth_m") or 99.0) > 1.85 for o in dets):
-                    dets = self._merge_dets(list(dets) + far_dets)
-            if len(dets) == 0:
-                if self._scene_near(depth):
-                    strip_dets = self._detect_bottom_strip(rgb, depth, robot_pos, robot_yaw)
-                    if strip_dets:
-                        dets = strip_dets
-                elif 1.0 <= p10 <= 5.5:
-                    mid_dets = self._detect_midfield_yellow(rgb, depth, robot_pos, robot_yaw)
-                    if mid_dets:
-                        dets = mid_dets
-                    else:
-                        edge_dets = self._detect_edge_yellow(rgb, depth, robot_pos, robot_yaw)
-                        if edge_dets:
-                            dets = edge_dets
+            layers: List[dict] = list(dets or [])
+            for extra in (
+                self._detect_head_far_yellow(rgb, depth, robot_pos, robot_yaw),
+                self._detect_head_neutral_boxes(rgb, depth, robot_pos, robot_yaw),
+            ):
+                if extra:
+                    layers.extend(extra)
+            if self._scene_near(depth):
+                strip_dets = self._detect_bottom_strip(rgb, depth, robot_pos, robot_yaw)
+                if strip_dets:
+                    layers.extend(strip_dets)
+            if p10 < 7.0:
+                for extra in (
+                    self._detect_midfield_yellow(rgb, depth, robot_pos, robot_yaw),
+                    self._detect_edge_yellow(rgb, depth, robot_pos, robot_yaw),
+                    self._detect_head_depth_relief(rgb, depth, robot_pos, robot_yaw),
+                ):
+                    if extra:
+                        layers.extend(extra)
+            if layers:
+                dets = self._merge_dets(layers)
 
         dets = self._merge_dets(dets)
         dets.sort(key=lambda x: x.get("depth_m") or 999.0)

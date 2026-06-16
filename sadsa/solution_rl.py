@@ -91,10 +91,13 @@ class AlgSolution:
         self._ee_only_no_head_frames = 0
         self._nav_stall_turn_rad = 0.0
         self._nav_stall_dist_start: float | None = None
+        self._search_turn_accum = 0.0
         self._nav_ignore_perc_until_head = False
         self.ee_only_unlock_frames = max(12, int(os.getenv("ATEC_TASKB_EE_ONLY_UNLOCK_FRAMES", "18")))
-        self.nav_stall_turn_rad = float(os.getenv("ATEC_TASKB_NAV_STALL_TURN_RAD", "1.15"))
-        self.nav_stall_min_dist_m = float(os.getenv("ATEC_TASKB_NAV_STALL_MIN_DIST", "2.0"))
+        self.nav_stall_turn_rad = float(os.getenv("ATEC_TASKB_NAV_STALL_TURN_RAD", "1.05"))
+        self.nav_stall_min_dist_m = float(os.getenv("ATEC_TASKB_NAV_STALL_MIN_DIST", "0.55"))
+        self.nav_gt_max_heading_diff = float(os.getenv("ATEC_TASKB_NAV_GT_MAX_HEADING_DIFF", "0.90"))
+        self.search_max_turn_rad = float(os.getenv("ATEC_TASKB_SEARCH_MAX_TURN_RAD", "2.20"))
         self._release_step_count = 0
         self._arm_grasp_controller = None
         self._arm_controller_init_failed = False
@@ -227,7 +230,10 @@ class AlgSolution:
         self.dynamic_stop_distance_near = float(os.getenv("ATEC_TASKB_DYNAMIC_STOP_DISTANCE_NEAR", "0.82"))
         self.dynamic_lateral_gain = float(os.getenv("ATEC_TASKB_DYNAMIC_LATERAL_GAIN", "0.60"))
         self.search_yaw_rate = float(os.getenv("ATEC_TASKB_SEARCH_YAW_RATE", "0.35"))
-        self.grasp_start_depth = float(os.getenv("ATEC_TASKB_GRASP_START_DEPTH", "1.25"))
+        self.grasp_start_depth = float(os.getenv("ATEC_TASKB_GRASP_START_DEPTH", "1.05"))
+        self.grasp_gt_max_dist = float(os.getenv("ATEC_TASKB_GRASP_GT_MAX_DIST", "1.05"))
+        self.grasp_gt_max_err = float(os.getenv("ATEC_TASKB_GRASP_GT_MAX_ERR", "0.45"))
+        self.grasp_heading_tolerance = float(os.getenv("ATEC_TASKB_GRASP_HEADING_TOL", "0.28"))
         self.bin_drop_radius = float(os.getenv("ATEC_TASKB_BIN_DROP_RADIUS", "1.0"))
         self.release_steps = max(1, int(os.getenv("ATEC_TASKB_RELEASE_STEPS", "25")))
         self.default_bin_center = np.asarray(BIN_CENTER, dtype=np.float32)
@@ -1217,7 +1223,11 @@ class AlgSolution:
         pr = self._safe_numpy(target_nav.get("pos_robot"), np.zeros(3, dtype=np.float32))
         if np.all(np.isfinite(pr[:2])) and float(np.linalg.norm(pr[:2])) > 0.05:
             parts.append(float(np.linalg.norm(pr[:2])))
-        return max(parts) if parts else float("inf")
+        base = max(parts) if parts else float("inf")
+        gt_dist = self._gt_target_xy_distance(target_nav, robot_pos_world)
+        if gt_dist is not None:
+            return max(base, gt_dist)
+        return base
 
     def _smooth_nav_heading(self, heading_error: float) -> float:
         alpha = self.nav_heading_ema_alpha
@@ -1342,9 +1352,12 @@ class AlgSolution:
             phase = "ready_to_grasp"
             stopped = True
         elif (
-            target_dist <= self.grasp_start_depth
-            and self._conservative_target_dist(target_nav, robot_pos_world) <= self.grasp_start_depth
-            and abs(yaw_error) <= max(self.object_yaw_tolerance * 2.5, 0.35)
+            self._grasp_range_ok(
+                target_nav,
+                robot_pos_world,
+                self._conservative_target_dist(target_nav, robot_pos_world),
+            )
+            and abs(yaw_error) <= self.grasp_heading_tolerance
         ):
             lin_x = 0.0
             lin_y = 0.0
@@ -1425,6 +1438,31 @@ class AlgSolution:
         self._pregrasp_stall_steps = 0
         self._pregrasp_last_robot_xy = None
         base_cmd, nav_info = self._compute_dynamic_visual_cmd(target_nav, target_pos_robot)
+        if self._nav_approach_stalled(
+            nav_info,
+            float(nav_info.get("target_dist", 999.0)),
+            target_nav,
+            robot_pos_world,
+        ):
+            self._log(
+                f"[NAV] turn stall ({self._nav_stall_turn_rad:.2f}rad, "
+                f"dist={nav_info.get('target_dist', 0):.2f}m), unlock and search"
+            )
+            self._clear_fuse_nav_lock("turn stall")
+            self._clear_frozen_pregrasp()
+            self._nav_stall_turn_rad = 0.0
+            self._nav_stall_dist_start = None
+            search_cmd = self._compute_search_cmd(self._last_perception_output)
+            search_info = {
+                "phase": "search_stall_recovery",
+                "target": None,
+                "target_dist": 0.0,
+                "goal_dist": 0.0,
+                "heading_error": 0.0,
+                "stopped": False,
+                "searching": True,
+            }
+            return search_cmd, search_info
         return base_cmd, nav_info
 
     @staticmethod
@@ -1850,12 +1888,17 @@ class AlgSolution:
         """head 无 lock 时用 EE 方位转向+慢走，避免盲转或跟 EE 错 3D."""
         hint = (perception_output or {}).get("ee_search_hint")
         if isinstance(hint, dict) and hint.get("bearing_only") and hint.get("yaw_rel") is not None:
+            self._search_turn_accum = 0.0
             bearing = float(hint["yaw_rel"])
             if abs(bearing) > 0.08:
                 ang = float(np.clip(bearing * self.heading_kp, -0.52, 0.52))
                 lin = 0.18 if abs(bearing) < 0.45 else 0.08
                 return np.array([lin, 0.0, ang], dtype=np.float32)
-        return np.array([0.25, 0.0, self.search_yaw_rate * 0.85], dtype=np.float32)
+        ang = self.search_yaw_rate * 0.85
+        self._search_turn_accum += abs(ang) * self.dt
+        if self._search_turn_accum >= self.search_max_turn_rad:
+            return np.array([0.32, 0.0, 0.12], dtype=np.float32)
+        return np.array([0.18, 0.0, ang], dtype=np.float32)
 
     def _build_search_nav_info(self, nav_input: dict[str, Any], target: dict[str, Any] | None) -> dict[str, Any]:
         robot = nav_input.get("robot") or {}
@@ -1906,21 +1949,32 @@ class AlgSolution:
         self._nav_turn_sign_hold = 0
         self._nav_ignore_perc_until_head = False
 
-    def _nav_approach_stalled(self, nav_info: dict[str, Any], target_dist: float) -> bool:
+    def _nav_approach_stalled(
+        self,
+        nav_info: dict[str, Any],
+        target_dist: float,
+        target_nav: dict[str, Any] | None = None,
+        robot_pos_world: np.ndarray | None = None,
+    ) -> bool:
         phase = str(nav_info.get("phase", ""))
-        if phase != "turn_to_target":
+        if phase not in ("turn_to_target", "turn_to_pregrasp"):
             self._nav_stall_turn_rad = 0.0
             self._nav_stall_dist_start = None
             return False
+        effective_dist = float(target_dist)
+        if target_nav is not None and robot_pos_world is not None:
+            gt_dist = self._gt_target_xy_distance(target_nav, robot_pos_world)
+            if gt_dist is not None:
+                effective_dist = max(effective_dist, gt_dist)
         if self._nav_stall_dist_start is None:
-            self._nav_stall_dist_start = target_dist
+            self._nav_stall_dist_start = effective_dist
         ang_z = abs(float(nav_info.get("ang_z") or nav_info.get("cmd_ang_z") or 0.0))
-        self._nav_stall_turn_rad += ang_z * 0.02
+        self._nav_stall_turn_rad += ang_z * self.dt
         if (
             self._nav_stall_turn_rad >= self.nav_stall_turn_rad
-            and target_dist >= self.nav_stall_min_dist_m
+            and effective_dist >= self.nav_stall_min_dist_m
             and self._nav_stall_dist_start is not None
-            and (self._nav_stall_dist_start - target_dist) < 0.12
+            and (self._nav_stall_dist_start - effective_dist) < 0.15
         ):
             return True
         return False
@@ -1973,6 +2027,18 @@ class AlgSolution:
         target["nav_lock_id"] = lock_id
         self._last_known_target_pos = target["pos_world"]
         self._set_locked_target_snapshot(target)
+
+        unreliable, reason = self._perception_nav_unreliable(target, robot_pos_world)
+        if unreliable:
+            gt_target = self._build_gt_nav_target(target, robot_pos_world, robot_yaw)
+            if gt_target is not None:
+                self._log(f"[NAV] perc unreliable ({reason}), GT fallback nav")
+                self._fuse_lock_key = (gt_target.get("class"), "gt_fallback")
+                self._fuse_pos_world = self._safe_numpy(gt_target.get("pos_world"), pw.copy())
+                self._nav_heading_error_f = None
+                return gt_target
+            self._clear_fuse_nav_lock(f"perc unreliable: {reason}")
+            return None
         return target
 
     def _adapt_perception_output(
@@ -2493,6 +2559,129 @@ class AlgSolution:
         )
         return best
 
+    def _gt_target_xy_distance(
+        self,
+        target: dict[str, Any] | None,
+        robot_pos_world: np.ndarray,
+    ) -> float | None:
+        gt = self._match_gt_for_target(target)
+        if gt is None:
+            return None
+        gt_pw = self._safe_numpy(gt.get("pos_world"), np.zeros(3, dtype=np.float32))
+        if not np.all(np.isfinite(gt_pw[:2])):
+            return None
+        robot_xy = self._safe_numpy(robot_pos_world, np.zeros(3, dtype=np.float32))[:2]
+        return float(np.linalg.norm(gt_pw[:2] - robot_xy))
+
+    def _gt_perc_xy_error(self, target: dict[str, Any] | None) -> float | None:
+        gt = self._match_gt_for_target(target)
+        if gt is None or not isinstance(target, dict):
+            return None
+        gt_pw = self._safe_numpy(gt.get("pos_world"), np.zeros(3, dtype=np.float32))
+        perc_pw = self._safe_numpy(target.get("pos_world"), np.zeros(3, dtype=np.float32))
+        if not np.all(np.isfinite(gt_pw[:2])) or not np.all(np.isfinite(perc_pw[:2])):
+            return None
+        return float(np.linalg.norm(gt_pw[:2] - perc_pw[:2]))
+
+    def _gt_heading_disagreement(self, target: dict[str, Any] | None) -> float | None:
+        gt = self._match_gt_for_target(target)
+        if gt is None or not isinstance(target, dict):
+            return None
+        perc_pr = self._safe_numpy(target.get("pos_robot"), np.zeros(3, dtype=np.float32))
+        gt_pr = self._safe_numpy(gt.get("pos_robot"), np.zeros(3, dtype=np.float32))
+        if float(np.linalg.norm(perc_pr[:2])) < 0.05 or float(np.linalg.norm(gt_pr[:2])) < 0.05:
+            robot_pos, robot_yaw, _ = self._resolve_robot_pose_world({}, {}, None)
+            perc_pw = self._safe_numpy(target.get("pos_world"), np.zeros(3, dtype=np.float32))
+            gt_pw = self._safe_numpy(gt.get("pos_world"), np.zeros(3, dtype=np.float32))
+            perc_pr = self._world_to_robot_frame(perc_pw, robot_pos, robot_yaw)
+            gt_pr = self._world_to_robot_frame(gt_pw, robot_pos, robot_yaw)
+        if float(np.linalg.norm(perc_pr[:2])) < 0.05 or float(np.linalg.norm(gt_pr[:2])) < 0.05:
+            return None
+        perc_h = float(math.atan2(perc_pr[1], perc_pr[0]))
+        gt_h = float(math.atan2(gt_pr[1], gt_pr[0]))
+        return abs(self._wrap_angle(perc_h - gt_h))
+
+    def _perception_nav_unreliable(
+        self,
+        target: dict[str, Any] | None,
+        robot_pos_world: np.ndarray,
+    ) -> tuple[bool, str]:
+        if not isinstance(target, dict):
+            return False, ""
+        gt_err = self._gt_perc_xy_error(target)
+        if gt_err is not None and gt_err > self.grasp_gt_max_err:
+            return True, f"gt_xy_err={gt_err:.2f}m"
+        heading_diff = self._gt_heading_disagreement(target)
+        if heading_diff is not None and heading_diff > self.nav_gt_max_heading_diff:
+            return True, f"gt_heading_diff={heading_diff:.2f}rad"
+        gt_dist = self._gt_target_xy_distance(target, robot_pos_world)
+        cons_dist = self._conservative_target_dist(target, robot_pos_world)
+        if gt_dist is not None and cons_dist + 0.35 < gt_dist:
+            return True, f"perc_near_gt_far cons={cons_dist:.2f} gt={gt_dist:.2f}"
+        return False, ""
+
+    def _build_gt_nav_target(
+        self,
+        seed: dict[str, Any],
+        robot_pos_world: np.ndarray,
+        robot_yaw: float,
+    ) -> dict[str, Any] | None:
+        gt = self._match_gt_for_target(seed)
+        if gt is None:
+            return None
+        pw = gt.get("pos_world")
+        if pw is None:
+            return None
+        out = {
+            "id": seed.get("id"),
+            "class": gt.get("class") or seed.get("class"),
+            "pos_world": list(pw),
+            "source_camera": "gt_fallback",
+            "camera": "gt_fallback",
+            "confirmed": True,
+            "visible": True,
+            "nav_from_gt": True,
+        }
+        pr = self._world_to_robot_frame(self._safe_numpy(pw, np.zeros(3, dtype=np.float32)), robot_pos_world, robot_yaw)
+        out["pos_robot"] = pr.tolist()
+        out["dist_to_robot"] = float(np.linalg.norm(pr[:2]))
+        out["yaw_rel"] = float(math.atan2(pr[1], pr[0]))
+        out["depth_m"] = out["dist_to_robot"]
+        return out
+
+    def _nav_lock_matches_target(
+        self,
+        lock_id: Any,
+        target: dict[str, Any] | None,
+    ) -> bool:
+        if lock_id is None or not isinstance(target, dict):
+            return False
+        track_id = target.get("perception_id", target.get("id"))
+        if track_id is None:
+            return False
+        try:
+            return int(track_id) == int(lock_id)
+        except (TypeError, ValueError):
+            return str(track_id) == str(lock_id)
+
+    def _grasp_range_ok(
+        self,
+        target_nav: dict[str, Any] | None,
+        robot_pos_world: np.ndarray,
+        cons_dist: float,
+    ) -> bool:
+        if target_nav is None:
+            return False
+        gt_dist = self._gt_target_xy_distance(target_nav, robot_pos_world)
+        gt_err = self._gt_perc_xy_error(target_nav)
+        if gt_dist is not None:
+            if gt_dist > self.grasp_gt_max_dist:
+                return False
+            if gt_err is not None and gt_err > self.grasp_gt_max_err:
+                return False
+            cons_dist = max(cons_dist, gt_dist)
+        return cons_dist <= self.grasp_start_depth
+
     def _maybe_print_locked_target_gt_debug(self, nav_info: dict[str, Any]) -> None:
         target = nav_info.get("target")
         if not isinstance(target, dict):
@@ -2543,7 +2732,7 @@ class AlgSolution:
                 gt_pw = self._safe_numpy(gt_pw_raw, np.zeros(3, dtype=np.float32))
                 if np.all(np.isfinite(gt_pw)):
                     perc_pw = self._safe_numpy(target.get("pos_world"), gt_pw)
-                    if float(np.linalg.norm(perc_pw[:2] - gt_pw[:2])) <= 0.35:
+                    if float(np.linalg.norm(perc_pw[:2] - gt_pw[:2])) <= self.grasp_gt_max_err:
                         enriched["pos_world"] = gt_pw.tolist()
         return enriched
 
@@ -2595,10 +2784,11 @@ class AlgSolution:
         perception_output: dict[str, Any] | None,
         target_nav: dict[str, Any] | None,
         cons_dist: float,
+        robot_pos_world: np.ndarray,
     ) -> bool:
         if not isinstance(perception_output, dict) or target_nav is None:
             return False
-        if cons_dist > self.grasp_start_depth - 0.05:
+        if not self._grasp_range_ok(target_nav, robot_pos_world, cons_dist):
             return False
         src = str(target_nav.get("source_camera") or "")
         if src in {"lock_coast"} or bool(target_nav.get("nav_coast")):
@@ -2840,6 +3030,8 @@ class AlgSolution:
                 robot_yaw,
             )
             nav_input, target_nav = self._adapt_perception_output(obs, local_nav, perception_output)
+            if target_nav is not None:
+                self._search_turn_accum = 0.0
 
         base_cmd = np.zeros(3, dtype=np.float32)
         nav_info = self._make_pipeline_nav_info(perception_output, pose_source, target_nav, phase="idle", stopped=True)
@@ -3098,18 +3290,12 @@ class AlgSolution:
                     robot_yaw,
                 )
                 cons_dist = self._conservative_target_dist(target_nav, robot_pos_world)
-                dist_ok = cons_dist <= self.grasp_start_depth
-                heading_ok = abs(float(nav_info.get("heading_error") or 999.0)) <= max(
-                    self.object_yaw_tolerance * 3.0, 0.45,
-                )
+                dist_ok = self._grasp_range_ok(target_nav, robot_pos_world, cons_dist)
+                heading_ok = abs(float(nav_info.get("heading_error") or 999.0)) <= self.grasp_heading_tolerance
                 lock_id = perception_output.get("nav_lock_id") if isinstance(perception_output, dict) else None
-                lock_match = (
-                    lock_id is not None
-                    and matched_grasp_target is not None
-                    and int(matched_grasp_target.get("id", -1)) == int(lock_id)
-                )
+                lock_match = self._nav_lock_matches_target(lock_id, matched_grasp_target)
                 grasp_ready = self._perception_grasp_ready(
-                    perception_output, target_nav, cons_dist,
+                    perception_output, target_nav, cons_dist, robot_pos_world,
                 )
                 if (
                     matched_grasp_target is not None
@@ -3117,10 +3303,7 @@ class AlgSolution:
                     and dist_ok
                     and heading_ok
                     and grasp_ready
-                    and (
-                        nav_info.get("phase") == "ready_to_grasp"
-                        or cons_dist <= self.grasp_start_depth - 0.08
-                    )
+                    and nav_info.get("phase") == "ready_to_grasp"
                 ):
                     base_cmd = np.zeros(3, dtype=np.float32)
                     nav_info["phase"] = "start_grasp"

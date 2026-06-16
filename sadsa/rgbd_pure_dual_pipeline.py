@@ -43,6 +43,7 @@ from rgbd_pure_pipeline import RgbdPureCamera, _robot_to_world, _yaw_from_gravit
 from rgbd_utils import (
     GRASP_RELIABLE_DEPTH_M,
     MIN_NAV_POS_CONF,
+    _is_head_fallback_det,
     _to_numpy,
     bbox_lateral_consistent,
     compensate_grasp_for_gripper_base,
@@ -598,6 +599,8 @@ def _strict_lock_match(a: Optional[dict], b: Optional[dict]) -> bool:
 def _is_head_nav_unreliable(obj: dict) -> bool:
     """拒 coast/跳变/边缘假检/bbox-3D 横向不一致."""
     if obj.get("coast_frame"):
+        return False
+    if _is_head_fallback_det(obj) and float(obj.get("depth_m") or 99.0) >= 1.0:
         return False
     if obj.get("pos_jump_rejected"):
         return True

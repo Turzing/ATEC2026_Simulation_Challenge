@@ -278,6 +278,14 @@ def is_ee_sky_blob(obj: dict, *, img_h: int = IMG_H, img_w: int = IMG_W) -> bool
     return False
 
 
+def _is_head_fallback_det(obj: dict) -> bool:
+    return bool(
+        obj.get("head_far_fallback")
+        or obj.get("head_depth_fallback")
+        or obj.get("head_neutral_fallback")
+    )
+
+
 def filter_plausible_objects(
     objects: list,
     camera: str,
@@ -303,11 +311,16 @@ def filter_plausible_objects(
         vm = float(o.get("blob_val_mean") or 0.0)
         bbox = o.get("bbox")
         if camera == "head":
+            if _is_head_fallback_det(o) and 0.75 <= depth <= 6.5:
+                if is_sky_phantom_bbox(o):
+                    continue
+                out.append(o)
+                continue
             if is_sky_phantom_bbox(o):
                 continue
-            if is_head_edge_phantom(o):
+            if is_head_edge_phantom(o) and not (depth >= 1.35 and _is_head_fallback_det(o)):
                 continue
-            if depth < 2.5 and not bbox_lateral_consistent(o):
+            if depth < 2.5 and not _is_head_fallback_det(o) and not bbox_lateral_consistent(o):
                 continue
             if depth < 1.05 and sm < 46:
                 continue
