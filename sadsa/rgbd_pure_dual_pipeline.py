@@ -98,16 +98,22 @@ def _nav_dist_conservative(obj: Optional[dict]) -> float:
 
 
 def _synthesize_grasp_from_head(obj: dict, robot_pos, robot_yaw, arm_q) -> dict:
-    """近距无 EE grasp 时, 用 head 目标合成 grasp_pos (供 motion 蹲下)."""
-    cam_pos = compute_dynamic_ee_cam_pos(arm_q) if arm_q is not None else None
-    if cam_pos is None:
-        from config import EE_CAM_POS_ROBOT
-        cam_pos = EE_CAM_POS_ROBOT
-    out = refresh_ee_object_pose(dict(obj), robot_pos, robot_yaw, cam_pos)
+    """近距无 EE grasp 时, 直接沿用 head 3D 点生成 grasp (不再走 EE 外参重投影)."""
+    from config import GRASP_DEPTH_OFFSET
+
+    out = dict(obj)
+    pr = out.get("pos_robot")
+    if pr is None:
+        return out
+    pr_np = np.asarray(pr, dtype=np.float32).reshape(3)
+    grasp_r = pr_np.copy()
+    grasp_r[2] = float(pr_np[2]) - float(GRASP_DEPTH_OFFSET)
+    out["grasp_pos_robot"] = grasp_r.tolist()
+    out["grasp_pos_world"] = _robot_to_world(grasp_r, robot_pos, robot_yaw).tolist()
+    out["grasp_offset_robot"] = [0.0, 0.0, -float(GRASP_DEPTH_OFFSET)]
     out["camera"] = "ee"
     out["source_camera"] = "head"
     out["nav_from_head"] = True
-    out["skip_camera_correction"] = True
     out["grasp_reliable"] = True
     out["role"] = "nav_grasp"
     return compensate_grasp_for_gripper_base(out, robot_pos, robot_yaw)
@@ -801,7 +807,6 @@ def _make_head_mirror(head_nav: dict) -> dict:
     mirror["source_camera"] = "head"
     mirror["grasp_reliable"] = False
     mirror["nav_from_head"] = True
-    mirror["skip_camera_correction"] = True
     return mirror
 
 

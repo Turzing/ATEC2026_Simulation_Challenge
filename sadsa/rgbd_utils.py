@@ -587,6 +587,27 @@ def refresh_locked_grasp(
     return out
 
 
+def pick_reproject_uv_depth(obj: dict) -> Optional[Tuple[float, float, float]]:
+    """GT 重投影用: head 优先 nav_anchor + 近端 depth."""
+    anchor_uv = obj.get("nav_anchor_uv")
+    anchor_depth = obj.get("nav_anchor_depth") or obj.get("nav_depth_m")
+    centroid_uv = obj.get("centroid_uv") or obj.get("centroid")
+    depth_m = obj.get("depth_m")
+    uv = anchor_uv if anchor_uv is not None else centroid_uv
+    depth = anchor_depth if anchor_uv is not None and anchor_depth is not None else depth_m
+    if uv is None or depth is None:
+        return None
+    try:
+        u = float(uv[0])
+        v = float(uv[1])
+        depth_f = float(depth)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if depth_f <= 0.01 or depth_f > 100.0:
+        return None
+    return u, v, depth_f
+
+
 def apply_gt_camera_pose(
     obj: dict,
     cam_pos_w: np.ndarray,
@@ -606,17 +627,10 @@ def apply_gt_camera_pose(
     from config import GRASP_DEPTH_OFFSET
 
     out = dict(obj)
-    depth_m = out.get("depth_m")
-    centroid_uv = out.get("centroid_uv") or out.get("centroid")
-    if depth_m is None or centroid_uv is None:
+    picked = pick_reproject_uv_depth(out)
+    if picked is None:
         return out
-    try:
-        u, v = float(centroid_uv[0]), float(centroid_uv[1])
-        depth_m_f = float(depth_m)
-    except (TypeError, ValueError, IndexError):
-        return out
-    if depth_m_f <= 0.01 or depth_m_f > 100.0:
-        return out
+    u, v, depth_m_f = picked
 
     x = (u - cx) / fx * depth_m_f
     y = (v - cy) / fy * depth_m_f
