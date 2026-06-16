@@ -52,6 +52,7 @@ from rgbd_utils import (
     depth_stats,
     filter_plausible_objects,
     head_nav_pos_confidence,
+    is_ee_floor_phantom,
     is_ee_sky_blob,
     is_head_edge_phantom,
     is_sky_phantom_bbox,
@@ -78,6 +79,7 @@ NAV_LOCK_MISS_MAX = 45           # 丢失多少帧后解锁重选 (~0.9s)
 EE_NAV_LOCK_MAX_DEPTH_M = 2.05   # EE 独锁最大深度 (log: 2.36m 偏 1.55m)
 EE_ONLY_HEAD_CONFIRM_MAX = 30    # EE-only 锁无 head 确认则解锁 (~0.6s)
 NAV_RELOCK_MAX_XY_M = 1.25       # 重锁不得离上一 lock_world 超过此距
+EE_HEAD_SPATIAL_CONFIRM_M = 0.32  # EE↔head 同类确认最大 XY 偏差 (log: 0.46m 误确认地板 phantom)
 TARGET_MATCH_RADIUS = 0.55       # 判定同一导航目标
 HEAD_MIRROR_EE_MIN_M = 0.85
 TEMPORAL_MEDIAN_N = 6
@@ -459,8 +461,8 @@ def _nav_quality(obj: dict) -> float:
 
 
 def _is_ee_phantom_near(ee_o: dict, head_objs: List[dict]) -> bool:
-    """EE 侧视假近距：仅天空框 / 同 id 异类 / head 明显更远."""
-    if is_ee_sky_blob(ee_o):
+    """EE 侧视假近距：天空框 / 地板 phantom / 同 id 异类 / head 明显更远."""
+    if is_ee_sky_blob(ee_o) or is_ee_floor_phantom(ee_o):
         return True
     ee_d = _obj_dist(ee_o)
     if ee_d > EE_PHANTOM_NEAR_M:
@@ -472,7 +474,7 @@ def _is_ee_phantom_near(ee_o: dict, head_objs: List[dict]) -> bool:
         if ee_id is not None and hid is not None and int(ee_id) == int(hid):
             if ho.get("class") != ee_cls:
                 return True
-        if _world_xy_dist(ee_o, ho) >= 0.55:
+        if _world_xy_dist(ee_o, ho) >= EE_HEAD_SPATIAL_CONFIRM_M:
             continue
         if ho.get("class") == ee_cls:
             return False
@@ -724,6 +726,9 @@ def _can_acquire_nav_lock(seed: Optional[dict], head_objs: List[dict]) -> bool:
     if seed is None or not head_objs:
         return False
     if _head_confirms_lock(head_objs, seed.get("id"), seed.get("class")):
+        ho = _find_in_pool(head_objs, seed.get("id"), seed.get("class"), None)
+        if ho is not None and seed.get("pos_world") and ho.get("pos_world"):
+            return _world_xy_dist(ho, {"pos_world": seed.get("pos_world")}) <= EE_HEAD_SPATIAL_CONFIRM_M
         return True
     if _is_ee_sourced(seed):
         same_cls = [o for o in head_objs if o.get("class") == seed.get("class")]
@@ -734,7 +739,7 @@ def _can_acquire_nav_lock(seed: Optional[dict], head_objs: List[dict]) -> bool:
             return False
         ref = {"pos_world": pw}
         near = min(same_cls, key=lambda o: _world_xy_dist(o, ref))
-        return _world_xy_dist(near, ref) <= NAV_RELOCK_MAX_XY_M
+        return _world_xy_dist(near, ref) <= EE_HEAD_SPATIAL_CONFIRM_M
     return True
 
 

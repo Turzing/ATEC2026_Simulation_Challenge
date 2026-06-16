@@ -255,6 +255,28 @@ def is_sky_phantom_bbox(obj: dict, *, img_h: int = IMG_H) -> bool:
     return False
 
 
+def is_ee_floor_phantom(obj: dict, *, img_h: int = IMG_H, img_w: int = IMG_W) -> bool:
+    """EE 地砖/空地板假 mustard (log: 0.94 conf 框内无物, pos_w≈[-9,-9.87])."""
+    if obj.get("grasp_reliable"):
+        return False
+    depth = float(obj.get("depth_m") or obj.get("nav_depth_m") or 99.0)
+    if depth > 1.20 or depth < 0.50:
+        return False
+    sm = float(obj.get("blob_sat_mean") or 0.0)
+    vm = float(obj.get("blob_val_mean") or 0.0)
+    bbox = obj.get("bbox")
+    if not bbox or len(bbox) != 4:
+        return False
+    x1, y1, x2, y2 = bbox
+    area = int((x2 - x1 + 1) * (y2 - y1 + 1))
+    cy = 0.5 * (float(y1) + float(y2))
+    if depth < 1.05 and sm < 34 and vm > 115 and area < 3200:
+        return True
+    if depth < 0.90 and sm < 42 and cy > img_h * 0.38 and area < 2800:
+        return True
+    return False
+
+
 def is_ee_sky_blob(obj: dict, *, img_h: int = IMG_H, img_w: int = IMG_W) -> bool:
     """EE 框在画面上方 + 深度假近 → 地平线 phantom (log 里 conf 0.86 天空 mustard)."""
     if is_sky_phantom_bbox(obj, img_h=img_h):
@@ -342,6 +364,8 @@ def filter_plausible_objects(
             if depth < 0.35 and sm < 40:
                 continue
             if is_ee_sky_blob(o):
+                continue
+            if is_ee_floor_phantom(o):
                 continue
         out.append(o)
     return out

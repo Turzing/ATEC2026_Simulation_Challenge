@@ -91,6 +91,7 @@ class AlgSolution:
         self._ee_only_no_head_frames = 0
         self._nav_stall_turn_rad = 0.0
         self._nav_stall_dist_start: float | None = None
+        self._phantom_gt_err_steps = 0
         self._search_turn_accum = 0.0
         self._nav_ignore_perc_until_head = False
         self.ee_only_unlock_frames = max(12, int(os.getenv("ATEC_TASKB_EE_ONLY_UNLOCK_FRAMES", "18")))
@@ -1463,6 +1464,29 @@ class AlgSolution:
                 "searching": True,
             }
             return search_cmd, search_info
+        gt_err = self._gt_perc_xy_error(target_nav)
+        if gt_err is not None and gt_err > self.grasp_gt_max_err:
+            self._phantom_gt_err_steps += 1
+            if (
+                self._phantom_gt_err_steps >= 12
+                and str(nav_info.get("phase", "")) in ("near_refine", "turn_to_target", "refine_hold")
+            ):
+                self._log(f"[NAV] phantom lock gt_err={gt_err:.2f}m, unlock and search")
+                self._clear_fuse_nav_lock("phantom gt_err")
+                self._phantom_gt_err_steps = 0
+                search_cmd = self._compute_search_cmd(self._last_perception_output)
+                search_info = {
+                    "phase": "phantom_unlock_search",
+                    "target": None,
+                    "target_dist": 0.0,
+                    "goal_dist": 0.0,
+                    "heading_error": 0.0,
+                    "stopped": False,
+                    "searching": True,
+                }
+                return search_cmd, search_info
+        else:
+            self._phantom_gt_err_steps = 0
         return base_cmd, nav_info
 
     @staticmethod
@@ -1944,6 +1968,7 @@ class AlgSolution:
         self._ee_only_no_head_frames = 0
         self._nav_stall_turn_rad = 0.0
         self._nav_stall_dist_start = None
+        self._phantom_gt_err_steps = 0
         self._nav_heading_error_f = None
         self._nav_turn_sign = 0
         self._nav_turn_sign_hold = 0
