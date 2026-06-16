@@ -651,6 +651,37 @@ def _find_in_pool(
     return None
 
 
+def _resolve_live_lock_hit(
+    head_objs: List[dict],
+    ee_objs: List[dict],
+    lock_id: Optional[int],
+    lock_class: Optional[str],
+    lock_world: Optional[List[float]] = None,
+) -> Optional[dict]:
+    """live 检测跟锁: id 优先, 否则同类近 lock_world (log: lock=0 冻住, head id=2)."""
+    if lock_id is not None:
+        for pool in (head_objs, ee_objs):
+            by_id = _find_in_pool_by_id(pool, lock_id)
+            if by_id is not None:
+                return by_id
+    live = _find_in_pool(head_objs, lock_id, lock_class, None)
+    if live is not None:
+        return live
+    live = _find_in_pool(ee_objs, lock_id, lock_class, None)
+    if live is not None:
+        return live
+    if lock_class and lock_world is not None:
+        ref = {"pos_world": lock_world}
+        for pool in (head_objs, ee_objs):
+            same = [o for o in pool if o.get("class") == lock_class]
+            if not same:
+                continue
+            near = [o for o in same if _world_xy_dist(o, ref) <= NAV_RELOCK_MAX_XY_M]
+            if near:
+                return min(near, key=_obj_dist)
+    return None
+
+
 def _is_ee_sourced(obj: Optional[dict]) -> bool:
     if not obj or obj.get("nav_from_head"):
         return False
@@ -1212,8 +1243,13 @@ class RgbdPureDualPipeline:
         arm_q,
         *,
         force_recalc: bool = False,
+        head_confirms: bool = False,
+        live_visible: bool = False,
     ) -> Optional[dict]:
         if ee_d > GRASP_UNLOCK_DIST_M:
+            self._frozen_grasp = None
+            return None
+        if not live_visible:
             self._frozen_grasp = None
             return None
         if force_recalc:
@@ -1221,8 +1257,9 @@ class RgbdPureDualPipeline:
                 return None
             return _finalize_ee(ee_grasp, rp, ry, arm_q)
         if ee_grasp is None:
-            if self._frozen_grasp is not None:
+            if self._frozen_grasp is not None and head_confirms:
                 return refresh_locked_grasp(self._frozen_grasp, rp, ry)
+            self._frozen_grasp = None
             return None
         cand = _finalize_ee(ee_grasp, rp, ry, arm_q)
         if ee_d < 1.35:
@@ -1238,7 +1275,7 @@ class RgbdPureDualPipeline:
                 if old_id is not None and cand.get("id") == old_id:
                     self._frozen_grasp = dict(cand)
             return refresh_locked_grasp(self._frozen_grasp, rp, ry)
-        if self._frozen_grasp is not None:
+        if self._frozen_grasp is not None and head_confirms:
             return refresh_locked_grasp(self._frozen_grasp, rp, ry)
         return cand
 
@@ -1313,12 +1350,23 @@ class RgbdPureDualPipeline:
         ee_d = _obj_dist(ee_grasp or ee_nav)
         head_d = _obj_dist(head_nav)
 
+        if self._nav_lock_id is not None and head_objs:
+            synced = _sync_lock_id_from_head(
+                self._nav_lock_id, self._nav_lock_class, head_objs,
+            )
+            if synced is not None and int(synced) != int(self._nav_lock_id):
+                self._nav_lock_id = int(synced)
+
         locked = lock_ref
         if self._nav_lock_id is not None:
-            live = _find_in_pool(head_objs, self._nav_lock_id, self._nav_lock_class, None)
-            if live is None:
-                live = _find_in_pool(ee_objs, self._nav_lock_id, self._nav_lock_class, None)
+            live = _resolve_live_lock_hit(
+                head_objs, ee_objs,
+                self._nav_lock_id, self._nav_lock_class, self._nav_lock_world,
+            )
             if live is not None and live.get("pos_world") is not None:
+                self._nav_lock_id = int(live["id"])
+                if live.get("class"):
+                    self._nav_lock_class = live.get("class")
                 self._nav_lock_world = list(live["pos_world"])
                 self._nav_lock_miss = 0
                 locked = live
@@ -1360,21 +1408,28 @@ class RgbdPureDualPipeline:
         )
         ee_grasp_nav = ee_grasp if _strict_lock_match(ee_grasp, lock_ref_obj) else None
         ee_grasp_ok = ee_grasp_nav is not None and bool(ee_grasp_nav.get("grasp_reliable"))
-        head_lock_hit = _find_in_pool(
-            head_objs, self._nav_lock_id, self._nav_lock_class, self._nav_lock_world,
+        head_lock_hit = _resolve_live_lock_hit(
+            head_objs, ee_objs,
+            self._nav_lock_id, self._nav_lock_class, self._nav_lock_world,
         )
         head_close = (
             head_lock_hit is not None
+            and _head_confirms_lock(
+                head_objs, head_lock_hit.get("id"), head_lock_hit.get("class"),
+            )
             and _nav_dist_conservative(head_lock_hit) < GRASP_APPROACH_DIST_M
         )
         lock_dist = _nav_dist_conservative(locked or lock_ref_obj)
         want_grasp = (
             self._nav_lock_id is not None
+            and head_close
             and close_d < GRASP_APPROACH_DIST_M
             and lock_dist < GRASP_APPROACH_DIST_M + 0.08
             and lock_ref_obj is not None
-            and _strict_lock_match(lock_ref_obj, {"id": self._nav_lock_id, "class": self._nav_lock_class})
-            and (ee_grasp_ok or head_close)
+            and _strict_lock_match(
+                lock_ref_obj, {"id": self._nav_lock_id, "class": self._nav_lock_class},
+            )
+            and self._nav_lock_miss == 0
         )
 
         nav_stage = _resolve_nav_stage(nav_dist, want_grasp, self._nav_stage)
@@ -1438,6 +1493,10 @@ class RgbdPureDualPipeline:
         grasp_src = ee_grasp_nav if _same_nav_target(ee_grasp_nav, auth_tgt) else None
         if grasp_src is None and auth_tgt is not None:
             grasp_src = _find_in_pool(ee_objs, auth_tgt.get("id"), auth_tgt.get("class"))
+        live_visible = bool(head_objs or ee_objs)
+        head_confirms = _head_confirms_lock(
+            head_objs, self._nav_lock_id, self._nav_lock_class,
+        )
         grasp_tgt = self._update_grasp_lock(
             grasp_src,
             _obj_dist(grasp_src or auth_tgt),
@@ -1445,9 +1504,13 @@ class RgbdPureDualPipeline:
             ry,
             arm_q,
             force_recalc=(nav_stage == "grasp"),
+            head_confirms=head_confirms,
+            live_visible=live_visible,
         )
-        if nav_stage == "grasp" and grasp_tgt is None and auth_tgt is not None:
-            grasp_tgt = _synthesize_grasp_from_head(auth_tgt, rp, ry, arm_q)
+        if want_grasp and nav_stage == "grasp" and grasp_tgt is None and head_lock_hit is not None:
+            grasp_tgt = _synthesize_grasp_from_head(head_lock_hit, rp, ry, arm_q)
+        elif not want_grasp:
+            grasp_tgt = None
 
         if nav_stage == "grasp" and ee_near < HEAD_DISABLE_DIST_M:
             pass  # 保留 head_objects 供 motion fallback
@@ -1513,14 +1576,7 @@ class RgbdPureDualPipeline:
             ) is None:
                 auth_tgt = None
 
-        if self._nav_lock_id is not None:
-            synced = _sync_lock_id_from_head(
-                self._nav_lock_id, self._nav_lock_class, head_objs,
-            )
-            if synced is not None and int(synced) != int(self._nav_lock_id):
-                self._nav_lock_id = int(synced)
-
-        use_grasp = nav_stage == "grasp" and grasp_tgt is not None
+        use_grasp = want_grasp and nav_stage == "grasp" and grasp_tgt is not None
         grasp_objs = ee_objs_raw
         if auth_tgt is not None:
             g0 = _find_in_pool(ee_objs_raw, auth_tgt.get("id"), auth_tgt.get("class"))

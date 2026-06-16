@@ -1398,6 +1398,7 @@ class AlgSolution:
             and target_nav["dist_to_robot"] <= self.target_freeze_distance
             and cons_dist <= self.grasp_start_depth - 0.05
             and target_nav.get("source_camera") == "head"
+            and not bool(target_nav.get("nav_coast"))
             and int(target_nav.get("head_stable_count", 0)) >= self.target_head_confirm_steps
         ):
             self._freeze_pregrasp_for_target(target_nav, robot_pos_world)
@@ -2525,6 +2526,94 @@ class AlgSolution:
             f"heading perc={perc_heading:.2f} gt={gt_heading:.2f} diff={heading_err:.2f}rad"
         )
 
+    def _enrich_grasp_target_with_gt(self, target: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not isinstance(target, dict):
+            return None
+        enriched = dict(target)
+        gt = self._match_gt_for_target(target)
+        if gt is not None:
+            # ArmGraspController 用 trash_target["id"] 查 scene，须映射为 object_N
+            if target.get("id") is not None:
+                enriched["perception_id"] = target.get("id")
+            scene_id = gt.get("id")
+            if scene_id is not None:
+                enriched["id"] = scene_id
+            gt_pw_raw = gt.get("pos_world")
+            if gt_pw_raw is not None:
+                gt_pw = self._safe_numpy(gt_pw_raw, np.zeros(3, dtype=np.float32))
+                if np.all(np.isfinite(gt_pw)):
+                    perc_pw = self._safe_numpy(target.get("pos_world"), gt_pw)
+                    if float(np.linalg.norm(perc_pw[:2] - gt_pw[:2])) <= 0.35:
+                        enriched["pos_world"] = gt_pw.tolist()
+        return enriched
+
+    def _grasp_reference_world(self, target: dict[str, Any]) -> np.ndarray:
+        """ArmGraspController 会在 pos 上再加 grasp_height_offset, 传物体中心而非 grasp_pos."""
+        pw = target.get("pos_world")
+        if pw is not None:
+            return self._safe_numpy(pw, np.zeros(3, dtype=np.float32))
+        gp = target.get("grasp_pos_world")
+        return self._safe_numpy(gp, np.zeros(3, dtype=np.float32))
+
+    def _refresh_grasp_target_from_perception(
+        self,
+        target: dict[str, Any] | None,
+        perception_output: dict[str, Any] | None,
+        robot_pos_world: np.ndarray,
+        robot_yaw: float,
+    ) -> dict[str, Any] | None:
+        if not isinstance(target, dict) or not isinstance(perception_output, dict):
+            return target
+        lock_id = perception_output.get("nav_lock_id")
+        lock_class = perception_output.get("nav_lock_class") or target.get("class")
+        fresh_grasp = self._prepare_pipeline_object(
+            perception_output.get("target_grasp"),
+            str((perception_output.get("grasp") or {}).get("camera", "ee")),
+            robot_pos_world,
+            robot_yaw,
+        )
+        fresh_nav = self._prepare_pipeline_object(
+            perception_output.get("target_nav"),
+            str((perception_output.get("navigation") or {}).get("camera", "head")),
+            robot_pos_world,
+            robot_yaw,
+        )
+        candidate = fresh_grasp or fresh_nav
+        if candidate is None:
+            return self._enrich_grasp_target_with_gt(target)
+        if lock_id is not None and candidate.get("id") not in {None, lock_id}:
+            if candidate.get("class") != lock_class:
+                return self._enrich_grasp_target_with_gt(target)
+        merged = dict(target)
+        for key in ("id", "class", "pos_world", "pos_robot", "grasp_pos_world", "grasp_quat_world"):
+            if candidate.get(key) is not None:
+                merged[key] = candidate[key]
+        return self._enrich_grasp_target_with_gt(merged)
+
+    def _perception_grasp_ready(
+        self,
+        perception_output: dict[str, Any] | None,
+        target_nav: dict[str, Any] | None,
+        cons_dist: float,
+    ) -> bool:
+        if not isinstance(perception_output, dict) or target_nav is None:
+            return False
+        if cons_dist > self.grasp_start_depth - 0.05:
+            return False
+        src = str(target_nav.get("source_camera") or "")
+        if src in {"lock_coast"} or bool(target_nav.get("nav_coast")):
+            return False
+        if str(perception_output.get("phase", "approach")) != "grasp":
+            return False
+        if perception_output.get("nav_lock_id") is None:
+            return False
+        head_n = len(perception_output.get("head_objects") or [])
+        if head_n < 1:
+            return False
+        if not perception_output.get("target_grasp") and not perception_output.get("grasp_reliable"):
+            return False
+        return True
+
     def _select_grasp_target(
         self,
         target_nav: dict[str, Any] | None,
@@ -2677,6 +2766,7 @@ class AlgSolution:
         """到达目标后先蹲下，再开始抓取。"""
         if target_grasp is None:
             return False
+        target_grasp = self._enrich_grasp_target_with_gt(target_grasp)
         robot = self._get_robot()
         if robot is None:
             self._log("[TaskB-GRASP] robot unavailable, skip crouch start.")
@@ -2749,23 +2839,6 @@ class AlgSolution:
                 robot_pos_world,
                 robot_yaw,
             )
-            tracked_dist = float("inf")
-            if self._tracked_target is not None:
-                tracked_pos = self._safe_numpy(self._tracked_target.get("filtered_pos_world"), np.zeros(3, dtype=np.float32))
-                tracked_robot = self._world_to_robot_frame(tracked_pos, robot_pos_world, robot_yaw)
-                tracked_dist = float(np.linalg.norm(tracked_robot[:2]))
-            nav_lock_id = perception_output.get("nav_lock_id")
-            lock_cons_dist = float("inf")
-            if isinstance(perception_output.get("target_nav"), dict):
-                lock_cons_dist = self._conservative_target_dist(
-                    perception_output["target_nav"], robot_pos_world,
-                )
-            if (
-                tracked_dist <= self.target_near_range
-                and nav_lock_id is not None
-                and lock_cons_dist <= self.grasp_start_depth
-            ):
-                perception_output["phase"] = "grasp"
             nav_input, target_nav = self._adapt_perception_output(obs, local_nav, perception_output)
 
         base_cmd = np.zeros(3, dtype=np.float32)
@@ -2836,7 +2909,13 @@ class AlgSolution:
 
                 if crouch_ready:
                     if self._pending_grasp_target is not None and controller is not None:
-                        grasp_pos_world = self._pending_grasp_target.get("grasp_pos_world") or self._pending_grasp_target.get("pos_world")
+                        self._pending_grasp_target = self._refresh_grasp_target_from_perception(
+                            self._pending_grasp_target,
+                            perception_output,
+                            robot_pos_world,
+                            robot_yaw,
+                        )
+                        grasp_pos_world = self._grasp_reference_world(self._pending_grasp_target)
                         try:
                             current_ee_quat_w = controller.get_ee_pose()[1]
                             controller.start_grasp(
@@ -3029,11 +3108,15 @@ class AlgSolution:
                     and matched_grasp_target is not None
                     and int(matched_grasp_target.get("id", -1)) == int(lock_id)
                 )
+                grasp_ready = self._perception_grasp_ready(
+                    perception_output, target_nav, cons_dist,
+                )
                 if (
                     matched_grasp_target is not None
                     and lock_match
                     and dist_ok
                     and heading_ok
+                    and grasp_ready
                     and (
                         nav_info.get("phase") == "ready_to_grasp"
                         or cons_dist <= self.grasp_start_depth - 0.08
@@ -3051,7 +3134,8 @@ class AlgSolution:
                         ctrl = self._ensure_arm_grasp_controller()
                         if ctrl is not None:
                             try:
-                                grasp_pos_world = matched_grasp_target.get("grasp_pos_world") or matched_grasp_target.get("pos_world")
+                                matched_grasp_target = self._enrich_grasp_target_with_gt(matched_grasp_target)
+                                grasp_pos_world = self._grasp_reference_world(matched_grasp_target)
                                 current_ee_quat_w = ctrl.get_ee_pose()[1]
                                 ctrl.start_grasp(matched_grasp_target, grasp_pos_world, current_ee_quat_w=current_ee_quat_w)
                                 self._pending_grasp_target = dict(matched_grasp_target)
