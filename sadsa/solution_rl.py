@@ -1362,7 +1362,7 @@ class AlgSolution:
             )
             nav_info["phase"] = "search_stall"
             nav_info["stopped"] = False
-            return np.array([0.0, 0.0, self.search_yaw_rate], dtype=np.float32), nav_info
+            return self._compute_search_cmd(self._last_perception_output), nav_info
         return base_cmd, nav_info
 
     @staticmethod
@@ -1783,6 +1783,16 @@ class AlgSolution:
             if section.get("camera") == camera and isinstance(section.get("target"), dict):
                 return section.get("target")
         return None
+
+    def _compute_search_cmd(self, perception_output: dict[str, Any] | None) -> np.ndarray:
+        """head=0 时用 EE 方位定向转，避免盲转 43s (log 02-27-18)."""
+        hint = (perception_output or {}).get("ee_search_hint")
+        if isinstance(hint, dict) and hint.get("yaw_rel") is not None:
+            bearing = float(hint["yaw_rel"])
+            if abs(bearing) > 0.12:
+                ang = float(np.clip(bearing * self.heading_kp, -0.55, 0.55))
+                return np.array([0.0, 0.0, ang], dtype=np.float32)
+        return np.array([0.0, 0.0, self.search_yaw_rate], dtype=np.float32)
 
     def _build_search_nav_info(self, nav_input: dict[str, Any], target: dict[str, Any] | None) -> dict[str, Any]:
         robot = nav_input.get("robot") or {}
@@ -2721,7 +2731,7 @@ class AlgSolution:
                     nav_info["phase"] = "stand"
                     nav_info["stopped"] = True
             elif self._step_count > max(8, self.stand_still_steps // 4):
-                base_cmd = np.array([0.0, 0.0, self.search_yaw_rate], dtype=np.float32)
+                base_cmd = self._compute_search_cmd(perception_output)
                 nav_info["phase"] = "search"
                 nav_info["stopped"] = False
         elif self._task_state == "CROUCHING":
@@ -3008,7 +3018,7 @@ class AlgSolution:
                             self._pending_grasp_target = None
                             self._clear_locked_target()
             else:
-                base_cmd = np.array([0.0, 0.0, self.search_yaw_rate], dtype=np.float32)
+                base_cmd = self._compute_search_cmd(perception_output)
                 search_phase = "search"
                 if perception_output.get("nav_lock_id") is not None:
                     search_phase = "search_coast"

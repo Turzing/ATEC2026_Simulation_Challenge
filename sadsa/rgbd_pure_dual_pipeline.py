@@ -1058,6 +1058,49 @@ def _ensure_ee_motion_export(
     return []
 
 
+def _build_ee_search_hint(
+    head_objs: List[dict],
+    ee_objs: List[dict],
+) -> Optional[dict]:
+    """head=0 时 export EE 方位角供 motion 定向搜 (log: 盲转 43s)."""
+    if head_objs or not ee_objs:
+        return None
+    best = min(ee_objs, key=_obj_dist)
+    pr = best.get("pos_robot")
+    if pr is None:
+        return None
+    try:
+        px, py = float(pr[0]), float(pr[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+    if abs(px) < 0.05 and abs(py) < 0.05:
+        return None
+    bearing = float(np.arctan2(py, px))
+    return {
+        "yaw_rel": bearing,
+        "class": best.get("class"),
+        "bearing_only": True,
+        "depth_m": _obj_dist(best),
+    }
+
+
+def _sync_lock_id_from_head(
+    lock_id: Optional[int],
+    lock_class: Optional[str],
+    head_objs: List[dict],
+) -> Optional[int]:
+    """head/ee tracker id 不一致时以 head 为准 (log: lock=3 head id=0)."""
+    if lock_id is None or not head_objs:
+        return lock_id
+    hit = _find_in_pool(head_objs, lock_id, lock_class, None)
+    if hit is not None:
+        return int(hit["id"])
+    same = [o for o in head_objs if o.get("class") == lock_class]
+    if same:
+        return int(min(same, key=_obj_dist)["id"])
+    return lock_id
+
+
 class RgbdPureDualPipeline:
     def __init__(self):
         self.ee = RgbdPureCamera("ee")
@@ -1457,6 +1500,13 @@ class RgbdPureDualPipeline:
                 if self._nav_lock_id is None or _is_ee_sourced(nav_tgt) or nav_tgt.get("nav_coast"):
                     nav_tgt = None
 
+        if self._nav_lock_id is not None:
+            synced = _sync_lock_id_from_head(
+                self._nav_lock_id, self._nav_lock_class, head_objs,
+            )
+            if synced is not None and int(synced) != int(self._nav_lock_id):
+                self._nav_lock_id = int(synced)
+
         use_grasp = nav_stage == "grasp" and grasp_tgt is not None
         grasp_objs = ee_objs_raw
         if auth_tgt is not None:
@@ -1464,6 +1514,7 @@ class RgbdPureDualPipeline:
             grasp_objs = [g0] if g0 is not None else []
         ee_list = [_object_summary(o, "ee") for o in ee_objs]
         head_list = [_object_summary(o, "head") for o in head_objs]
+        ee_search_hint = _build_ee_search_hint(head_objs, ee_objs_raw)
 
         return {
             "roles": {"ee": "nav_far+grasp", "head": "nav_near"},
@@ -1475,6 +1526,7 @@ class RgbdPureDualPipeline:
             "nav_lock_ee_only": self._nav_lock_ee_only,
             "nav_lock_stable": self._nav_lock_id is not None and self._nav_lock_miss == 0,
             "nav_pos_confidence": None if nav_tgt is None else nav_tgt.get("pos_confidence"),
+            "ee_search_hint": ee_search_hint,
             "navigation": {"camera": nav_cam, "target": nav_tgt, "objects_detailed": nav_objs},
             "target_nav": nav_tgt,
             "objects_nav": nav_objs,
