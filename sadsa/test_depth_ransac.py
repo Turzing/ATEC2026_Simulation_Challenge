@@ -18,7 +18,7 @@ def _synthetic_ee_depth(h=480, w=640) -> np.ndarray:
 
 
 def test_ransac_finds_object_cluster():
-    det = RansacClusterDetector()
+    det = RansacClusterDetector("ee")
     depth = _synthetic_ee_depth()
     robot_pos = np.zeros(3, dtype=np.float32)
     dets = det.detect(depth, robot_pos, 0.0)

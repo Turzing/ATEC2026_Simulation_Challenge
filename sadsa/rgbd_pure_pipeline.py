@@ -1649,6 +1649,8 @@ class RgbdPureCamera:
             objects.append(o)
         target = min(objects, key=lambda o: o.get("depth_m") or 999.0) if objects else None
         meta = {"depth_stats": st, "mask_components": getattr(self, "_mask_n", 0)}
+        if self._depth_cluster is not None and hasattr(self._depth_cluster, "last_stats"):
+            meta["ransac"] = self._depth_cluster.last_stats
         return objects, target, meta
 
     def _scene_near(self, depth: np.ndarray) -> bool:

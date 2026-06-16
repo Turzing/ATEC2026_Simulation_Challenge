@@ -337,7 +337,7 @@ def _is_head_fallback_det(obj: dict) -> bool:
 
 
 def _filter_plausible_simple(objects: list, camera: str) -> list:
-    """简化后滤: 只杀本体/天空/EE地板 phantom，保留真检."""
+    """简化后滤: 只杀明显 sky/超大地板 phantom."""
     out = []
     for o in objects:
         pr = o.get("pos_robot")
@@ -347,12 +347,20 @@ def _filter_plausible_simple(objects: list, camera: str) -> list:
             px, py, pz = float(pr[0]), float(pr[1]), float(pr[2])
         except (TypeError, ValueError, IndexError):
             continue
-        if pz < -0.85 or pz > 0.32:
+        if pz < -0.95 or pz > 0.45:
             continue
-        if float(np.hypot(px, py)) < 0.10 and abs(py) < 0.16:
+        if float(np.hypot(px, py)) < 0.08 and abs(py) < 0.14:
+            continue
+        if float(px) < 0.12:
+            continue
+        src = str(o.get("source") or "")
+        if src == "ransac_cluster":
+            out.append(o)
             continue
         if camera == "head":
-            if is_sky_phantom_bbox(o) or is_head_floor_phantom(o):
+            if is_sky_phantom_bbox(o):
+                continue
+            if is_head_floor_phantom(o) and int(o.get("cluster_pixels") or 0) > 2200:
                 continue
         if camera == "ee":
             if is_ee_sky_blob(o) or is_ee_floor_phantom(o):
@@ -677,9 +685,13 @@ def refresh_head_object_pose(
     if out.get("pos_from_pointcloud") and out.get("pos_robot") is not None:
         pc_r = np.asarray(out["pos_robot"], dtype=np.float32)
         n = int(out.get("nav_point_count") or 0)
-        w_pc = min(0.82, 0.55 + n / 80.0)
-        pos_r = (w_pc * pc_r + (1.0 - w_pc) * anchor_r).astype(np.float32)
-        pos_r[2] = pc_r[2]
+        src = str(out.get("source") or "")
+        if src == "ransac_cluster" or n >= 18:
+            pos_r = pc_r.copy()
+        else:
+            w_pc = min(0.82, 0.55 + n / 80.0)
+            pos_r = (w_pc * pc_r + (1.0 - w_pc) * anchor_r).astype(np.float32)
+            pos_r[2] = pc_r[2]
     else:
         pos_r = anchor_r.astype(np.float32)
 

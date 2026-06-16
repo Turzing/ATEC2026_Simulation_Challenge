@@ -1272,7 +1272,7 @@ class RgbdPureDualPipeline:
         self._nav_lock_reject_until = 0
         self._last_ee_motion: List[dict] = []
         self._last_head_objs: List[dict] = []
-        self._ransac = RansacClusterDetector() if RansacClusterDetector is not None else None
+        self._ransac = RansacClusterDetector("ee") if RansacClusterDetector is not None else None
         if STATIC_TWO_STEP:
             mode = "two-step: head-coarse-nav → static-ee-ransac"
         elif RGBD_SIMPLE:
@@ -1782,6 +1782,7 @@ class RgbdPureDualPipeline:
             "head_dist_m": _obj_dist(head_nav),
             "ee_dist_m": ee_d,
             "head_count_raw": len(head_objs),
+            "head_ransac": head_meta.get("ransac") or {},
             "ee_count_raw": len(ee_objs_raw),
             "nav_depth_m": None if nav_tgt is None else nav_tgt.get("nav_depth_m"),
             "nav_yaw_rel": None if nav_tgt is None else nav_tgt.get("nav_yaw_rel"),
