@@ -225,8 +225,11 @@ MOTION_GRASP_HEIGHT_OFFSET = 0.03
 # =============================================================================
 POS_JUMP_REJECT_NEAR_M = 0.30   # 近距 world XY 单帧跳变上限
 POS_JUMP_REJECT_FAR_M = 0.45    # 远距
-MIN_NAV_POINT_COUNT = 14        # head 点云最少有效点
-MIN_NAV_POS_CONF = 0.42         # 低于此不做新锁/主导目标
+MIN_NAV_POINT_COUNT = 10        # head 点云最少有效点
+MIN_NAV_POS_CONF = 0.35         # world_reliable 参考
+MIN_NAV_LOCK_CONF = 0.38        # 新锁目标最低置信
+EE_PHANTOM_NEAR_M = 1.85        # EE 假近距阈值
+EE_PHANTOM_HEAD_GAP_M = 0.85    # head 最近比 EE 远此值 → 判 EE 假近
 HEAD_NAV_BOTTOM_FRAC = 0.72     # bbox 底边分位用于水平定位
 HEAD_NAV_Z_PERCENTILE = 42      # 点云 robot-Z 分位 (近表面)
 

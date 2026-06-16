@@ -27,10 +27,13 @@ from config import (
     HEAD_NAV_BOTTOM_FRAC,
     HEAD_NAV_Z_PERCENTILE,
     MIN_NAV_POINT_COUNT,
+    MIN_NAV_LOCK_CONF,
     MIN_NAV_POS_CONF,
     MOTION_GRASP_HEIGHT_OFFSET,
     POS_JUMP_REJECT_FAR_M,
     POS_JUMP_REJECT_NEAR_M,
+    EE_PHANTOM_HEAD_GAP_M,
+    EE_PHANTOM_NEAR_M,
 )
 
 CAMERA_MODELS = {
@@ -500,8 +503,7 @@ def refresh_head_object_pose(
     out["pos_confidence"] = conf
     out["world_reliable"] = (
         depth_f < WORLD_RELIABLE_DEPTH_M
-        and conf >= MIN_NAV_POS_CONF
-        and not out.get("pos_jump_rejected", False)
+        and conf >= MIN_NAV_POS_CONF * 0.55
     )
     return out
 
