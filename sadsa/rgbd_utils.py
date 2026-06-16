@@ -261,6 +261,28 @@ def is_sky_phantom_bbox(obj: dict, *, img_h: int = IMG_H) -> bool:
     return False
 
 
+def is_head_floor_phantom(obj: dict, *, img_h: int = IMG_H, img_w: int = IMG_W) -> bool:
+    """Head 地砖/近地板大面积假检 (截图: 下半屏巨框 → 假 banana)."""
+    bbox = obj.get("bbox")
+    if not bbox or len(bbox) != 4:
+        return False
+    x1, y1, x2, y2 = map(float, bbox)
+    area = (x2 - x1 + 1) * (y2 - y1 + 1)
+    img_area = float(img_h * img_w)
+    cy = 0.5 * (y1 + y2)
+    depth = float(obj.get("depth_m") or obj.get("nav_depth_m") or 99.0)
+    pixels = int(obj.get("cluster_pixels") or 0)
+    if cy > img_h * 0.56 and area > img_area * 0.10:
+        return True
+    if y1 > img_h * 0.40 and area > img_area * 0.16:
+        return True
+    if depth < 1.20 and cy > img_h * 0.48 and area > img_area * 0.07:
+        return True
+    if pixels > 1500 and cy > img_h * 0.50:
+        return True
+    return False
+
+
 def is_ee_floor_phantom(obj: dict, *, img_h: int = IMG_H, img_w: int = IMG_W) -> bool:
     """EE 地砖/空地板假 mustard (log: 0.94 conf 框内无物, pos_w≈[-9,-9.87])."""
     if obj.get("grasp_reliable"):
@@ -329,8 +351,9 @@ def _filter_plausible_simple(objects: list, camera: str) -> list:
             continue
         if float(np.hypot(px, py)) < 0.10 and abs(py) < 0.16:
             continue
-        if camera == "head" and is_sky_phantom_bbox(o):
-            continue
+        if camera == "head":
+            if is_sky_phantom_bbox(o) or is_head_floor_phantom(o):
+                continue
         if camera == "ee":
             if is_ee_sky_blob(o) or is_ee_floor_phantom(o):
                 continue

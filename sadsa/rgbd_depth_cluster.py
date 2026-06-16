@@ -37,7 +37,8 @@ MIN_CLUSTER_PX_HEAD = 10
 MIN_CLUSTER_PX_EE = 8
 MAX_CLUSTERS = 20
 ROI_V_MIN = 0.06
-ROI_V_MAX = 0.96
+ROI_V_MAX_HEAD = 0.68   # head 排除画面下部地砖 (假检重灾区)
+ROI_V_MAX_EE = 0.96
 PROTRUDE_HEAD_M = 0.016
 PROTRUDE_EE_M = 0.010
 LOCAL_GROUND_K = 15
@@ -157,7 +158,8 @@ class DepthClusterDetector:
         valid = (depth > DEPTH_MIN) & (depth < DEPTH_MAX) & np.isfinite(depth)
         vs = np.arange(h, dtype=np.float32)
         vv = np.meshgrid(np.arange(w), vs)[1]
-        in_roi = (vv >= int(h * ROI_V_MIN)) & (vv <= int(h * ROI_V_MAX))
+        roi_v_max = ROI_V_MAX_EE if self.camera_name == "ee" else ROI_V_MAX_HEAD
+        in_roi = (vv >= int(h * ROI_V_MIN)) & (vv <= int(h * roi_v_max))
 
         base = PROTRUDE_EE_M if self.camera_name == "ee" else PROTRUDE_HEAD_M
         protrude_m = max(0.004, float(base) * float(protrude_scale))
@@ -270,7 +272,12 @@ class DepthClusterDetector:
 
             x1, x2 = int(xs.min()), int(xs.max())
             y1, y2 = int(ys.min()), int(ys.max())
+            if is_head and float(np.median(ys)) > h * 0.62:
+                continue
             bbox = [x1, y1, x2, y2]
+            bw, bh = max(1, x2 - x1 + 1), max(1, y2 - y1 + 1)
+            if is_head and bw * bh > h * w * 0.14:
+                continue
             cx, cy = float(np.median(xs)), float(np.median(ys))
             cls, cls_conf = _classify_cluster(rgb, ys, xs, bbox, z_extent)
 

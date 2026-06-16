@@ -2077,6 +2077,13 @@ class AlgSolution:
 
         unreliable, reason = self._perception_nav_unreliable(target, robot_pos_world)
         if unreliable:
+            if self.static_two_step:
+                # 不用 GT 把目标拉到身后物体 (log: err=-2.8rad 转圈)
+                pr = self._safe_numpy(target.get("pos_robot"), np.zeros(3, dtype=np.float32))
+                if float(pr[0]) > 0.08:
+                    return target
+                self._clear_fuse_nav_lock(f"perc unreliable in static mode: {reason}")
+                return None
             gt_target = self._build_gt_nav_target(target, robot_pos_world, robot_yaw)
             if gt_target is not None:
                 self._log(f"[NAV] perc unreliable ({reason}), GT fallback nav")
@@ -2579,6 +2586,39 @@ class AlgSolution:
         except Exception:
             return []
 
+    def _match_gt_in_front(
+        self,
+        target: dict[str, Any] | None,
+        robot_pos_world: np.ndarray,
+        robot_yaw: float,
+    ) -> dict[str, Any] | None:
+        """优先匹配 robot 前方 GT 物体，避免 class 匹配到身后实例."""
+        if not isinstance(target, dict):
+            return None
+        target_class = target.get("class")
+        gt_objects = self._get_gt_objects()
+        if not gt_objects:
+            return None
+        scored: list[tuple[float, dict[str, Any]]] = []
+        for obj in gt_objects:
+            if target_class and obj.get("class") != target_class:
+                continue
+            pw = obj.get("pos_world")
+            if pw is None:
+                continue
+            pr = self._world_to_robot_frame(
+                self._safe_numpy(pw, np.zeros(3, dtype=np.float32)),
+                robot_pos_world,
+                robot_yaw,
+            )
+            if float(pr[0]) < 0.12:
+                continue
+            scored.append((float(np.linalg.norm(pr[:2])), obj))
+        if not scored:
+            return None
+        scored.sort(key=lambda x: x[0])
+        return scored[0][1]
+
     def _match_gt_for_target(self, target: dict[str, Any] | None) -> dict[str, Any] | None:
         if not isinstance(target, dict):
             return None
@@ -2679,7 +2719,9 @@ class AlgSolution:
         robot_pos_world: np.ndarray,
         robot_yaw: float,
     ) -> dict[str, Any] | None:
-        gt = self._match_gt_for_target(seed)
+        gt = self._match_gt_in_front(seed, robot_pos_world, robot_yaw)
+        if gt is None:
+            gt = self._match_gt_for_target(seed)
         if gt is None:
             return None
         pw = gt.get("pos_world")
