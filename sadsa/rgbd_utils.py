@@ -24,7 +24,13 @@ from config import (
     HEAD_CAM,
     HEAD_CAM_POS_ROBOT,
     HEAD_CAM_ROT_MATRIX,
+    HEAD_NAV_BOTTOM_FRAC,
+    HEAD_NAV_Z_PERCENTILE,
+    MIN_NAV_POINT_COUNT,
+    MIN_NAV_POS_CONF,
     MOTION_GRASP_HEIGHT_OFFSET,
+    POS_JUMP_REJECT_FAR_M,
+    POS_JUMP_REJECT_NEAR_M,
 )
 
 CAMERA_MODELS = {
@@ -406,33 +412,97 @@ def refresh_ee_object_pose(
     return compensate_grasp_for_gripper_base(out, robot_pos, robot_yaw)
 
 
+def head_nav_pos_confidence(obj: dict) -> float:
+    n = int(obj.get("nav_point_count") or 0)
+    sm = float(obj.get("blob_sat_mean") or 0.0)
+    vm = float(obj.get("blob_val_mean") or 0.0)
+    depth = float(obj.get("depth_m") or 99.0)
+    score = min(1.0, n / max(MIN_NAV_POINT_COUNT, 1)) * 0.45
+    if obj.get("pos_from_pointcloud"):
+        score += 0.38
+    if depth < 1.35:
+        score += 0.08
+    if sm > 48 and vm > 65:
+        score += 0.09
+    if obj.get("pos_jump_rejected"):
+        score *= 0.55
+    return float(np.clip(score, 0.0, 1.0))
+
+
+def pos_jump_limit_m(dist_m: float) -> float:
+    return POS_JUMP_REJECT_NEAR_M if dist_m < 1.35 else POS_JUMP_REJECT_FAR_M
+
+
+def reject_pos_world_jump(
+    obj: dict,
+    prev_world: Optional[np.ndarray],
+    robot_pos: np.ndarray,
+    robot_yaw: float,
+) -> dict:
+    """单帧 world XY 跳变过大 → 保持上一帧稳定位置."""
+    out = dict(obj)
+    pw = out.get("pos_world")
+    if pw is None or prev_world is None:
+        return out
+    pw_np = np.asarray(pw, dtype=np.float32)
+    prev_np = np.asarray(prev_world, dtype=np.float32).reshape(3)
+    dist = float(out.get("dist_to_robot") or out.get("nav_depth_m") or out.get("depth_m") or 2.0)
+    lim = pos_jump_limit_m(dist)
+    if float(np.linalg.norm(pw_np[:2] - prev_np[:2])) > lim:
+        out["pos_world"] = prev_np.tolist()
+        pr = world_to_robot_frame(prev_np, robot_pos, robot_yaw)
+        out["pos_robot"] = pr.tolist()
+        out["dist_to_robot"] = float(np.linalg.norm(pr[:2]))
+        out["yaw_rel"] = float(np.arctan2(pr[1], pr[0]))
+        out["nav_yaw_rel"] = out["yaw_rel"]
+        out["pos_jump_rejected"] = True
+        out["world_reliable"] = False
+    return out
+
+
 def refresh_head_object_pose(
     obj: dict,
     robot_pos: np.ndarray,
     robot_yaw: float,
     cam_pos_robot: np.ndarray,
 ) -> dict:
-    """head: centroid+depth + 动态外参重算 world"""
+    """head: 底边 anchor + 点云融合 + 动态外参 (不用 centroid 单点 depth 覆盖点云)"""
     out = dict(obj)
-    uv = out.get("centroid_uv")
-    depth = out.get("depth_m")
-    if uv is None or depth is None:
+    anchor_uv = out.get("nav_anchor_uv") or out.get("centroid_uv")
+    depth = out.get("nav_anchor_depth") or out.get("depth_m")
+    if anchor_uv is None or depth is None:
         return out
     try:
-        u, v = float(uv[0]), float(uv[1])
+        au, av = float(anchor_uv[0]), float(anchor_uv[1])
         depth_f = float(depth)
     except (TypeError, ValueError, IndexError):
         return out
     if depth_f <= 0.05:
         return out
-    pos_r = pixel_to_robot(u, v, depth_f, HEAD_CAM, cam_pos_robot, HEAD_CAM_ROT_MATRIX)
+
+    anchor_r = pixel_to_robot(au, av, depth_f, HEAD_CAM, cam_pos_robot, HEAD_CAM_ROT_MATRIX)
+    if out.get("pos_from_pointcloud") and out.get("pos_robot") is not None:
+        pc_r = np.asarray(out["pos_robot"], dtype=np.float32)
+        n = int(out.get("nav_point_count") or 0)
+        w_pc = min(0.82, 0.55 + n / 80.0)
+        pos_r = (w_pc * pc_r + (1.0 - w_pc) * anchor_r).astype(np.float32)
+        pos_r[2] = pc_r[2]
+    else:
+        pos_r = anchor_r.astype(np.float32)
+
     out["pos_robot"] = pos_r.tolist()
     out["pos_world"] = robot_to_world(pos_r, robot_pos, robot_yaw).tolist()
     out["dist_to_robot"] = float(np.linalg.norm(pos_r[:2]))
     out["yaw_rel"] = float(np.arctan2(pos_r[1], pos_r[0]))
     out["nav_depth_m"] = depth_f
     out["nav_yaw_rel"] = out["yaw_rel"]
-    out["world_reliable"] = depth_f < WORLD_RELIABLE_DEPTH_M
+    conf = head_nav_pos_confidence(out)
+    out["pos_confidence"] = conf
+    out["world_reliable"] = (
+        depth_f < WORLD_RELIABLE_DEPTH_M
+        and conf >= MIN_NAV_POS_CONF
+        and not out.get("pos_jump_rejected", False)
+    )
     return out
 
 

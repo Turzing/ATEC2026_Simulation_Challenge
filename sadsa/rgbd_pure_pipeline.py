@@ -33,6 +33,9 @@ from config import (
     HEAD_CAM,
     HEAD_CAM_POS_ROBOT,
     HEAD_CAM_ROT_MATRIX,
+    HEAD_NAV_BOTTOM_FRAC,
+    HEAD_NAV_Z_PERCENTILE,
+    MIN_NAV_POINT_COUNT,
     OBJECT_SIZES,
     PROPRIO_BASE_ANG_VEL,
     PROPRIO_BASE_LIN_VEL,
@@ -1066,13 +1069,48 @@ class RgbdPureCamera:
         is_ee = self.camera_name == "ee"
         x1, y1, x2, y2 = bbox
 
-        # ── head: 仅导航 ──
+        # ── head: 点云 + 底边 anchor 导航 (不用 centroid 单点 depth) ──
         if is_head:
-            pos_r = self._uv_depth_to_robot(cx, cy, depth_m)
-            if pos_r is None:
-                pos_r = self._pos_from_mask(ys, xs, depth, depth_m)
-            if pos_r is None:
-                return None
+            nav_u = float(cx)
+            nav_v = float(y2)
+            au = int(np.clip(nav_u, 0, w - 1))
+            av = int(np.clip(nav_v, 0, h - 1))
+            az = float(depth[av, au])
+            if az <= self._depth_min() or az >= DEPTH_MAX:
+                az = float(depth_m)
+
+            pts = self._blob_points_robot(ys, xs, depth, depth_m)
+            pos_from_pc = False
+            nav_point_count = 0
+            if pts is not None and len(pts) >= MIN_NAV_POINT_COUNT:
+                y_cut = float(np.quantile(ys.astype(np.float32), HEAD_NAV_BOTTOM_FRAC))
+                bot = ys >= y_cut
+                if int(np.sum(bot)) >= 6:
+                    pts_bot = []
+                    step = 1 if int(np.sum(bot)) < 400 else 2
+                    dmin = self._depth_min()
+                    for y, x in zip(ys[bot][::step], xs[bot][::step]):
+                        z = float(depth[y, x])
+                        if z <= dmin or z >= DEPTH_MAX:
+                            continue
+                        pts_bot.append(self._uv_depth_to_robot(float(x), float(y), z))
+                    if len(pts_bot) >= 6:
+                        pts_bot = np.stack(pts_bot, axis=0).astype(np.float32)
+                        pos_r = np.median(pts_bot, axis=0).astype(np.float32)
+                        pos_r[2] = float(np.percentile(pts[:, 2], HEAD_NAV_Z_PERCENTILE))
+                    else:
+                        pos_r = np.median(pts, axis=0).astype(np.float32)
+                else:
+                    pos_r = np.median(pts, axis=0).astype(np.float32)
+                pos_from_pc = True
+                nav_point_count = int(len(pts))
+            else:
+                pos_r = self._uv_depth_to_robot(nav_u, nav_v, az)
+                if pos_r is None:
+                    pos_r = self._pos_from_mask(ys, xs, depth, depth_m)
+                if pos_r is None:
+                    return None
+                nav_point_count = int(len(ys))
             if float(pos_r[2]) < -0.78 or float(pos_r[2]) > 0.28:
                 return None
             if depth_m < 0.85 and sm < 58 and cy > h * 0.30 and abs(cx - w * 0.5) < w * 0.34:
@@ -1092,6 +1130,8 @@ class RgbdPureCamera:
                 "bbox": bbox,
                 "centroid": (cx, cy),
                 "centroid_uv": [cx, cy],
+                "nav_anchor_uv": [nav_u, nav_v],
+                "nav_anchor_depth": az,
                 "depth_m": depth_f,
                 "dist_to_robot": float(np.linalg.norm(pos_r[:2])),
                 "yaw_rel": yaw_rel,
@@ -1099,12 +1139,14 @@ class RgbdPureCamera:
                 "nav_yaw_rel": yaw_rel,
                 "pos_robot": pos_r.tolist(),
                 "pos_world": pos_w.tolist(),
+                "pos_from_pointcloud": pos_from_pc,
+                "nav_point_count": nav_point_count,
                 "blob_sat_mean": sm,
                 "blob_val_mean": vm,
                 "source": "rgbd_nav_head",
                 "camera": "head",
                 "role": "nav",
-                "world_reliable": depth_f < WORLD_RELIABLE_DEPTH_M,
+                "world_reliable": depth_f < WORLD_RELIABLE_DEPTH_M and pos_from_pc,
                 "grasp_reliable": False,
             }
 

@@ -35,16 +35,19 @@ from config import (
 from rgbd_pure_pipeline import RgbdPureCamera, _robot_to_world, _yaw_from_gravity
 from rgbd_utils import (
     GRASP_RELIABLE_DEPTH_M,
+    MIN_NAV_POS_CONF,
     _to_numpy,
     compute_dynamic_ee_cam_pos,
     compute_dynamic_head_cam_pos,
     depth_stats,
     filter_plausible_objects,
+    head_nav_pos_confidence,
     parse_ee_rgbd,
     parse_head_rgbd,
     refresh_ee_object_pose,
     refresh_head_object_pose,
     refresh_locked_grasp,
+    reject_pos_world_jump,
     stabilize_ee_nav_pose,
     world_to_robot_frame,
 )
@@ -174,6 +177,32 @@ def _object_summary(o: dict, cam: str) -> dict:
     return s
 
 
+class _PosWorldGate:
+    """跨帧 world 位置门控: 拒跳变、维持稳定输出."""
+
+    def __init__(self):
+        self._last: Dict[Tuple[str, int, str], np.ndarray] = {}
+
+    def reset(self):
+        self._last.clear()
+
+    def apply(self, obj: dict, cam: str, robot_pos, robot_yaw) -> dict:
+        cls = str(obj.get("class") or "")
+        key = (cam, int(obj["id"]), cls)
+        prev = self._last.get(key)
+        out = reject_pos_world_jump(obj, prev, robot_pos, robot_yaw)
+        pw = out.get("pos_world")
+        if pw is None:
+            return out
+        pw_np = np.asarray(pw, dtype=np.float32)
+        if not out.get("pos_jump_rejected"):
+            self._last[key] = pw_np.copy()
+        elif prev is not None:
+            self._last[key] = prev.copy()
+        out["pos_confidence"] = head_nav_pos_confidence(out) if cam == "head" else out.get("pos_confidence")
+        return out
+
+
 class _TemporalMedian:
     def __init__(self, n: int = TEMPORAL_MEDIAN_N, grasp_n: int = GRASP_TEMPORAL_N):
         self.n = n
@@ -221,9 +250,18 @@ class _TemporalMedian:
             # 世界系滤波：转圈时 robot 系坐标会变，不能对 pos_robot 做 median
             worlds = [x.get("pos_world") for x in h if x.get("pos_world") is not None]
             if worlds:
-                med_w = np.median(
-                    np.stack([np.asarray(w, dtype=np.float32) for w in worlds]), axis=0,
-                )
+                stack_w = np.stack([np.asarray(w, dtype=np.float32) for w in worlds], axis=0)
+                if len(stack_w) >= 3:
+                    rough = np.median(stack_w, axis=0)
+                    dist_m = float(m.get("depth_m") or m.get("nav_depth_m") or 2.0)
+                    lim = 0.32 if dist_m < 1.35 else 0.48
+                    keep = [
+                        float(np.linalg.norm(stack_w[i, :2] - rough[:2])) <= lim
+                        for i in range(len(stack_w))
+                    ]
+                    if any(keep):
+                        stack_w = stack_w[np.asarray(keep, dtype=bool)]
+                med_w = np.median(stack_w, axis=0)
                 m["pos_world"] = med_w.tolist()
                 med_r = world_to_robot_frame(med_w, robot_pos, robot_yaw)
                 m["pos_robot"] = med_r.tolist()
@@ -257,6 +295,13 @@ class _TemporalMedian:
                     ).tolist()
 
             m["world_reliable"] = float(m.get("depth_m") or 99.0) < 2.0
+            if cam == "head":
+                m["pos_confidence"] = head_nav_pos_confidence(m)
+                m["world_reliable"] = (
+                    m["world_reliable"]
+                    and m["pos_confidence"] >= MIN_NAV_POS_CONF
+                    and bool(m.get("pos_from_pointcloud"))
+                )
             out.append(m)
         return out
 
@@ -270,6 +315,9 @@ def _nav_quality(obj: dict) -> float:
         q -= 80.0
     if obj.get("world_reliable"):
         q += 30.0
+    q += float(obj.get("pos_confidence") or head_nav_pos_confidence(obj)) * 120.0
+    if obj.get("pos_jump_rejected"):
+        q -= 200.0
     return q
 
 
@@ -346,11 +394,20 @@ def _find_in_pool(
     pool: List[dict],
     lock_id: Optional[int],
     lock_class: Optional[str],
+    lock_world: Optional[List[float]] = None,
 ) -> Optional[dict]:
     if lock_id is not None:
         for o in pool:
-            if int(o.get("id", -1)) == int(lock_id):
-                return o
+            if int(o.get("id", -1)) != int(lock_id):
+                continue
+            if lock_class and o.get("class") != lock_class:
+                continue
+            return o
+    if lock_class and lock_world is not None:
+        cands = [o for o in pool if o.get("class") == lock_class]
+        if cands:
+            ref = {"pos_world": lock_world}
+            return min(cands, key=lambda o: _world_xy_dist(o, ref))
     if lock_class:
         cands = [o for o in pool if o.get("class") == lock_class]
         if cands:
@@ -363,8 +420,12 @@ def _find_locked_target(
     ee_objs: List[dict],
     lock_id: Optional[int],
     lock_class: Optional[str],
+    lock_world: Optional[List[float]] = None,
 ) -> Optional[dict]:
-    return _find_in_pool(head_objs, lock_id, lock_class) or _find_in_pool(ee_objs, lock_id, lock_class)
+    return (
+        _find_in_pool(head_objs, lock_id, lock_class, lock_world)
+        or _find_in_pool(ee_objs, lock_id, lock_class, lock_world)
+    )
 
 
 def _acquire_nav_lock(
@@ -373,12 +434,24 @@ def _acquire_nav_lock(
     head_d: float,
     ee_d: float,
 ) -> Optional[dict]:
-    """无锁时单次只选一个目标，近距优先 head."""
+    """无锁时单次只选一个目标，近距优先 head，且必须 pos_confidence 达标."""
+    cands: List[Tuple[float, dict]] = []
     if head_nav and head_d < NAV_EE_TO_HEAD_M:
-        return head_nav
+        cands.append((head_d, head_nav))
     if ee_nav and (not head_nav or ee_d <= head_d + 0.20):
-        return ee_nav
-    return head_nav or ee_nav
+        cands.append((ee_d, ee_nav))
+    if head_nav and not cands:
+        cands.append((head_d, head_nav))
+    if ee_nav and not cands:
+        cands.append((ee_d, ee_nav))
+    cands.sort(key=lambda x: x[0])
+    for _, c in cands:
+        conf = float(c.get("pos_confidence") or head_nav_pos_confidence(c))
+        if conf >= MIN_NAV_POS_CONF or c.get("pos_from_pointcloud"):
+            out = dict(c)
+            out["pos_confidence"] = conf
+            return out
+    return cands[0][1] if cands else None
 
 
 def _resolve_nav_stage(nav_dist: float, want_grasp: bool, prev: str) -> str:
@@ -402,6 +475,7 @@ def _resolve_authoritative_target(
     ee_nav: Optional[dict],
     lock_id: Optional[int],
     lock_class: Optional[str],
+    lock_world: Optional[List[float]] = None,
 ) -> Tuple[Optional[dict], str, str]:
     """
     按阶段唯一主导相机选目标; primary 缺失才降级 fallback，二者不同时生效。
@@ -412,14 +486,16 @@ def _resolve_authoritative_target(
     pools = {"head": head_objs, "ee": ee_objs}
     navs = {"head": head_nav, "ee": ee_nav}
 
-    tgt = _find_in_pool(pools[primary], lock_id, lock_class)
+    tgt = _find_in_pool(pools[primary], lock_id, lock_class, lock_world)
     if tgt is None:
         tgt = navs[primary]
-    if tgt is not None:
+    if tgt is not None and float(tgt.get("pos_confidence") or 0) >= MIN_NAV_POS_CONF * 0.7:
+        return tgt, primary, "primary"
+    if tgt is not None and lock_id is not None:
         return tgt, primary, "primary"
 
     if fallback:
-        fb = _find_in_pool(pools[fallback], lock_id, lock_class)
+        fb = _find_in_pool(pools[fallback], lock_id, lock_class, lock_world)
         if fb is None:
             fb = navs[fallback]
         if fb is not None:
@@ -541,6 +617,39 @@ def _export_ee_for_motion(
     return []
 
 
+def _ensure_ee_motion_export(
+    ee_motion: List[dict],
+    auth_tgt: Optional[dict],
+    auth_cam: str,
+    head_nav: Optional[dict],
+    ee_nav: Optional[dict],
+    head_objs: List[dict],
+    ee_objs: List[dict],
+    nav_stage: str,
+) -> List[dict]:
+    """solution_rl preferred=ee: 永不让 ee_objects 为空 (head 有目标时必须 mirror)."""
+    if ee_motion:
+        return ee_motion
+    if auth_tgt is not None:
+        if auth_cam == "head" or nav_stage == "near_head":
+            return [_make_head_mirror(auth_tgt)]
+        if not _is_far_ee_nav_unreliable(auth_tgt):
+            return [stabilize_ee_nav_pose(dict(auth_tgt))]
+    if head_nav is not None and float(head_nav.get("pos_confidence") or 0) >= MIN_NAV_POS_CONF * 0.85:
+        return [_make_head_mirror(head_nav)]
+    if ee_nav is not None and not _is_far_ee_nav_unreliable(ee_nav):
+        return [stabilize_ee_nav_pose(dict(ee_nav))]
+    if head_objs:
+        best = max(head_objs, key=lambda o: float(o.get("pos_confidence") or head_nav_pos_confidence(o)))
+        if float(best.get("pos_confidence") or 0) >= MIN_NAV_POS_CONF * 0.75:
+            return [_make_head_mirror(best)]
+    if ee_objs:
+        best = min(ee_objs, key=_obj_dist)
+        if not _is_far_ee_nav_unreliable(best):
+            return [stabilize_ee_nav_pose(dict(best))]
+    return []
+
+
 class RgbdPureDualPipeline:
     def __init__(self):
         self.ee = RgbdPureCamera("ee")
@@ -549,24 +658,28 @@ class RgbdPureDualPipeline:
         self.robot_pos = ROBOT_INIT_POS.copy().astype(np.float32)
         self.robot_yaw = float(ROBOT_INIT_YAW)
         self._temporal = _TemporalMedian()
+        self._pos_gate = _PosWorldGate()
         self._frozen_grasp: Optional[dict] = None
         self._nav_stage = "far_ee"
         self._nav_lock_id: Optional[int] = None
         self._nav_lock_class: Optional[str] = None
+        self._nav_lock_world: Optional[List[float]] = None
         self._nav_lock_miss = 0
         print(
-            "[RgbdPureDual] 3-stage priority: far=ee>head | near=head>ee | grasp=ee-only "
-            f"(lock+single ee_objects, ee>={NAV_EE_FAR_MIN_M}m grasp<{GRASP_PHASE_DIST_M}m)"
+            "[RgbdPureDual] 3-stage + pos_gate: far=ee>head | near=head>ee | grasp=ee-only "
+            f"(min_conf={MIN_NAV_POS_CONF}, ee_objects never empty if head sees target)"
         )
 
     def reset(self):
         self.ee.reset()
         self.head.reset()
         self._temporal.reset()
+        self._pos_gate.reset()
         self._frozen_grasp = None
         self._nav_stage = "far_ee"
         self._nav_lock_id = None
         self._nav_lock_class = None
+        self._nav_lock_world = None
         self._nav_lock_miss = 0
         self.frame_count = 0
         self.robot_pos = ROBOT_INIT_POS.copy().astype(np.float32)
@@ -659,6 +772,8 @@ class RgbdPureDualPipeline:
         ee_objs = self._temporal.apply(ee_objs, "ee", rp, ry, motion)
         head_objs = [_finalize_head(o, rp, ry, grav) for o in head_objs]
         ee_objs = [_finalize_ee(o, rp, ry, arm_q) for o in ee_objs]
+        head_objs = [self._pos_gate.apply(o, "head", rp, ry) for o in head_objs]
+        ee_objs = [self._pos_gate.apply(o, "ee", rp, ry) for o in ee_objs]
 
         ee_objs = filter_plausible_objects(ee_objs, "ee")
         ee_near = _obj_dist(_best_nav_target(ee_objs) or _best_ee_grasp(ee_objs))
@@ -670,7 +785,10 @@ class RgbdPureDualPipeline:
 
         ee_nav = _best_nav_target(ee_objs, self._nav_lock_id, self._nav_lock_class)
         head_nav = _best_nav_target(head_objs, self._nav_lock_id, self._nav_lock_class)
-        lock_ref = _find_locked_target(head_objs, ee_objs, self._nav_lock_id, self._nav_lock_class)
+        lock_ref = _find_locked_target(
+            head_objs, ee_objs,
+            self._nav_lock_id, self._nav_lock_class, self._nav_lock_world,
+        )
         ee_grasp = _best_ee_grasp(ee_objs, lock_ref or head_nav or ee_nav)
         ee_d = _obj_dist(ee_grasp or ee_nav)
         head_d = _obj_dist(head_nav)
@@ -681,6 +799,8 @@ class RgbdPureDualPipeline:
             if seed is not None:
                 self._nav_lock_id = int(seed["id"])
                 self._nav_lock_class = seed.get("class")
+                pw = seed.get("pos_world")
+                self._nav_lock_world = list(pw) if pw is not None else None
                 locked = seed
 
         nav_dist = _obj_dist(locked or head_nav or ee_nav)
@@ -697,13 +817,15 @@ class RgbdPureDualPipeline:
 
         auth_tgt, auth_cam, auth_mode = _resolve_authoritative_target(
             nav_stage, head_objs, ee_objs, head_nav, ee_nav,
-            self._nav_lock_id, self._nav_lock_class,
+            self._nav_lock_id, self._nav_lock_class, self._nav_lock_world,
         )
         if auth_tgt is not None:
             nav_dist = _obj_dist(auth_tgt)
             if auth_mode == "primary":
                 self._nav_lock_id = int(auth_tgt["id"])
                 self._nav_lock_class = auth_tgt.get("class")
+                pw = auth_tgt.get("pos_world")
+                self._nav_lock_world = list(pw) if pw is not None else self._nav_lock_world
                 self._nav_lock_miss = 0
             else:
                 self._nav_lock_miss += 1
@@ -713,11 +835,14 @@ class RgbdPureDualPipeline:
         if self._nav_lock_miss >= NAV_LOCK_MISS_MAX:
             self._nav_lock_id = None
             self._nav_lock_class = None
+            self._nav_lock_world = None
             self._nav_lock_miss = 0
             seed = _acquire_nav_lock(head_nav, ee_nav, head_d, ee_d)
             if seed is not None:
                 self._nav_lock_id = int(seed["id"])
                 self._nav_lock_class = seed.get("class")
+                pw = seed.get("pos_world")
+                self._nav_lock_world = list(pw) if pw is not None else None
 
         grasp_src = ee_grasp_nav if _same_nav_target(ee_grasp_nav, auth_tgt) else None
         if grasp_src is None and auth_tgt is not None:
@@ -737,6 +862,10 @@ class RgbdPureDualPipeline:
         ee_objs_raw = list(ee_objs)
         ee_motion = _export_ee_for_motion(
             ee_objs, head_objs, auth_tgt, auth_cam, nav_stage, auth_mode,
+        )
+        ee_motion = _ensure_ee_motion_export(
+            ee_motion, auth_tgt, auth_cam, head_nav, ee_nav,
+            head_objs, ee_objs_raw, nav_stage,
         )
         ee_objs = ee_motion
 
@@ -758,6 +887,7 @@ class RgbdPureDualPipeline:
             "nav_authority": auth_cam,
             "nav_authority_mode": auth_mode,
             "nav_lock_id": self._nav_lock_id,
+            "nav_pos_confidence": None if nav_tgt is None else nav_tgt.get("pos_confidence"),
             "navigation": {"camera": nav_cam, "target": nav_tgt, "objects_detailed": nav_objs},
             "target_nav": nav_tgt,
             "objects_nav": nav_objs,
