@@ -879,7 +879,10 @@ class AlgSolution:
             
         except Exception as exc:
             if not self._perception_error_printed:
-                self._log(f"[TaskB-PERCEPTION] disabled after error: {type(exc).__name__}: {exc}")
+                self._log(
+                    f"[TaskB-PERCEPTION] process failed: {type(exc).__name__}: {exc} "
+                    "(check taskb_perception/rgbd_depth_cluster.py has 'h, w = depth.shape[:2]' in detect())"
+                )
                 self._perception_error_printed = True
             perception_output = None
         robot_pos_world, robot_yaw, pose_source = self._resolve_robot_pose_world(obs, local_nav, perception_output)
