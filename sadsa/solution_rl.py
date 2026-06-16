@@ -81,6 +81,8 @@ class AlgSolution:
         self._locked_goal_yaw: float | None = None
         self._locked_goal_target_id: Any | None = None
         self._locked_target_world: list[float] | None = None
+        self._pregrasp_stall_steps = 0
+        self._pregrasp_last_robot_xy: np.ndarray | None = None
         self._release_step_count = 0
         self._arm_grasp_controller = None
         self._arm_controller_init_failed = False
@@ -199,8 +201,10 @@ class AlgSolution:
         self.target_ema_alpha_ee = float(os.getenv("ATEC_TASKB_TARGET_EMA_ALPHA_EE", "0.25"))
         self.target_ema_alpha_head = float(os.getenv("ATEC_TASKB_TARGET_EMA_ALPHA_HEAD", "0.45"))
         self.target_near_range = float(os.getenv("ATEC_TASKB_TARGET_NEAR_RANGE", "1.80"))
-        self.target_freeze_distance = float(os.getenv("ATEC_TASKB_TARGET_FREEZE_DISTANCE", "1.20"))
-        self.target_relock_disagreement = float(os.getenv("ATEC_TASKB_TARGET_RELOCK_DISAGREEMENT", "0.60"))
+        self.target_freeze_distance = float(os.getenv("ATEC_TASKB_TARGET_FREEZE_DISTANCE", "0.95"))
+        self.target_relock_disagreement = float(os.getenv("ATEC_TASKB_TARGET_RELOCK_DISAGREEMENT", "0.35"))
+        self.ee_track_max_distance = float(os.getenv("ATEC_TASKB_EE_TRACK_MAX_DISTANCE", "2.15"))
+        self.pregrasp_stall_steps = max(10, int(os.getenv("ATEC_TASKB_PREGRASP_STALL_STEPS", "35")))
         self.turn_then_go_yaw_threshold = float(os.getenv("ATEC_TASKB_TURN_THEN_GO_YAW_THRESHOLD", "0.30"))
         self.turn_then_go_heading_hold = float(os.getenv("ATEC_TASKB_TURN_THEN_GO_HEADING_HOLD", "0.18"))
         self.dynamic_stop_distance_far = float(os.getenv("ATEC_TASKB_DYNAMIC_STOP_DISTANCE_FAR", "1.15"))
@@ -1268,18 +1272,39 @@ class AlgSolution:
                 )
                 self._clear_frozen_pregrasp()
 
+        cons_dist = self._conservative_target_dist(target_nav, robot_pos_world)
         if (
             self._locked_goal_xy is None
             and bool(target_nav.get("confirmed", False))
             and bool(target_nav.get("visible", True))
             and target_nav["dist_to_robot"] <= self.target_freeze_distance
+            and cons_dist <= self.grasp_start_depth - 0.05
             and target_nav.get("source_camera") == "head"
             and int(target_nav.get("head_stable_count", 0)) >= self.target_head_confirm_steps
         ):
             self._freeze_pregrasp_for_target(target_nav, robot_pos_world)
 
         if self._locked_goal_xy is not None and self._locked_goal_yaw is not None:
-            return self._compute_frozen_pregrasp_cmd(target_nav, robot_pos_world, robot_yaw)
+            base_cmd, nav_info = self._compute_frozen_pregrasp_cmd(target_nav, robot_pos_world, robot_yaw)
+            goal_dist = float(nav_info.get("goal_dist", 0.0))
+            robot_xy = robot_pos_world[:2]
+            if self._pregrasp_last_robot_xy is not None:
+                moved = float(np.linalg.norm(robot_xy - self._pregrasp_last_robot_xy))
+                if moved < 0.015 and goal_dist > 0.28 and abs(float(base_cmd[0])) > 0.05:
+                    self._pregrasp_stall_steps += 1
+                else:
+                    self._pregrasp_stall_steps = 0
+            self._pregrasp_last_robot_xy = robot_xy.copy()
+            if self._pregrasp_stall_steps >= self.pregrasp_stall_steps:
+                self._log(
+                    f"[NAV] pregrasp stall ({self._pregrasp_stall_steps} steps, goal={goal_dist:.2f}m), "
+                    "unlocking frozen goal"
+                )
+                self._clear_frozen_pregrasp()
+                return self._compute_dynamic_visual_cmd(target_nav, target_pos_robot)
+            return base_cmd, nav_info
+        self._pregrasp_stall_steps = 0
+        self._pregrasp_last_robot_xy = None
         return self._compute_dynamic_visual_cmd(target_nav, target_pos_robot)
 
     @staticmethod
@@ -1429,6 +1454,8 @@ class AlgSolution:
         self._locked_goal_yaw = None
         self._locked_goal_target_id = None
         self._locked_target_world = None
+        self._pregrasp_stall_steps = 0
+        self._pregrasp_last_robot_xy = None
 
     def _clear_locked_target(self) -> None:
         self._locked_target = None
@@ -1502,15 +1529,24 @@ class AlgSolution:
                 score += 3.0
         return score
 
+    def _tracking_candidate_allowed(self, candidate: dict[str, Any]) -> bool:
+        source = str(candidate.get("source_camera", "ee"))
+        pos_robot = self._safe_numpy(candidate.get("pos_robot"), np.zeros(3, dtype=np.float32))
+        dist = self._safe_float(candidate.get("dist_to_robot"), float(np.linalg.norm(pos_robot[:2])))
+        if source == "ee" and dist > self.ee_track_max_distance:
+            return False
+        return True
+
     def _select_best_candidate(
         self,
         candidates: list[dict[str, Any]],
         preferred_camera: str,
         reference: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
-        if not candidates:
+        eligible = [c for c in candidates if self._tracking_candidate_allowed(c)]
+        if not eligible:
             return None
-        return min(candidates, key=lambda candidate: self._candidate_rank(candidate, preferred_camera, reference))
+        return min(eligible, key=lambda candidate: self._candidate_rank(candidate, preferred_camera, reference))
 
     def _match_candidate_to_track(
         self,
@@ -1539,7 +1575,13 @@ class AlgSolution:
         alpha = self._tracking_alpha(str(candidate.get("source_camera", "ee")))
         prev_pos = self._safe_numpy(state.get("filtered_pos_world"), np.zeros(3, dtype=np.float32))
         obs_pos = self._safe_numpy(candidate.get("pos_world"), np.zeros(3, dtype=np.float32))
-        filtered_pos = (1.0 - alpha) * prev_pos + alpha * obs_pos
+        jump_xy = float(np.linalg.norm(obs_pos[:2] - prev_pos[:2]))
+        if jump_xy > 1.20:
+            filtered_pos = obs_pos
+            state["stable_count"] = 1
+            state["head_stable_count"] = 0
+        else:
+            filtered_pos = (1.0 - alpha) * prev_pos + alpha * obs_pos
         pos_robot = self._safe_numpy(candidate.get("pos_robot"), np.zeros(3, dtype=np.float32))
         state["filtered_pos_world"] = filtered_pos.tolist()
         state["last_candidate"] = dict(candidate)
