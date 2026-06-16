@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+PERCEPTION_BUILD_ID = "20260617-fix-detect-shape"
+
 from typing import List, Optional, Tuple
 
 import cv2
@@ -240,6 +242,7 @@ class DepthClusterDetector:
         robot_yaw: float,
     ) -> List[dict]:
         depth = sanitize_depth(depth)
+        img_h, img_w = int(depth.shape[0]), int(depth.shape[1])
         mask = self._build_mask(depth)
         labeled, n = ndimage.label(mask)
         if n == 0:
@@ -272,11 +275,11 @@ class DepthClusterDetector:
 
             x1, x2 = int(xs.min()), int(xs.max())
             y1, y2 = int(ys.min()), int(ys.max())
-            if is_head and float(np.median(ys)) > h * 0.62:
+            if is_head and float(np.median(ys)) > img_h * 0.62:
                 continue
             bbox = [x1, y1, x2, y2]
             bw, bh = max(1, x2 - x1 + 1), max(1, y2 - y1 + 1)
-            if is_head and bw * bh > h * w * 0.14:
+            if is_head and bw * bh > img_h * img_w * 0.14:
                 continue
             cx, cy = float(np.median(xs)), float(np.median(ys))
             cls, cls_conf = _classify_cluster(rgb, ys, xs, bbox, z_extent)

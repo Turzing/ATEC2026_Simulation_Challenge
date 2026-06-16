@@ -105,6 +105,11 @@ try:
 except ImportError:
     RansacClusterDetector = None  # type: ignore[misc, assignment]
 
+try:
+    from rgbd_depth_cluster import PERCEPTION_BUILD_ID as _DEPTH_CLUSTER_BUILD
+except ImportError:
+    _DEPTH_CLUSTER_BUILD = "missing-rgbd_depth_cluster"
+
 GRASP_PHASE_DIST_M = 1.10
 GRASP_APPROACH_DIST_M = 1.22   # head/lock 近距即请求 grasp 阶段
 GRASP_LOCK_DIST_M = 1.22
@@ -1276,7 +1281,9 @@ class RgbdPureDualPipeline:
         print(
             f"[RgbdPureDual] {mode} | head-nav | "
             f"ee={'static-ransac' if STATIC_TWO_STEP else 'grasp'} | "
-            f"coast={'off' if RGBD_SIMPLE else str(DETECTION_COAST_FRAMES) + 'f'}"
+            f"coast={'off' if RGBD_SIMPLE else str(DETECTION_COAST_FRAMES) + 'f'} | "
+            f"depth_cluster={_DEPTH_CLUSTER_BUILD} | "
+            f"ransac={'ok' if self._ransac is not None else 'MISSING'}"
         )
 
     def reset(self):
