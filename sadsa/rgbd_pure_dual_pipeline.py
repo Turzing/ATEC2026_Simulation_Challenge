@@ -613,12 +613,18 @@ def _find_in_pool(
     lock_world: Optional[List[float]] = None,
 ) -> Optional[dict]:
     if lock_id is not None:
-        for o in pool:
-            if int(o.get("id", -1)) != int(lock_id):
-                continue
-            if lock_class and o.get("class") != lock_class:
-                continue
-            return o
+        cands = [o for o in pool if int(o.get("id", -1)) == int(lock_id)]
+        if lock_class:
+            cands = [o for o in cands if o.get("class") == lock_class]
+        if cands:
+            if lock_world is not None:
+                ref = {"pos_world": lock_world}
+                cands.sort(key=lambda o: _world_xy_dist(o, ref))
+                best = cands[0]
+                if _world_xy_dist(best, ref) > POS_JUMP_REJECT_FAR_M:
+                    return None
+                return best
+            return cands[0]
     if lock_class and lock_world is not None:
         cands = [o for o in pool if o.get("class") == lock_class]
         if cands:
@@ -641,6 +647,8 @@ def _find_locked_target(
     hit = _find_in_pool(head_objs, lock_id, lock_class, lock_world)
     if hit is not None:
         return hit
+    if lock_world is not None:
+        return None
     return _find_in_pool(ee_objs, lock_id, lock_class, lock_world)
 
 
@@ -1176,6 +1184,13 @@ class RgbdPureDualPipeline:
         locked = lock_ref
         if locked is None and self._nav_lock_id is None:
             seed = _acquire_nav_lock(head_objs, ee_objs, head_nav, ee_nav, head_d, ee_d)
+            if seed is not None and seed.get("source_camera") == "ee":
+                if _is_far_ee_nav_unreliable(seed) or not bool(seed.get("world_reliable")):
+                    seed = None
+                elif head_objs:
+                    hc = [o for o in head_objs if o.get("class") == seed.get("class")]
+                    if hc and _obj_dist(min(hc, key=_obj_dist)) < _obj_dist(seed) + 0.35:
+                        seed = None
             if seed is not None:
                 self._nav_lock_id = int(seed["id"])
                 self._nav_lock_class = seed.get("class")
@@ -1318,6 +1333,26 @@ class RgbdPureDualPipeline:
             nav_tgt = auth_tgt
         if nav_tgt is None and locked is not None:
             nav_tgt = locked
+        if (
+            nav_tgt is not None
+            and self._nav_lock_world is not None
+            and nav_tgt.get("pos_world") is not None
+        ):
+            jump = float(
+                np.linalg.norm(
+                    np.asarray(nav_tgt["pos_world"], dtype=np.float32)[:2]
+                    - np.asarray(self._nav_lock_world, dtype=np.float32)[:2]
+                )
+            )
+            if jump > POS_JUMP_REJECT_FAR_M:
+                nav_tgt = _coast_nav_from_lock(
+                    int(self._nav_lock_id),
+                    self._nav_lock_class,
+                    self._nav_lock_world,
+                    rp,
+                    ry,
+                )
+                nav_tgt["pos_jump_rejected"] = True
         if (
             nav_tgt is None
             and self._nav_lock_id is not None

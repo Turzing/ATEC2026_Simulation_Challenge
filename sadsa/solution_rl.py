@@ -1827,19 +1827,25 @@ class AlgSolution:
 
         lock_key = (lock_id, lock_class)
         pw = self._safe_numpy(target.get("pos_world"), np.zeros(3, dtype=np.float32))
+        jump_limit = self.track_jump_reject_m
         if lock_key != self._fuse_lock_key or self._fuse_pos_world is None:
             self._fuse_lock_key = lock_key
             self._fuse_pos_world = pw.copy()
             self._nav_heading_error_f = None
         else:
-            coast = bool(raw_nav.get("nav_coast"))
-            alpha = 0.18 if coast else 0.32
-            self._fuse_pos_world = (1.0 - alpha) * self._fuse_pos_world + alpha * pw
-
-        pos_robot = self._world_to_robot_frame(self._fuse_pos_world, robot_pos_world, robot_yaw)
+            jump_xy = float(np.linalg.norm(pw[:2] - self._fuse_pos_world[:2]))
+            if raw_nav.get("pos_jump_rejected") or jump_xy > jump_limit:
+                pw = self._fuse_pos_world.copy()
+            else:
+                coast = bool(raw_nav.get("nav_coast"))
+                alpha = 0.18 if coast else 0.28
+                self._fuse_pos_world = (1.0 - alpha) * self._fuse_pos_world + alpha * pw
+                pw = self._fuse_pos_world.copy()
+        self._fuse_pos_world = pw.copy()
+        pos_robot = self._world_to_robot_frame(pw, robot_pos_world, robot_yaw)
         target["id"] = lock_id if lock_id is not None else target.get("id")
         target["class"] = lock_class or target.get("class")
-        target["pos_world"] = self._fuse_pos_world.tolist()
+        target["pos_world"] = pw.tolist()
         target["pos_robot"] = pos_robot.tolist()
         target["dist_to_robot"] = float(np.linalg.norm(pos_robot[:2]))
         target["yaw_rel"] = float(math.atan2(pos_robot[1], pos_robot[0]))
