@@ -666,22 +666,8 @@ def _head_confirms_lock(
 
 
 def _can_acquire_nav_lock(seed: Optional[dict], head_objs: List[dict]) -> bool:
-    """首锁必须 head 确认；EE 独检一律拒 (log: source_camera 缺字段 bypass)."""
-    if seed is None:
-        return False
-    if _is_head_sourced(seed):
-        return True
-    if not head_objs:
-        return False
-    if not _head_confirms_lock(head_objs, seed.get("id"), seed.get("class")):
-        same = [o for o in head_objs if o.get("class") == seed.get("class")]
-        if not same:
-            return False
-    if _is_ee_sourced(seed):
-        sd = _obj_dist(seed)
-        if sd > EE_NAV_LOCK_MAX_DEPTH_M or not bool(seed.get("world_reliable")):
-            return False
-    return True
+    """有检出就允许锁，不再额外门控."""
+    return seed is not None
 
 
 def _find_locked_target(
@@ -746,20 +732,8 @@ def _acquire_nav_lock(
         return _world_xy_dist(o, {"pos_world": prefer_world}) <= NAV_RELOCK_MAX_XY_M
 
     def _eligible(o: dict, from_ee: bool) -> bool:
-        if from_ee:
-            if _is_ee_phantom_near(o, head_objs):
-                return False
-            if _is_far_ee_nav_unreliable(o):
-                return False
-            depth = float(o.get("depth_m") or o.get("nav_depth_m") or 99.0)
-            if depth > EE_NAV_LOCK_MAX_DEPTH_M or not bool(o.get("world_reliable")):
-                return False
-        else:
-            if _is_head_nav_unreliable(o):
-                return False
-            conf = float(o.get("pos_confidence") or head_nav_pos_confidence(o))
-            if conf < MIN_NAV_LOCK_CONF * 0.35:
-                return False
+        if from_ee and _is_ee_phantom_near(o, head_objs):
+            return False
         return True
 
     head_cands = [o for o in head_objs if _eligible(o, False) and _near_preferred(o)]
@@ -1289,7 +1263,7 @@ class RgbdPureDualPipeline:
             seed = _acquire_nav_lock(head_objs, ee_objs, head_nav, ee_nav, head_d, ee_d)
             if seed is not None and not _can_acquire_nav_lock(seed, head_objs):
                 seed = None
-            if seed is not None:
+            if seed is not None and _can_acquire_nav_lock(seed, head_objs):
                 self._nav_lock_id = int(seed["id"])
                 self._nav_lock_class = seed.get("class")
                 pw = seed.get("pos_world")
@@ -1310,16 +1284,6 @@ class RgbdPureDualPipeline:
             elif locked is not None and _is_ee_sourced(locked) and not head_objs:
                 self._nav_lock_ee_only = True
                 self._nav_lock_ee_only_frames = 0
-
-        if self._nav_lock_ee_only_frames >= EE_ONLY_HEAD_CONFIRM_MAX:
-            self._nav_lock_id = None
-            self._nav_lock_class = None
-            self._nav_lock_world = None
-            self._nav_lock_miss = 0
-            self._nav_lock_ee_only = False
-            self._nav_lock_ee_only_frames = 0
-            locked = None
-            lock_ref = None
 
         nav_dist = _nav_dist_conservative(locked or head_nav or ee_nav)
         lock_ref_obj = locked or head_nav or ee_nav
@@ -1394,7 +1358,7 @@ class RgbdPureDualPipeline:
                 head_objs, ee_objs, head_nav, ee_nav, head_d, ee_d,
                 prefer_class=prev_class, prefer_world=prev_world,
             )
-            if seed is not None:
+            if seed is not None and _can_acquire_nav_lock(seed, head_objs):
                 self._nav_lock_id = int(seed["id"])
                 self._nav_lock_class = seed.get("class")
                 pw = seed.get("pos_world")
@@ -1493,12 +1457,6 @@ class RgbdPureDualPipeline:
                 rp,
                 ry,
             )
-
-        # 无 head 确认 → 不 export 导航目标 (motion search; log: EE-only 2.5m 偏 2.5m)
-        if nav_tgt is not None and nav_stage != "grasp":
-            if not _head_confirms_lock(head_objs, self._nav_lock_id, self._nav_lock_class):
-                if self._nav_lock_id is None or _is_ee_sourced(nav_tgt) or nav_tgt.get("nav_coast"):
-                    nav_tgt = None
 
         if self._nav_lock_id is not None:
             synced = _sync_lock_id_from_head(

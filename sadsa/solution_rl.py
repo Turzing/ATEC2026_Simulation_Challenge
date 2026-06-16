@@ -181,7 +181,7 @@ class AlgSolution:
                 f"expected input=45, output={self.leg_action_dim}"
             )
 
-        self.stand_still_steps = max(0, int(float(os.getenv("ATEC_TASKB_STAND_SECONDS", "1.5")) / 0.02))
+        self.stand_still_steps = max(0, int(float(os.getenv("ATEC_TASKB_STAND_SECONDS", "0.3")) / 0.02))
         self.stop_distance = float(os.getenv("ATEC_TASKB_STOP_DISTANCE", "0.9"))
         self.object_stop_distance = float(os.getenv("ATEC_TASKB_OBJECT_STOP_DISTANCE", "0.7"))
         self.stop_tolerance = float(os.getenv("ATEC_TASKB_STOP_TOLERANCE", "0.2"))
@@ -205,7 +205,7 @@ class AlgSolution:
         self.target_reacquire_radius = float(os.getenv("ATEC_TASKB_TARGET_REACQUIRE_RADIUS", "0.45"))
         self.target_lock_timeout_steps = max(1, int(os.getenv("ATEC_TASKB_TARGET_LOCK_TIMEOUT_STEPS", "45")))
         self.target_confirm_steps = max(1, int(os.getenv("ATEC_TASKB_TARGET_CONFIRM_STEPS", "5")))
-        self.target_head_confirm_steps = max(1, int(os.getenv("ATEC_TASKB_TARGET_HEAD_CONFIRM_STEPS", "3")))
+        self.target_head_confirm_steps = max(1, int(os.getenv("ATEC_TASKB_TARGET_HEAD_CONFIRM_STEPS", "1")))
         self.target_pending_timeout_steps = max(1, int(os.getenv("ATEC_TASKB_TARGET_PENDING_TIMEOUT_STEPS", "12")))
         self.target_far_match_radius = float(os.getenv("ATEC_TASKB_TARGET_FAR_MATCH_RADIUS", "0.60"))
         self.target_near_match_radius = float(os.getenv("ATEC_TASKB_TARGET_NEAR_MATCH_RADIUS", "0.25"))
@@ -227,7 +227,7 @@ class AlgSolution:
         self.dynamic_stop_distance_near = float(os.getenv("ATEC_TASKB_DYNAMIC_STOP_DISTANCE_NEAR", "0.82"))
         self.dynamic_lateral_gain = float(os.getenv("ATEC_TASKB_DYNAMIC_LATERAL_GAIN", "0.60"))
         self.search_yaw_rate = float(os.getenv("ATEC_TASKB_SEARCH_YAW_RATE", "0.35"))
-        self.grasp_start_depth = float(os.getenv("ATEC_TASKB_GRASP_START_DEPTH", "1.10"))
+        self.grasp_start_depth = float(os.getenv("ATEC_TASKB_GRASP_START_DEPTH", "1.25"))
         self.bin_drop_radius = float(os.getenv("ATEC_TASKB_BIN_DROP_RADIUS", "1.0"))
         self.release_steps = max(1, int(os.getenv("ATEC_TASKB_RELEASE_STEPS", "25")))
         self.default_bin_center = np.asarray(BIN_CENTER, dtype=np.float32)
@@ -1106,7 +1106,7 @@ class AlgSolution:
 
     def _dynamic_stop_distance_for_target(self, target_nav: dict[str, Any]) -> float:
         target_dist = self._conservative_target_dist(target_nav)
-        if target_nav.get("source_camera") == "head" or target_dist <= self.target_near_range:
+        if target_dist <= self.target_near_range:
             return self.dynamic_stop_distance_near
         return self.dynamic_stop_distance_far
 
@@ -1174,27 +1174,15 @@ class AlgSolution:
         lateral_error = float(target_pos_robot[1])
         goal_dist = float(np.linalg.norm([forward_error, lateral_error]))
 
-        phase = "near_refine" if (
-            (
-                target_nav.get("source_camera") == "head"
-                and not target_nav.get("nav_coast")
-                and not target_nav.get("nav_bearing_hint")
-            )
-            or target_dist <= self.target_near_range
-        ) else "far_approach"
+        phase = "near_refine" if target_dist <= self.target_near_range else "far_approach"
 
         approach_scale = float(np.clip(goal_dist / self.slow_down_radius, 0.0, 1.0))
         heading_scale = max(self.min_heading_lin_scale, math.cos(min(abs(heading_error), math.pi / 2.0)))
-        align_threshold = self.turn_then_go_yaw_threshold if forward_error > 0.25 else self.turn_then_go_heading_hold
-        if target_nav.get("source_camera") == "head":
-            align_threshold = min(align_threshold, self.turn_then_go_heading_hold, 0.12)
-            if target_dist > 0.35:
-                lat_frac = abs(lateral_error) / max(target_dist, 0.25)
-                if lat_frac > 0.08 or abs(lateral_error) > 0.10:
-                    align_threshold = min(align_threshold, 0.08)
+        align_threshold = self.turn_then_go_yaw_threshold
 
         if abs(heading_error) > align_threshold:
-            lin_x = 0.0
+            creep = max(0.22, approach_scale * heading_scale * 0.55)
+            lin_x = float(np.clip(forward_error * creep, 0.0, self.max_lin_vel))
             lin_y = 0.0
             ang_z = float(np.clip(heading_error * self.heading_kp, -self.max_ang_vel, self.max_ang_vel))
             phase = "turn_to_target"
@@ -1202,14 +1190,7 @@ class AlgSolution:
             lin_x = float(np.clip(forward_error * approach_scale * heading_scale, -self.max_lin_vel, self.max_lin_vel))
             lin_y = 0.0
             ang_z = 0.0
-            phase = "near_refine" if (
-                (
-                    target_nav.get("source_camera") == "head"
-                    and not target_nav.get("nav_coast")
-                    and not target_nav.get("nav_bearing_hint")
-                )
-                or target_dist <= self.target_near_range
-            ) else "far_approach"
+            phase = "near_refine" if target_dist <= self.target_near_range else "far_approach"
 
         stopped = False
         if goal_dist <= self.object_stop_tolerance and abs(heading_error) <= self.object_yaw_tolerance:
@@ -1868,33 +1849,13 @@ class AlgSolution:
         robot_pos_world: np.ndarray,
         robot_yaw: float,
     ) -> dict[str, Any] | None:
-        """单一导航出口：只跟感知 target_nav，motion 不再独立 pick/confirm。"""
+        """单一导航出口：只跟感知 target_nav."""
         raw_nav = perception_output.get("target_nav")
         if not isinstance(raw_nav, dict) or raw_nav.get("pos_world") is None:
             return None
 
         lock_id = perception_output.get("nav_lock_id")
         lock_class = perception_output.get("nav_lock_class")
-        head_n = int(perception_output.get("head_count_raw") or 0)
-        ee_only = bool(perception_output.get("nav_lock_ee_only"))
-        if self._nav_ignore_perc_until_head:
-            if head_n > 0 and not ee_only and perception_output.get("nav_lock_id") is not None:
-                self._nav_ignore_perc_until_head = False
-            else:
-                return None
-        if lock_id is not None and (ee_only or str(raw_nav.get("source_camera")) == "lock_coast") and head_n == 0:
-            self._ee_only_no_head_frames += 1
-        else:
-            self._ee_only_no_head_frames = 0
-        if self._ee_only_no_head_frames >= self.ee_only_unlock_frames:
-            self._clear_fuse_nav_lock("ee-only lock without head confirmation")
-            self._nav_ignore_perc_until_head = True
-            return None
-
-        if lock_id is not None and lock_class and raw_nav.get("class") not in {None, lock_class}:
-            return None
-        if raw_nav.get("pos_jump_rejected") and lock_id is None:
-            return None
 
         active = perception_output.get("active_camera")
         nav_cam = str(raw_nav.get("source_camera") or active or "head")
@@ -1907,20 +1868,14 @@ class AlgSolution:
 
         lock_key = (lock_id, lock_class)
         pw = self._safe_numpy(target.get("pos_world"), np.zeros(3, dtype=np.float32))
-        jump_limit = self.track_jump_reject_m
         if lock_key != self._fuse_lock_key or self._fuse_pos_world is None:
             self._fuse_lock_key = lock_key
             self._fuse_pos_world = pw.copy()
             self._nav_heading_error_f = None
         else:
-            jump_xy = float(np.linalg.norm(pw[:2] - self._fuse_pos_world[:2]))
-            if raw_nav.get("pos_jump_rejected") or jump_xy > jump_limit:
-                pw = self._fuse_pos_world.copy()
-            else:
-                coast = bool(raw_nav.get("nav_coast"))
-                alpha = 0.18 if coast else 0.28
-                self._fuse_pos_world = (1.0 - alpha) * self._fuse_pos_world + alpha * pw
-                pw = self._fuse_pos_world.copy()
+            alpha = 0.35
+            self._fuse_pos_world = (1.0 - alpha) * self._fuse_pos_world + alpha * pw
+            pw = self._fuse_pos_world.copy()
         self._fuse_pos_world = pw.copy()
         pos_robot = self._world_to_robot_frame(pw, robot_pos_world, robot_yaw)
         target["id"] = lock_id if lock_id is not None else target.get("id")
@@ -1931,8 +1886,8 @@ class AlgSolution:
         target["yaw_rel"] = float(math.atan2(pos_robot[1], pos_robot[0]))
         target["source_camera"] = nav_cam
         target["camera"] = nav_cam
-        target["confirmed"] = lock_id is not None
-        target["visible"] = not bool(raw_nav.get("nav_coast")) and not bool(raw_nav.get("pos_jump_rejected"))
+        target["confirmed"] = True
+        target["visible"] = True
         target["nav_lock_id"] = lock_id
         self._last_known_target_pos = target["pos_world"]
         self._set_locked_target_snapshot(target)
@@ -2717,20 +2672,9 @@ class AlgSolution:
             nav_info["phase"] = "stand"
             if target_nav is not None:
                 base_cmd, nav_info = self._compute_nav_cmd_from_target_nav(target_nav)
-                heading_err = abs(float(nav_info.get("heading_error") or 0.0))
-                target_dist = float(nav_info.get("target_dist") or 0.0)
-                allow_move = (
-                    self._step_count > max(8, self.stand_still_steps // 3)
-                    and (heading_err > 0.20 or target_dist > 2.0)
-                )
-                if allow_move:
-                    nav_info["phase"] = str(nav_info.get("phase", "far_approach"))
-                    nav_info["stopped"] = bool(nav_info.get("stopped", False))
-                else:
-                    base_cmd = np.zeros(3, dtype=np.float32)
-                    nav_info["phase"] = "stand"
-                    nav_info["stopped"] = True
-            elif self._step_count > max(8, self.stand_still_steps // 4):
+                nav_info["phase"] = str(nav_info.get("phase", "far_approach"))
+                nav_info["stopped"] = bool(nav_info.get("stopped", False))
+            elif self._step_count > max(4, self.stand_still_steps // 2):
                 base_cmd = self._compute_search_cmd(perception_output)
                 nav_info["phase"] = "search"
                 nav_info["stopped"] = False
@@ -2973,20 +2917,16 @@ class AlgSolution:
                 cons_dist = self._conservative_target_dist(target_nav, robot_pos_world)
                 dist_ok = cons_dist <= self.grasp_start_depth
                 heading_ok = abs(float(nav_info.get("heading_error") or 999.0)) <= max(
-                    self.object_yaw_tolerance * 2.5, 0.35,
-                )
-                head_confirmed = (
-                    target_nav.get("source_camera") != "head"
-                    or int(target_nav.get("head_stable_count") or 0) >= self.target_head_confirm_steps
+                    self.object_yaw_tolerance * 3.0, 0.45,
                 )
                 if (
                     matched_grasp_target is not None
                     and dist_ok
                     and heading_ok
-                    and head_confirmed
                     and (
                         nav_info.get("phase") == "ready_to_grasp"
                         or perception_phase == "grasp"
+                        or cons_dist <= self.grasp_start_depth
                     )
                 ):
                     base_cmd = np.zeros(3, dtype=np.float32)

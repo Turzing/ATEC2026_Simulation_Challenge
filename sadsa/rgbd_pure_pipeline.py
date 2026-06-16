@@ -1309,7 +1309,6 @@ class RgbdPureCamera:
         dets = self._dets_from_mask(mask, rgb, depth, robot_pos, robot_yaw)
         for d in dets or []:
             d["head_far_fallback"] = True
-            d["pos_confidence"] = min(float(d.get("pos_confidence") or 0.5), 0.62)
         return dets
 
     def _detect_midfield_yellow(
