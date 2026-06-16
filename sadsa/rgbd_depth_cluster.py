@@ -40,7 +40,7 @@ ROI_V_MIN = 0.06
 ROI_V_MAX = 0.96
 PROTRUDE_HEAD_M = 0.016
 PROTRUDE_EE_M = 0.010
-LOCAL_GROUND_K = 21
+LOCAL_GROUND_K = 15
 EE_GRASP_NEAR_M = 1.15
 MIN_SAMPLE_PTS = 3
 
@@ -160,8 +160,9 @@ class DepthClusterDetector:
         in_roi = (vv >= int(h * ROI_V_MIN)) & (vv <= int(h * ROI_V_MAX))
 
         protrude_m = PROTRUDE_EE_M if self.camera_name == "ee" else PROTRUDE_HEAD_M
-        fill = np.where(valid, depth, np.median(depth[valid]) if np.any(valid) else 3.0)
-        local_ground = ndimage.median_filter(fill.astype(np.float32), size=LOCAL_GROUND_K)
+        fill = np.where(valid, depth, np.median(depth[valid]) if np.any(valid) else 3.0).astype(np.float32)
+        k = LOCAL_GROUND_K | 1
+        local_ground = cv2.GaussianBlur(fill, (k, k), 0)
         relief = local_ground - depth
 
         v0 = int(h * ROI_V_MIN)

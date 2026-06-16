@@ -243,12 +243,12 @@ class AlgSolution:
         self.arm_ik_joint_names = list(self.arm_joint_names[:6])
         self.gripper_joint_names = list(self.arm_joint_names[6:])
 
-        self.show_rgb = os.getenv("ATEC_SHOW_RGB", "1").lower() in {"1", "true", "yes", "on"}
+        self.show_rgb = os.getenv("ATEC_SHOW_RGB", "0").lower() in {"1", "true", "yes", "on"}
         self.rgb_debug_every = max(1, int(os.getenv("ATEC_SHOW_RGB_EVERY", "50")))
         self._rgb_debug_failed = False
         self._rgb_debug_warned = False
 
-        self.save_rgb = os.getenv("ATEC_SAVE_RGB", "1").lower() in {"1", "true", "yes", "on"}
+        self.save_rgb = os.getenv("ATEC_SAVE_RGB", "0").lower() in {"1", "true", "yes", "on"}
         self.save_rgb_dir = os.path.join(REPO_ROOT, "logs", "rgb_frames")
         os.makedirs(self.save_rgb_dir, exist_ok=True)
         self._rgb_save_warned = False
