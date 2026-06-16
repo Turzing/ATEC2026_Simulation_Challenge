@@ -40,6 +40,7 @@ from rgbd_utils import (
     MIN_NAV_POS_CONF,
     _to_numpy,
     bbox_lateral_consistent,
+    compensate_grasp_for_gripper_base,
     compute_dynamic_ee_cam_pos,
     compute_dynamic_head_cam_pos,
     depth_stats,
@@ -57,6 +58,7 @@ from rgbd_utils import (
 )
 
 GRASP_PHASE_DIST_M = 1.10
+GRASP_APPROACH_DIST_M = 1.22   # head/lock 近距即请求 grasp 阶段
 GRASP_LOCK_DIST_M = 1.22
 GRASP_UNLOCK_DIST_M = 1.50
 HEAD_DISABLE_DIST_M = 1.05
@@ -92,6 +94,32 @@ def _nav_dist_conservative(obj: Optional[dict]) -> float:
     d_robot = float(obj.get("dist_to_robot") or 0.0)
     if d_robot > 0.08:
         return max(d_depth, d_robot)
+    return d_depth
+
+
+def _synthesize_grasp_from_head(obj: dict, robot_pos, robot_yaw, arm_q) -> dict:
+    """近距无 EE grasp 时, 用 head 目标合成 grasp_pos (供 motion 蹲下)."""
+    cam_pos = compute_dynamic_ee_cam_pos(arm_q) if arm_q is not None else None
+    if cam_pos is None:
+        from config import EE_CAM_POS_ROBOT
+        cam_pos = EE_CAM_POS_ROBOT
+    out = refresh_ee_object_pose(dict(obj), robot_pos, robot_yaw, cam_pos)
+    out["camera"] = "ee"
+    out["source_camera"] = "head"
+    out["nav_from_head"] = True
+    out["skip_camera_correction"] = True
+    out["grasp_reliable"] = True
+    out["role"] = "nav_grasp"
+    return compensate_grasp_for_gripper_base(out, robot_pos, robot_yaw)
+
+
+def _close_dist(obj: Optional[dict]) -> float:
+    if not obj:
+        return 999.0
+    d_depth = _obj_dist(obj)
+    d_robot = float(obj.get("dist_to_robot") or 0.0)
+    if d_robot > 0.08:
+        return min(d_depth, d_robot)
     return d_depth
 
 
@@ -820,7 +848,9 @@ def _export_ee_for_motion(
         ee_tgt = _find_in_pool(ee_objs, auth_tgt.get("id"), auth_tgt.get("class"))
         if ee_tgt is None:
             ee_tgt = auth_tgt if auth_cam == "ee" else None
-        if ee_tgt is None or not ee_tgt.get("grasp_reliable"):
+        if ee_tgt is None or not (
+            ee_tgt.get("grasp_reliable") or ee_tgt.get("nav_from_head")
+        ):
             return []
         exp = _safe_ee_export(ee_tgt, head_objs, ee_objs)
         return [exp] if exp is not None else []
@@ -1071,12 +1101,19 @@ class RgbdPureDualPipeline:
 
         nav_dist = _nav_dist_conservative(locked or head_nav or ee_nav)
         lock_ref_obj = locked or head_nav or ee_nav
+        close_d = min(
+            _close_dist(locked),
+            _close_dist(head_nav),
+            _close_dist(ee_grasp),
+            _close_dist(ee_nav),
+        )
         ee_grasp_nav = ee_grasp if _strict_lock_match(ee_grasp, lock_ref_obj) else None
+        ee_grasp_ok = ee_grasp_nav is not None and bool(ee_grasp_nav.get("grasp_reliable"))
+        head_close = head_d < GRASP_APPROACH_DIST_M
         want_grasp = (
-            nav_dist < GRASP_PHASE_DIST_M
-            and ee_grasp_nav is not None
-            and ee_grasp_nav.get("grasp_reliable")
-            and locked is not None
+            close_d < GRASP_APPROACH_DIST_M
+            and lock_ref_obj is not None
+            and (ee_grasp_ok or head_close)
         )
 
         nav_stage = _resolve_nav_stage(nav_dist, want_grasp, self._nav_stage)
@@ -1120,6 +1157,8 @@ class RgbdPureDualPipeline:
             arm_q,
             force_recalc=(nav_stage == "grasp"),
         )
+        if nav_stage == "grasp" and grasp_tgt is None and auth_tgt is not None:
+            grasp_tgt = _synthesize_grasp_from_head(auth_tgt, rp, ry, arm_q)
 
         if nav_stage == "grasp" and ee_near < HEAD_DISABLE_DIST_M:
             pass  # 保留 head_objects 供 motion fallback

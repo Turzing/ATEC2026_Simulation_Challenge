@@ -1075,7 +1075,17 @@ class AlgSolution:
             ang_z = 0.0
             phase = "locked_pregrasp"
         stopped = False
+        target_dist = float(np.linalg.norm(target_world[:2] - robot_pos_world[:2]))
         if pos_error_norm <= 0.32 and abs(yaw_error) <= self.object_yaw_tolerance:
+            lin_x = 0.0
+            lin_y = 0.0
+            ang_z = 0.0
+            phase = "ready_to_grasp"
+            stopped = True
+        elif (
+            target_dist <= self.grasp_start_depth
+            and abs(yaw_error) <= max(self.object_yaw_tolerance * 2.5, 0.35)
+        ):
             lin_x = 0.0
             lin_y = 0.0
             ang_z = 0.0
@@ -1083,7 +1093,6 @@ class AlgSolution:
             stopped = True
 
         base_cmd = np.array([lin_x, lin_y, ang_z], dtype=np.float32)
-        target_dist = float(np.linalg.norm(target_world[:2] - robot_pos_world[:2]))
         return base_cmd, {
             "phase": phase,
             "target": target_nav,
@@ -2566,13 +2575,23 @@ class AlgSolution:
                     robot_pos_world,
                     robot_yaw,
                 )
+                dist_ok = self._safe_float(
+                    target_nav.get("dist_to_robot"), fallback=float("inf"),
+                ) <= self.grasp_start_depth
+                heading_ok = abs(float(nav_info.get("heading_error") or 999.0)) <= max(
+                    self.object_yaw_tolerance * 2.5, 0.35,
+                )
                 if (
-                    nav_info.get("phase") == "ready_to_grasp"
-                    and matched_grasp_target is not None
+                    matched_grasp_target is not None
+                    and (
+                        nav_info.get("phase") == "ready_to_grasp"
+                        or perception_phase == "grasp"
+                        or (dist_ok and heading_ok)
+                    )
                     and (
                         target_nav.get("source_camera") == "head"
                         or perception_phase == "grasp"
-                        or self._safe_float(target_nav.get("dist_to_robot"), fallback=float("inf")) <= self.grasp_start_depth
+                        or dist_ok
                     )
                 ):
                     base_cmd = np.zeros(3, dtype=np.float32)
