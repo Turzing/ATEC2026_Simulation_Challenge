@@ -45,6 +45,7 @@ from rgbd_utils import (
     refresh_head_object_pose,
     refresh_locked_grasp,
     stabilize_ee_nav_pose,
+    world_to_robot_frame,
 )
 
 GRASP_PHASE_DIST_M = 1.10
@@ -52,7 +53,7 @@ GRASP_LOCK_DIST_M = 1.22
 GRASP_UNLOCK_DIST_M = 1.50
 HEAD_DISABLE_DIST_M = 1.05
 EE_NAV_PREFER_DIST_M = 1.35
-HEAD_MIRROR_EE_MIN_M = 1.25
+HEAD_MIRROR_EE_MIN_M = 0.85
 TEMPORAL_MEDIAN_N = 6
 GRASP_TEMPORAL_N = 10
 MOTION_FREEZE_THRESH = 0.35
@@ -203,14 +204,24 @@ class _TemporalMedian:
                 m["depth_m"] = float(np.median(depths))
                 m["nav_depth_m"] = m["depth_m"]
 
-            prs = [x["pos_robot"] for x in h if x.get("pos_robot") is not None]
-            if prs:
-                med = np.median(np.stack([np.asarray(p, dtype=np.float32) for p in prs]), axis=0)
-                m["pos_robot"] = med.tolist()
-                m["pos_world"] = _robot_to_world(med, robot_pos, robot_yaw).tolist()
-                m["dist_to_robot"] = float(np.linalg.norm(med[:2]))
-                m["yaw_rel"] = float(np.arctan2(med[1], med[0]))
+            uvs = [x.get("centroid_uv") for x in h if x.get("centroid_uv") is not None]
+            if uvs:
+                uv_med = np.median(np.stack([np.asarray(u, dtype=np.float32) for u in uvs]), axis=0)
+                m["centroid_uv"] = [float(uv_med[0]), float(uv_med[1])]
+
+            # 世界系滤波：转圈时 robot 系坐标会变，不能对 pos_robot 做 median
+            worlds = [x.get("pos_world") for x in h if x.get("pos_world") is not None]
+            if worlds:
+                med_w = np.median(
+                    np.stack([np.asarray(w, dtype=np.float32) for w in worlds]), axis=0,
+                )
+                m["pos_world"] = med_w.tolist()
+                med_r = world_to_robot_frame(med_w, robot_pos, robot_yaw)
+                m["pos_robot"] = med_r.tolist()
+                m["dist_to_robot"] = float(np.linalg.norm(med_r[:2]))
+                m["yaw_rel"] = float(np.arctan2(med_r[1], med_r[0]))
                 m["nav_yaw_rel"] = m["yaw_rel"]
+                m["nav_depth_m"] = float(m.get("nav_depth_m") or m.get("depth_m") or m["dist_to_robot"])
 
             if cam == "ee":
                 gh = self._grasp_hist.get(key, h)
@@ -307,17 +318,33 @@ def _pick_nav_target(
     return "ee", ee_objs, ee_tgt
 
 
+def _ee_nav_lateral(obj: Optional[dict]) -> float:
+    if not obj:
+        return 0.0
+    pr = obj.get("pos_robot")
+    if pr is None:
+        return 0.0
+    try:
+        return abs(float(pr[1]))
+    except (TypeError, ValueError, IndexError):
+        return 0.0
+
+
 def _inject_head_nav_into_ee(
     ee_objs: List[dict],
     head_nav: Optional[dict],
     phase: str,
     ee_near: float,
+    ee_nav: Optional[dict] = None,
 ) -> List[dict]:
-    """solution_rl approach 固定 preferred=ee；远距把 head 导航位姿注入 ee_objects."""
-    if phase != "approach" or head_nav is None or ee_near < HEAD_MIRROR_EE_MIN_M:
+    """solution_rl approach 固定 preferred=ee；用 head 前向位姿覆盖 EE 侧视大横向误差."""
+    if phase != "approach" or head_nav is None:
         return ee_objs
     hd = _obj_dist(head_nav)
-    if hd > 3.0:
+    if hd > 3.2:
+        return ee_objs
+    ee_lat = _ee_nav_lateral(ee_nav)
+    if ee_near < HEAD_MIRROR_EE_MIN_M and ee_lat < 0.55:
         return ee_objs
     mirror = dict(head_nav)
     for k in (
@@ -456,7 +483,7 @@ class RgbdPureDualPipeline:
             head_objs = []
 
         ee_objs = [stabilize_ee_nav_pose(o) for o in ee_objs]
-        ee_objs = _inject_head_nav_into_ee(ee_objs, head_nav, phase, ee_near)
+        ee_objs = _inject_head_nav_into_ee(ee_objs, head_nav, phase, ee_near, ee_nav)
 
         nav_cam, nav_objs, nav_tgt = _pick_nav_target(
             ee_nav, head_nav, ee_objs, head_objs, ee_near,
