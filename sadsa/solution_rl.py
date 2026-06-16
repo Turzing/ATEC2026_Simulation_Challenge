@@ -83,6 +83,9 @@ class AlgSolution:
         self._locked_target_world: list[float] | None = None
         self._pregrasp_stall_steps = 0
         self._pregrasp_last_robot_xy: np.ndarray | None = None
+        self._nav_heading_error_f: float | None = None
+        self._nav_turn_sign: int = 0
+        self._nav_turn_sign_hold = 0
         self._release_step_count = 0
         self._arm_grasp_controller = None
         self._arm_controller_init_failed = False
@@ -205,6 +208,9 @@ class AlgSolution:
         self.target_relock_disagreement = float(os.getenv("ATEC_TASKB_TARGET_RELOCK_DISAGREEMENT", "0.35"))
         self.ee_track_max_distance = float(os.getenv("ATEC_TASKB_EE_TRACK_MAX_DISTANCE", "2.15"))
         self.ee_search_fallback_distance = float(os.getenv("ATEC_TASKB_EE_SEARCH_FALLBACK_DISTANCE", "2.90"))
+        self.track_jump_reject_m = float(os.getenv("ATEC_TASKB_TRACK_JUMP_REJECT_M", "0.45"))
+        self.nav_heading_ema_alpha = float(os.getenv("ATEC_TASKB_NAV_HEADING_EMA", "0.28"))
+        self.nav_turn_sign_hold_steps = max(3, int(os.getenv("ATEC_TASKB_TURN_SIGN_HOLD_STEPS", "8")))
         self.pregrasp_stall_steps = max(10, int(os.getenv("ATEC_TASKB_PREGRASP_STALL_STEPS", "35")))
         self.turn_then_go_yaw_threshold = float(os.getenv("ATEC_TASKB_TURN_THEN_GO_YAW_THRESHOLD", "0.30"))
         self.turn_then_go_heading_hold = float(os.getenv("ATEC_TASKB_TURN_THEN_GO_HEADING_HOLD", "0.18"))
@@ -1124,13 +1130,36 @@ class AlgSolution:
             parts.append(float(np.linalg.norm(pr[:2])))
         return max(parts) if parts else float("inf")
 
+    def _smooth_nav_heading(self, heading_error: float) -> float:
+        alpha = self.nav_heading_ema_alpha
+        if self._nav_heading_error_f is None:
+            self._nav_heading_error_f = float(heading_error)
+        else:
+            self._nav_heading_error_f = (1.0 - alpha) * self._nav_heading_error_f + alpha * float(heading_error)
+        smoothed = float(self._nav_heading_error_f)
+        desired_sign = 0 if abs(smoothed) < 0.06 else (1 if smoothed > 0 else -1)
+        if desired_sign == 0:
+            self._nav_turn_sign = 0
+            self._nav_turn_sign_hold = 0
+        elif self._nav_turn_sign == 0 or self._nav_turn_sign == desired_sign:
+            self._nav_turn_sign = desired_sign
+            self._nav_turn_sign_hold = self.nav_turn_sign_hold_steps
+        elif self._nav_turn_sign_hold > 0:
+            self._nav_turn_sign_hold -= 1
+        else:
+            self._nav_turn_sign = desired_sign
+            self._nav_turn_sign_hold = self.nav_turn_sign_hold_steps
+        if self._nav_turn_sign != 0 and desired_sign != 0 and self._nav_turn_sign != desired_sign:
+            return float(self._nav_turn_sign) * min(abs(smoothed), 0.12)
+        return smoothed
+
     def _compute_dynamic_visual_cmd(
         self,
         target_nav: dict[str, Any],
         target_pos_robot: np.ndarray,
     ) -> tuple[np.ndarray, dict[str, Any]]:
         target_dist = float(np.linalg.norm(target_pos_robot[:2]))
-        heading_error = float(math.atan2(target_pos_robot[1], target_pos_robot[0]))
+        heading_error = self._smooth_nav_heading(float(math.atan2(target_pos_robot[1], target_pos_robot[0])))
         stop_distance = self._dynamic_stop_distance_for_target(target_nav)
         forward_error = float(target_pos_robot[0] - stop_distance)
         lateral_error = float(target_pos_robot[1])
@@ -1589,10 +1618,15 @@ class AlgSolution:
         prev_pos = self._safe_numpy(state.get("filtered_pos_world"), np.zeros(3, dtype=np.float32))
         obs_pos = self._safe_numpy(candidate.get("pos_world"), np.zeros(3, dtype=np.float32))
         jump_xy = float(np.linalg.norm(obs_pos[:2] - prev_pos[:2]))
-        if jump_xy > 1.20:
-            filtered_pos = obs_pos
-            state["stable_count"] = 1
-            state["head_stable_count"] = 0
+        jump_limit = self.track_jump_reject_m
+        if str(candidate.get("source_camera", "ee")) == "ee":
+            dist = float(np.linalg.norm(self._safe_numpy(candidate.get("pos_robot"), np.zeros(3, dtype=np.float32))[:2]))
+            jump_limit = min(jump_limit, 0.35 if dist > 2.2 else 0.45)
+        if candidate.get("pos_jump_rejected") or jump_xy > jump_limit:
+            filtered_pos = prev_pos
+        elif jump_xy > 1.20:
+            filtered_pos = prev_pos
+            state["stable_count"] = max(int(state.get("stable_count", 1)) - 1, 1)
         else:
             filtered_pos = (1.0 - alpha) * prev_pos + alpha * obs_pos
         pos_robot = self._safe_numpy(candidate.get("pos_robot"), np.zeros(3, dtype=np.float32))
@@ -1789,7 +1823,13 @@ class AlgSolution:
         )
         if target is None:
             raw_nav = perception_output.get("target_nav")
-            if isinstance(raw_nav, dict) and raw_nav.get("pos_world") is not None:
+            nav_lock_id = perception_output.get("nav_lock_id")
+            if (
+                isinstance(raw_nav, dict)
+                and raw_nav.get("pos_world") is not None
+                and nav_lock_id is not None
+                and not raw_nav.get("pos_jump_rejected")
+            ):
                 nav_cam = str(raw_nav.get("source_camera") or preferred_camera)
                 seeded = self._prepare_pipeline_object(raw_nav, nav_cam, robot_pos_world, robot_yaw)
                 has_head = bool(preferred_candidates) if preferred_camera == "head" else bool(fallback_candidates)
@@ -1798,7 +1838,7 @@ class AlgSolution:
                     and self._tracking_candidate_allowed(seeded, has_head_candidates=has_head)
                 ):
                     target = seeded
-                    target["confirmed"] = perception_output.get("nav_lock_id") is not None
+                    target["confirmed"] = True
 
         bin_info = perception_output.get("bin") or {}
         bin_center = self._safe_numpy(bin_info.get("center_world"), self.default_bin_center)
