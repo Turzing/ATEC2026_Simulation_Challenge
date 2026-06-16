@@ -204,6 +204,7 @@ class AlgSolution:
         self.target_freeze_distance = float(os.getenv("ATEC_TASKB_TARGET_FREEZE_DISTANCE", "0.95"))
         self.target_relock_disagreement = float(os.getenv("ATEC_TASKB_TARGET_RELOCK_DISAGREEMENT", "0.35"))
         self.ee_track_max_distance = float(os.getenv("ATEC_TASKB_EE_TRACK_MAX_DISTANCE", "2.15"))
+        self.ee_search_fallback_distance = float(os.getenv("ATEC_TASKB_EE_SEARCH_FALLBACK_DISTANCE", "2.90"))
         self.pregrasp_stall_steps = max(10, int(os.getenv("ATEC_TASKB_PREGRASP_STALL_STEPS", "35")))
         self.turn_then_go_yaw_threshold = float(os.getenv("ATEC_TASKB_TURN_THEN_GO_YAW_THRESHOLD", "0.30"))
         self.turn_then_go_heading_hold = float(os.getenv("ATEC_TASKB_TURN_THEN_GO_HEADING_HOLD", "0.18"))
@@ -1529,11 +1530,18 @@ class AlgSolution:
                 score += 3.0
         return score
 
-    def _tracking_candidate_allowed(self, candidate: dict[str, Any]) -> bool:
+    def _tracking_candidate_allowed(
+        self,
+        candidate: dict[str, Any],
+        *,
+        has_head_candidates: bool = True,
+    ) -> bool:
         source = str(candidate.get("source_camera", "ee"))
         pos_robot = self._safe_numpy(candidate.get("pos_robot"), np.zeros(3, dtype=np.float32))
         dist = self._safe_float(candidate.get("dist_to_robot"), float(np.linalg.norm(pos_robot[:2])))
         if source == "ee" and dist > self.ee_track_max_distance:
+            if not has_head_candidates and dist <= self.ee_search_fallback_distance:
+                return True
             return False
         return True
 
@@ -1542,8 +1550,13 @@ class AlgSolution:
         candidates: list[dict[str, Any]],
         preferred_camera: str,
         reference: dict[str, Any] | None = None,
+        *,
+        has_head_candidates: bool = True,
     ) -> dict[str, Any] | None:
-        eligible = [c for c in candidates if self._tracking_candidate_allowed(c)]
+        eligible = [
+            c for c in candidates
+            if self._tracking_candidate_allowed(c, has_head_candidates=has_head_candidates)
+        ]
         if not eligible:
             return None
         return min(eligible, key=lambda candidate: self._candidate_rank(candidate, preferred_camera, reference))
@@ -1637,6 +1650,7 @@ class AlgSolution:
         robot_yaw: float,
     ) -> dict[str, Any] | None:
         all_candidates = preferred_candidates + fallback_candidates
+        has_head_candidates = bool(preferred_candidates) if preferred_camera == "head" else bool(fallback_candidates)
 
         if self._tracked_target is not None:
             matched = self._match_candidate_to_track(all_candidates, self._tracked_target)
@@ -1659,7 +1673,12 @@ class AlgSolution:
                     return None
 
         if self._tracked_target is None:
-            best = self._select_best_candidate(all_candidates, preferred_camera, self._pending_target)
+            best = self._select_best_candidate(
+                all_candidates,
+                preferred_camera,
+                self._pending_target,
+                has_head_candidates=has_head_candidates,
+            )
             if best is None:
                 if (
                     self._pending_target is not None
@@ -1768,6 +1787,18 @@ class AlgSolution:
             robot_pos_world,
             robot_yaw,
         )
+        if target is None:
+            raw_nav = perception_output.get("target_nav")
+            if isinstance(raw_nav, dict) and raw_nav.get("pos_world") is not None:
+                nav_cam = str(raw_nav.get("source_camera") or preferred_camera)
+                seeded = self._prepare_pipeline_object(raw_nav, nav_cam, robot_pos_world, robot_yaw)
+                has_head = bool(preferred_candidates) if preferred_camera == "head" else bool(fallback_candidates)
+                if (
+                    seeded is not None
+                    and self._tracking_candidate_allowed(seeded, has_head_candidates=has_head)
+                ):
+                    target = seeded
+                    target["confirmed"] = perception_output.get("nav_lock_id") is not None
 
         bin_info = perception_output.get("bin") or {}
         bin_center = self._safe_numpy(bin_info.get("center_world"), self.default_bin_center)

@@ -1291,6 +1291,32 @@ class RgbdPureCamera:
         self._debug["bottom_strip"] = mask * 255
         return self._dets_from_mask(mask, rgb, depth, robot_pos, robot_yaw)
 
+    def _detect_midfield_yellow(
+        self, rgb: np.ndarray, depth: np.ndarray, robot_pos, robot_yaw,
+    ) -> List[dict]:
+        """head 2~4m 画面中部香蕉/黄物补检 (log: head=0 但 EE 见 banana@2.3m)."""
+        h, w = depth.shape
+        st = depth_stats(depth)
+        p10 = float(st.get("p10", 99.0))
+        if p10 < 1.25 or p10 > 4.8:
+            return []
+        roi = np.zeros((h, w), dtype=bool)
+        roi[int(h * 0.08) : int(h * 0.58), int(w * 0.10) : int(w * 0.90)] = True
+        valid = (
+            self._valid_depth(depth, near=False)
+            & (depth >= 1.15)
+            & (depth <= 4.6)
+        )
+        hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+        hue, sat, val = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+        mask = (
+            roi & valid
+            & (hue >= HEAD_HUE_LO) & (hue <= HEAD_HUE_HI)
+            & (sat >= 28) & (val >= 48)
+        ).astype(np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+        return self._dets_from_mask(mask, rgb, depth, robot_pos, robot_yaw)
+
     def detect(self, rgb: np.ndarray, depth: np.ndarray, robot_pos, robot_yaw) -> List[dict]:
         from rgbd_utils import align_rgb_to_depth
         depth = sanitize_depth(depth)
@@ -1298,10 +1324,17 @@ class RgbdPureCamera:
         mask = self._build_fusion_mask(rgb, depth)
         dets = self._dets_from_mask(mask, rgb, depth, robot_pos, robot_yaw)
 
-        if self.camera_name == "head" and len(dets) == 0 and self._scene_near(depth):
-            strip_dets = self._detect_bottom_strip(rgb, depth, robot_pos, robot_yaw)
-            if strip_dets:
-                dets = strip_dets
+        if self.camera_name == "head" and len(dets) == 0:
+            st = depth_stats(depth)
+            p10 = float(st.get("p10", 99.0))
+            if self._scene_near(depth):
+                strip_dets = self._detect_bottom_strip(rgb, depth, robot_pos, robot_yaw)
+                if strip_dets:
+                    dets = strip_dets
+            elif 1.25 <= p10 <= 4.8:
+                mid_dets = self._detect_midfield_yellow(rgb, depth, robot_pos, robot_yaw)
+                if mid_dets:
+                    dets = mid_dets
 
         dets = self._merge_dets(dets)
         dets.sort(key=lambda x: x.get("depth_m") or 999.0)
