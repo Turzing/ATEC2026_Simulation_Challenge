@@ -1101,16 +1101,13 @@ class RgbdPureCamera:
                 return None
             if rm < 0.007 and len(ys) > 700 and asp > 1.8 and vm < 84:
                 return None
-            if blob_area < 760 and rm < 0.010 and sm < 18:
-                return None
-            if depth_m < 1.20 and sm < 16 and vm > 150 and blob_area < 1100:
-                return None
         cx, cy = float(np.median(xs)), float(np.median(ys))
         is_head = self.camera_name == "head"
         is_ee = self.camera_name == "ee"
         x1, y1, x2, y2 = bbox
         if y2 < h * 0.52:
-            return None
+            if not (is_head and depth_m >= 1.4 and sm >= 16):
+                return None
 
         # ── head: 点云 + 底边 anchor 导航 (近端 depth, 避免 bbox 底边打到地面) ──
         if is_head:
@@ -1354,7 +1351,7 @@ class RgbdPureCamera:
         roi = self._roi(h, w, near=False)
         ground = self._ground_depth(depth, valid)
         relief = ground - depth
-        rmin = float(self._cfg.get("relief_min", 0.012)) * 0.55
+        rmin = float(self._cfg.get("relief_min", 0.012)) * 0.45
         hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
         hue, sat, val = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
         warm = ((hue >= 4) & (hue <= 38)) | (hue <= 10)
@@ -1378,9 +1375,8 @@ class RgbdPureCamera:
         roi[int(h * 0.05) : int(h * 0.62), int(w * 0.06) : int(w * 0.94)] = True
         ground = self._ground_depth(depth, valid)
         relief = ground - depth
-        rmin = float(self._cfg.get("relief_min", 0.012)) * 0.62
+        rmin = float(self._cfg.get("relief_min", 0.012)) * 0.50
         mask = (roi & valid & (relief >= rmin) & (relief <= RELIEF_MAX)).astype(np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
         dets = self._dets_from_mask(mask, rgb, depth, robot_pos, robot_yaw)
         for d in dets or []:
@@ -1442,6 +1438,7 @@ class RgbdPureCamera:
 
     @staticmethod
     def _prune_fallback_phantoms(dets: List[dict]) -> List[dict]:
+        """只杀近距地板 phantom; 远距 depth/neutral 保留."""
         kept: List[dict] = []
         for d in dets or []:
             if not (
@@ -1457,11 +1454,12 @@ class RgbdPureCamera:
             sm = float(d.get("blob_sat_mean") or 0.0)
             vm = float(d.get("blob_val_mean") or 0.0)
             depth = float(d.get("depth_m") or 99.0)
-            if area < 720:
+            if depth >= 1.35:
+                kept.append(d)
                 continue
-            if depth < 1.05 and sm < 18 and vm > 145:
+            if area < 520 and depth < 1.05 and sm < 14 and vm > 145:
                 continue
-            if depth < 0.95 and sm < 24:
+            if depth < 0.90 and sm < 20 and area < 640:
                 continue
             kept.append(d)
         return kept
@@ -1487,9 +1485,7 @@ class RgbdPureCamera:
                 strip_dets = self._detect_bottom_strip(rgb, depth, robot_pos, robot_yaw)
                 if strip_dets:
                     layers.extend(strip_dets)
-            if p10 < 7.0 and not any(
-                float(o.get("depth_m") or 99.0) < 2.2 for o in layers
-            ):
+            if p10 < 7.0:
                 for extra in (
                     self._detect_midfield_yellow(rgb, depth, robot_pos, robot_yaw),
                     self._detect_edge_yellow(rgb, depth, robot_pos, robot_yaw),

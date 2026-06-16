@@ -313,11 +313,9 @@ def filter_plausible_objects(
         if camera == "head":
             if _is_head_fallback_det(o) and 0.75 <= depth <= 6.5:
                 bbox = o.get("bbox")
-                if bbox and len(bbox) == 4:
+                if bbox and len(bbox) == 4 and depth < 1.15:
                     area = int((bbox[2] - bbox[0] + 1) * (bbox[3] - bbox[1] + 1))
-                    if area < 720:
-                        continue
-                    if depth < 1.05 and sm < 18 and vm > 145:
+                    if area < 480 and sm < 14 and vm > 145:
                         continue
                 if is_sky_phantom_bbox(o):
                     continue
