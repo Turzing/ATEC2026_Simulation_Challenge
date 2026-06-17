@@ -132,8 +132,8 @@ GRASP_LOCK_DIST_M = 1.22
 GRASP_UNLOCK_DIST_M = 1.50
 HEAD_DISABLE_DIST_M = 1.05
 NAV_EE_FAR_MIN_M = 1.35          # >= 远距 EE 导航
-NAV_EE_TO_HEAD_M = 1.28          # 迟滞: 远→近
-NAV_HEAD_TO_EE_M = 1.42          # 迟滞: 近→远
+NAV_EE_TO_HEAD_M = float(os.getenv("ATEC_TASKB_NAV_EE_TO_HEAD_M", "1.85"))  # 迟滞: 远→近 head 主导
+NAV_HEAD_TO_EE_M = float(os.getenv("ATEC_TASKB_NAV_HEAD_TO_EE_M", "2.05"))  # 迟滞: 近→远 EE 主导
 NAV_LOCK_MISS_MAX = 45           # 丢失多少帧后解锁重选 (~0.9s)
 NAV_LOCK_MISS_MAX_STATIC = 120   # 两步走 EE 主导: 允许更长的 lock coast
 EE_NAV_LOCK_MAX_DEPTH_M = 2.05   # EE 独锁最大深度 (log: 2.36m 偏 1.55m)
@@ -657,6 +657,8 @@ def _best_nav_target(
     if lock_id is not None:
         locked = _find_in_pool(objs, lock_id, lock_class, lock_world)
         return _enrich_nav(locked) if locked is not None else None
+    if CLASS_AGNOSTIC:
+        return _enrich_nav(min(objs, key=_obj_dist))
     return _enrich_nav(min(objs, key=lambda o: _nav_lock_rank(o)))
 
 
@@ -998,7 +1000,7 @@ def _acquire_nav_lock(
     prefer_class: Optional[str] = None,
     prefer_world: Optional[List[float]] = None,
 ) -> Optional[dict]:
-    """新锁：STATIC_TWO_STEP 时 EE 优先；否则 head 优先."""
+    """新锁：远距 EE；近距/多目标 head 选最近."""
 
     def _near_preferred(o: dict) -> bool:
         if prefer_world is None:
@@ -1012,8 +1014,29 @@ def _acquire_nav_lock(
             return False
         return True
 
+    head_cands = blob_nav_pool([o for o in head_objs if _eligible(o, False) and _near_preferred(o)])
+    ee_cands = blob_nav_pool([o for o in ee_objs if _eligible(o, True) and _near_preferred(o)])
+
+    if STATIC_TWO_STEP and head_cands and prefer_world is None:
+        head_nearest_d = min(_obj_dist(o) for o in head_cands)
+        ee_nearest_d = min((_obj_dist(o) for o in ee_cands), default=999.0)
+        use_head_first = (
+            len(head_cands) >= 2
+            or head_nearest_d < NAV_EE_TO_HEAD_M + 0.30
+            or head_nearest_d + 0.22 < ee_nearest_d
+        )
+        if use_head_first:
+            if prefer_class:
+                same_cls = [o for o in head_cands if o.get("class") == prefer_class]
+                if same_cls:
+                    head_cands = same_cls
+            best = min(head_cands, key=_obj_dist)
+            out = dict(best)
+            out["pos_confidence"] = float(best.get("pos_confidence") or head_nav_pos_confidence(best))
+            out["pipeline_tier"] = 1 if is_blob_nav_det(best) else 3
+            return out
+
     if STATIC_TWO_STEP:
-        ee_cands = blob_nav_pool([o for o in ee_objs if _eligible(o, True) and _near_preferred(o)])
         if prefer_class and ee_cands:
             same_cls = [o for o in ee_cands if o.get("class") == prefer_class]
             if same_cls:
@@ -1027,7 +1050,6 @@ def _acquire_nav_lock(
         if ee_nav is not None and _eligible(ee_nav, True):
             return ee_nav
 
-    head_cands = blob_nav_pool([o for o in head_objs if _eligible(o, False) and _near_preferred(o)])
     if prefer_class and head_cands:
         same_cls = [o for o in head_cands if o.get("class") == prefer_class]
         if same_cls:
@@ -1083,12 +1105,17 @@ def _resolve_authoritative_target(
     primary = NAV_AUTHORITY[nav_stage]
     fallback = NAV_FALLBACK[nav_stage]
     if STATIC_TWO_STEP:
-        primary, fallback = "ee", "head"
+        if nav_stage == "near_head":
+            primary, fallback = "head", "ee"
+        else:
+            primary, fallback = "ee", "head"
     pools = {"head": head_objs, "ee": ee_objs}
     navs = {"head": head_nav, "ee": ee_nav}
     has_lock = lock_id is not None
 
     tgt = _find_in_pool(pools[primary], lock_id, lock_class, lock_world)
+    if tgt is None and not has_lock and pools[primary]:
+        tgt = min(pools[primary], key=_obj_dist)
     if tgt is None and not has_lock:
         tgt = navs[primary]
     if tgt is not None:
@@ -1625,11 +1652,14 @@ class RgbdPureDualPipeline:
         if not RGBD_SIMPLE:
             ee_objs = _drop_ee_class_conflict(ee_objs, head_objs)
 
+        if (not RGBD_SIMPLE or STATIC_TWO_STEP) and not head_objs and self._last_head_objs:
+            head_objs = []
+            for o in self._last_head_objs[:4]:
+                c = self._refresh_coast_obj(o, rp, ry)
+                c["nav_coast"] = True
+                c["visible"] = False
+                head_objs.append(c)
         if not RGBD_SIMPLE:
-            if not head_objs and self._last_head_objs:
-                head_objs = [
-                    self._refresh_coast_obj(o, rp, ry) for o in self._last_head_objs
-                ]
             if not ee_objs and self._last_ee_motion:
                 ee_objs = [
                     self._refresh_coast_obj(o, rp, ry) for o in self._last_ee_motion
@@ -1976,7 +2006,7 @@ class RgbdPureDualPipeline:
         )
 
         return {
-            "roles": {"ee": "far-nav+grasp", "head": "near-nav-fallback"},
+            "roles": {"ee": "far-nav", "head": "near-nav-primary"},
             "nav_stage": nav_stage,
             "nav_authority": auth_cam,
             "nav_authority_mode": auth_mode,
@@ -1999,7 +2029,7 @@ class RgbdPureDualPipeline:
             "head_objects_list": head_list,
             "target": grasp_tgt if use_grasp else nav_tgt,
             "objects_remaining": ee_list + head_list,
-            "active_camera": "ee" if (use_grasp or auth_cam == "ee") else "head",
+            "active_camera": nav_cam if nav_tgt is not None else ("head" if nav_stage == "near_head" else auth_cam),
             "phase": phase,
             "grasp_reliable": bool(grasp_tgt and grasp_tgt.get("grasp_reliable")),
             "grasp_locked": bool(grasp_tgt and grasp_tgt.get("grasp_locked")),

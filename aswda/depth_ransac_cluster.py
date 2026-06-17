@@ -30,7 +30,7 @@ from rgbd_utils import (
     sanitize_depth,
 )
 
-PERCEPTION_RANSAC_BUILD = "20260617-taskb-perc-only-v26"
+PERCEPTION_RANSAC_BUILD = "20260617-taskb-perc-only-v27"
 TASKB_PIPELINE_MODE = "blob_gt_coast"
 RANSAC_HEAD_SUPPLEMENT_PX = 72
 
