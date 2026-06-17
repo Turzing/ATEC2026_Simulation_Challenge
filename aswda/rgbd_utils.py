@@ -389,10 +389,15 @@ def is_ee_gripper_phantom(obj: dict, *, img_h: int = IMG_H, img_w: int = IMG_W) 
     y1, y2 = float(bbox[1]), float(bbox[3])
     cy = 0.5 * (y1 + y2)
     depth = float(obj.get("depth_m") or obj.get("nav_depth_m") or 99.0)
-    if y2 >= img_h * 0.78 and depth < 2.4:
+    sm = float(obj.get("blob_sat_mean") or 0.0)
+    src = str(obj.get("source") or "")
+    if src in ("yellow_detect", "ee_yellow_nav") and sm >= 16:
+        return False
+    if src == "ransac_cluster" and depth >= 0.50:
+        return False
+    if y2 >= img_h * 0.78 and depth < 2.4 and sm < 42:
         return True
     if cy >= img_h * 0.70 and depth < 1.8:
-        sm = float(obj.get("blob_sat_mean") or 0.0)
         if sm < 55:
             return True
     pr = obj.get("pos_robot")
@@ -401,13 +406,13 @@ def is_ee_gripper_phantom(obj: dict, *, img_h: int = IMG_H, img_w: int = IMG_W) 
             px = float(pr[0])
         except (TypeError, ValueError, IndexError):
             px = 99.0
-        if px < 1.35 and y2 >= img_h * 0.68:
+        if px < 1.35 and y2 >= img_h * 0.68 and sm < 48:
             return True
     return False
 
 
 def is_head_body_phantom(obj: dict, *, img_h: int = IMG_H, img_w: int = IMG_W) -> bool:
-    """head 画面底部可见的本体/夹爪误检."""
+    """head 画面底部可见的本体/夹爪误检 — 勿杀近距地面真目标."""
     if is_ee_gripper_phantom(obj, img_h=img_h, img_w=img_w):
         return True
     bbox = obj.get("bbox")
@@ -415,7 +420,18 @@ def is_head_body_phantom(obj: dict, *, img_h: int = IMG_H, img_w: int = IMG_W) -
         return False
     y2 = float(bbox[3])
     depth = float(obj.get("depth_m") or obj.get("nav_depth_m") or 99.0)
-    if y2 >= img_h * 0.80 and depth < 2.5:
+    sm = float(obj.get("blob_sat_mean") or 0.0)
+    vm = float(obj.get("blob_val_mean") or 0.0)
+    src = str(obj.get("source") or "")
+    # 近距地面黄物常在画面最下方 — 旧逻辑 y2>=0.80 & depth<2.5 会全杀
+    if depth >= 0.45:
+        if sm >= 14 or src in ("yellow_detect", "ransac_cluster"):
+            return False
+        if src == "ransac_cluster" and y2 >= img_h * 0.42:
+            return False
+    if y2 >= img_h * 0.88 and depth < 0.40 and sm < 30 and vm < 130:
+        return True
+    if y2 >= img_h * 0.94 and depth < 0.55 and sm < 22:
         return True
     return False
 
@@ -479,12 +495,17 @@ def is_head_sky_phantom(obj: dict, *, img_h: int = IMG_H, img_w: int = IMG_W) ->
     远距真物体 bbox 底边仍应低于 MIN_GROUND 线; 仅用 y 不用 z 会误杀远距.
     """
     pr = obj.get("pos_robot")
+    depth = float(obj.get("depth_m") or obj.get("nav_depth_m") or 99.0)
+    bbox = obj.get("bbox")
+    y2 = float(bbox[3]) if bbox and len(bbox) == 4 else 0.0
+    near_ground = depth < 2.6 and y2 > img_h * 0.42
     if pr is not None:
         try:
             pz = float(pr[2])
         except (TypeError, ValueError, IndexError):
             pz = 0.0
-        if pz > -0.06:
+        z_hi = 0.22 if near_ground else -0.06
+        if pz > z_hi:
             return True
     bbox = obj.get("bbox")
     if not bbox or len(bbox) != 4:

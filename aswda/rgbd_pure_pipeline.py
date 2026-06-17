@@ -1653,17 +1653,20 @@ class RgbdPureCamera:
             layers: List[dict] = []
             if self.camera_name == "head":
                 from yellow_detect import detect_head_yellow
-                from rgbd_utils import is_head_sky_phantom
+                from rgbd_utils import depth_stats, is_head_sky_phantom
 
                 layers = detect_head_yellow(rgb, depth, robot_pos, robot_yaw)
-                if not layers:
+                st = depth_stats(depth)
+                need_ransac = (not layers) or float(st.get("p10", 99.0)) < 2.85
+                if need_ransac:
                     ransac = self._depth_cluster.detect(
                         rgb, depth, np.asarray(robot_pos, dtype=np.float32), float(robot_yaw),
                     )
-                    layers = [
+                    rlayers = [
                         d for d in (ransac or [])
                         if not is_head_sky_phantom(d)
                     ]
+                    layers = self._merge_dets(list(layers) + list(rlayers)) if layers else rlayers
                 dets = self._merge_dets(layers)
             else:
                 from yellow_detect import detect_ee_yellow, detect_ee_yellow_nav

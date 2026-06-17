@@ -287,7 +287,7 @@ def _finalize_ee(o: dict, robot_pos, robot_yaw, arm_joints) -> dict:
 def _finalize_head(o: dict, robot_pos, robot_yaw, grav) -> dict:
     src = str(o.get("source") or "")
     px = int(o.get("cluster_pixels") or 0)
-    if src == "ransac_cluster" and o.get("pos_from_pointcloud") and px > 72:
+    if src == "ransac_cluster" and o.get("pos_from_pointcloud") and px > 48:
         out = dict(o)
         out["camera"] = "head"
         out["role"] = "nav"

@@ -1,8 +1,5 @@
 """
-Task B 黄物检测 v22 — 两步感知 + 远距召回增强:
-  1) ee:   站立远距黄物 3D 导航 (strict + relaxed HSV 双通道)
-  2) ee:   趴下后近距黄物 + 顶边抓取点
-  head 仅作近距补充，不作远距主导
+Task B 黄物检测 v26 — head 近距召回 + 底部真目标不再被 phantom 误杀
 """
 
 from __future__ import annotations
@@ -49,6 +46,8 @@ MAX_BLOB_SIDE_HEAD = 240
 MAX_BLOB_SIDE_EE = 320
 MAX_BLOB_SIDE_EE_NAV = 420
 HEAD_MAX_ROBOT_Z = -0.05
+HEAD_MAX_ROBOT_Z_NEAR = 0.22
+HEAD_NEAR_DEPTH_M = 2.45
 EE_Z_LO, EE_Z_HI = -0.92, 0.18
 EE_NAV_Z_LO, EE_NAV_Z_HI = -1.35, 0.55
 
@@ -188,13 +187,15 @@ def _points_from_blob(
 
 def _head_rois(h: int, w: int) -> List[np.ndarray]:
     """近距地面 + 中距 + 远距 (不含天空带)."""
+    near = np.zeros((h, w), dtype=bool)
+    near[int(h * 0.14) : int(h * 0.99), int(w * 0.01) : int(w * 0.99)] = True
     ground = np.zeros((h, w), dtype=bool)
-    ground[int(h * 0.34) : int(h * 0.97), int(w * 0.01) : int(w * 0.99)] = True
+    ground[int(h * 0.30) : int(h * 0.97), int(w * 0.01) : int(w * 0.99)] = True
     mid = np.zeros((h, w), dtype=bool)
-    mid[int(h * 0.22) : int(h * 0.78), int(w * 0.01) : int(w * 0.99)] = True
+    mid[int(h * 0.20) : int(h * 0.82), int(w * 0.01) : int(w * 0.99)] = True
     far = np.zeros((h, w), dtype=bool)
-    far[int(h * 0.18) : int(h * 0.72), int(w * 0.01) : int(w * 0.99)] = True
-    return [ground, mid, far]
+    far[int(h * 0.16) : int(h * 0.72), int(w * 0.01) : int(w * 0.99)] = True
+    return [near, ground, mid, far]
 
 
 def _head_blob_to_det(
@@ -226,7 +227,8 @@ def _head_blob_to_det(
     )
     if pos_r is None:
         return None
-    if float(pos_r[0]) < 0.05 or float(pos_r[2]) > HEAD_MAX_ROBOT_Z:
+    z_lim = HEAD_MAX_ROBOT_Z_NEAR if depth_m < HEAD_NEAR_DEPTH_M else HEAD_MAX_ROBOT_Z
+    if float(pos_r[0]) < 0.04 or float(pos_r[2]) > z_lim:
         return None
 
     bbox = [x1, y1, x2, y2]
@@ -402,17 +404,34 @@ def detect_head_yellow(
     ry = float(robot_yaw)
     h, w = depth.shape[:2]
     rois = _head_rois(h, w)
-    min_y2 = [0.34, 0.24, 0.18]
-    min_px = [MIN_BLOB_PX_HEAD, MIN_BLOB_PX_HEAD, MIN_BLOB_PX_HEAD_FAR]
+    min_y2 = [0.12, 0.32, 0.22, 0.16]
+    min_px = [max(6, MIN_BLOB_PX_HEAD - 4), MIN_BLOB_PX_HEAD, MIN_BLOB_PX_HEAD, MIN_BLOB_PX_HEAD_FAR]
+    d_near_far = [0.10, DEPTH_MIN, DEPTH_MIN, DEPTH_MIN]
+    d_far_far = [HEAD_NEAR_DEPTH_M + 0.8, DEPTH_MAX, DEPTH_MAX, DEPTH_MAX]
     dets: List[dict] = []
-    for roi, y2f, mpx in zip(rois, min_y2, min_px):
-        mask = _yellow_mask(rgb, depth, roi)
+    for roi, y2f, mpx, dn, df in zip(rois, min_y2, min_px, d_near_far, d_far_far):
+        mask = _yellow_mask(rgb, depth, roi, d_near=dn, d_far=df)
         labeled, n = ndimage.label(mask > 0)
         for cid in range(1, n + 1):
             ys, xs = np.where(labeled == cid)
             det = _head_blob_to_det(ys, xs, depth, rgb, rp, ry, h, w, min_y2_frac=y2f, min_px=mpx)
             if det is not None:
                 dets.append(det)
+    if len(dets) < 2:
+        for roi, y2f in ((rois[0], 0.10), (rois[1], 0.28)):
+            mask = _yellow_mask_relaxed(
+                rgb, depth, roi, d_near=0.10, d_far=HEAD_NEAR_DEPTH_M + 1.0,
+            )
+            labeled, n = ndimage.label(mask > 0)
+            for cid in range(1, n + 1):
+                ys, xs = np.where(labeled == cid)
+                det = _head_blob_to_det(
+                    ys, xs, depth, rgb, rp, ry, h, w,
+                    min_y2_frac=y2f, min_px=max(6, MIN_BLOB_PX_HEAD_FAR - 2),
+                )
+                if det is not None:
+                    det["nav_relaxed"] = True
+                    dets.append(det)
     dets = _dedupe_dets(dets)
     dets.sort(
         key=lambda d: (
