@@ -432,6 +432,34 @@ def _is_head_fallback_det(obj: dict) -> bool:
     )
 
 
+def is_head_sky_phantom(obj: dict, *, img_h: int = IMG_H, img_w: int = IMG_W) -> bool:
+    """
+    天空/地平线假黄: robot_z 过高 或 bbox 整体在画面上部.
+    远距真物体 bbox 底边仍应低于 MIN_GROUND 线; 仅用 y 不用 z 会误杀远距.
+    """
+    pr = obj.get("pos_robot")
+    if pr is not None:
+        try:
+            pz = float(pr[2])
+        except (TypeError, ValueError, IndexError):
+            pz = 0.0
+        if pz > -0.06:
+            return True
+    bbox = obj.get("bbox")
+    if not bbox or len(bbox) != 4:
+        return False
+    y1, y2 = float(bbox[1]), float(bbox[3])
+    cy = 0.5 * (y1 + y2)
+    cx = 0.5 * (float(bbox[0]) + float(bbox[2]))
+    if y2 < img_h * 0.36:
+        return True
+    if cy < img_h * 0.34 and cx > img_w * 0.48:
+        return True
+    if y1 < img_h * 0.12 and (y2 - y1) < img_h * 0.18:
+        return True
+    return False
+
+
 def is_valid_taskb_ground_det(obj: dict, *, img_h: int = IMG_H) -> bool:
     """Task B 地面物体 — 类无关/简化模式下仅做基本 3D 范围检查."""
     if CLASS_AGNOSTIC or RGBD_SIMPLE:
@@ -445,7 +473,9 @@ def is_valid_taskb_ground_det(obj: dict, *, img_h: int = IMG_H) -> bool:
             return False
         if px < 0.04:
             return False
-        if pz < -1.15 or pz > 0.70:
+        if pz < -1.15 or pz > 0.55:
+            return False
+        if is_head_sky_phantom(obj, img_h=img_h):
             return False
         return True
 
@@ -506,11 +536,13 @@ def _filter_minimal(objects: list, camera: str) -> list:
             px, py, pz = float(pr[0]), float(pr[1]), float(pr[2])
         except (TypeError, ValueError, IndexError):
             continue
-        if px < 0.03:
+        if px < 0.04:
             continue
-        if pz < -1.20 or pz > 0.75:
+        if pz < -1.20 or pz > 0.55:
             continue
         if float(np.hypot(px, py)) < 0.05 and abs(py) < 0.10:
+            continue
+        if camera == "head" and is_head_sky_phantom(o):
             continue
         out.append(o)
     return out

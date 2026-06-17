@@ -254,8 +254,8 @@ class AlgSolution:
         self.static_grasp_fuse_frames = max(2, int(os.getenv("ATEC_TASKB_STATIC_GRASP_FUSE", "3")))
         self._log(
             f"[TaskB-PERCEPTION] build={PERCEPTION_RANSAC_BUILD} "
-            f"pipeline=yellow_clean "
-            f"(HSV-yellow→3D→lock→EE-grasp×{self.static_grasp_fuse_frames}) "
+            f"pipeline=two_step "
+            f"(head-HSV-nav→crouch→EE-HSV-grasp×{self.static_grasp_fuse_frames}) "
             f"module={DEPTH_RANSAC_MODULE_PATH} repo={REPO_ROOT} "
             f"static_two_step={self.static_two_step} "
             f"class_agnostic={int(self.class_agnostic)} "
@@ -1212,9 +1212,9 @@ class AlgSolution:
                 f"lock={perception_output.get('nav_lock_id')}:{perception_output.get('nav_lock_class')} "
                 f"build={build} pose_source={pose_source}"
             )
-            if "v13" not in str(build) and "yellow-clean" not in str(build):
+            if "v14" not in str(build) and "yellow-ground" not in str(build):
                 self._log(
-                    f"[PERC-WARN] 感知版本过旧 build={build} — 请同步 taskb_perception/ (期望 v13 yellow_clean)"
+                    f"[PERC-WARN] 感知版本过旧 build={build} — 请同步 taskb_perception/ (期望 v14 yellow-ground)"
                 )
             elif head_n == 0 and cloud > 5000 and int(hr.get("obj_pts") or 0) == 0:
                 self._log(
@@ -2293,7 +2293,7 @@ class AlgSolution:
         if self.static_two_step and self._task_state in (
             "APPROACH_OBJECT", "CROUCHING", "STATIC_PERCEIVE", "NAV_TO_BIN",
         ):
-            preferred_camera = "head"
+            preferred_camera = "ee"
         elif active in ("head", "ee"):
             preferred_camera = str(active)
         else:
@@ -3434,18 +3434,18 @@ class AlgSolution:
             ee_stats = out.get("ee_ransac_stats") or {}
             tg = out.get("target_grasp")
             if isinstance(tg, dict):
+                src = str(tg.get("source") or "ee")
                 self._log(
-                    "[TaskB-STATIC] RANSAC hit "
-                    f"id={tg.get('id')} class={tg.get('class')} "
+                    "[TaskB-STATIC] grasp hit "
+                    f"src={src} id={tg.get('id')} class={tg.get('class')} "
                     f"pos_w={np.asarray(tg.get('pos_world'), dtype=np.float32).round(3).tolist()} "
                     f"grasp_w={np.asarray(tg.get('grasp_pos_world'), dtype=np.float32).round(3).tolist()} "
                     f"n_ee={len(out.get('ee_objects') or [])} "
-                    f"cloud={ee_stats.get('cloud_pts', 0)} clusters={ee_stats.get('clusters', 0)} "
-                    f"pose_source={tg.get('pose_source', 'ransac')}"
+                    f"cloud={ee_stats.get('cloud_pts', 0)} clusters={ee_stats.get('clusters', 0)}"
                 )
             else:
                 self._log(
-                    "[TaskB-STATIC] RANSAC miss "
+                    "[TaskB-STATIC] grasp miss "
                     f"(ee_n={len(out.get('ee_objects') or [])} "
                     f"cloud={ee_stats.get('cloud_pts', 0)} clusters={ee_stats.get('clusters', 0)})"
                 )
@@ -3609,7 +3609,7 @@ class AlgSolution:
                         self._task_state = "STATIC_PERCEIVE"
                         self._static_perceive_steps = 0
                         self._static_grasp_samples = []
-                        self._log("[TaskB-STATIC] crouch stable, enter STATIC_PERCEIVE (RANSAC)")
+                        self._log("[TaskB-STATIC] crouch stable, enter STATIC_PERCEIVE (EE-yellow)")
                     elif self._pending_grasp_target is not None and controller is not None:
                         self._pending_grasp_target = self._refresh_grasp_target_from_perception(
                             self._pending_grasp_target,

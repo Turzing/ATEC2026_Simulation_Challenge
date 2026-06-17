@@ -1653,17 +1653,32 @@ class RgbdPureCamera:
             layers: List[dict] = []
             if self.camera_name == "head":
                 from yellow_detect import detect_head_yellow
+                from rgbd_utils import is_head_sky_phantom
+
                 layers = detect_head_yellow(rgb, depth, robot_pos, robot_yaw)
-                ransac = self._depth_cluster.detect(
-                    rgb, depth, np.asarray(robot_pos, dtype=np.float32), float(robot_yaw),
-                )
                 if not layers:
-                    layers = list(ransac or [])
+                    ransac = self._depth_cluster.detect(
+                        rgb, depth, np.asarray(robot_pos, dtype=np.float32), float(robot_yaw),
+                    )
+                    layers = [
+                        d for d in (ransac or [])
+                        if not is_head_sky_phantom(d)
+                    ]
                 dets = self._merge_dets(layers)
             else:
-                dets = self._depth_cluster.detect(
-                    rgb, depth, np.asarray(robot_pos, dtype=np.float32), float(robot_yaw),
-                )
+                from yellow_detect import detect_ee_yellow, detect_ee_yellow_nav
+
+                cam_pos = self._cam_pos_robot()
+                rp = np.asarray(robot_pos, dtype=np.float32)
+                ry = float(robot_yaw)
+                static_two = os.environ.get("ATEC_TASKB_STATIC_TWO_STEP", "1") != "0"
+                if static_two:
+                    layers = detect_ee_yellow_nav(rgb, depth, rp, ry, cam_pos)
+                else:
+                    layers = detect_ee_yellow(rgb, depth, rp, ry, cam_pos)
+                if not layers:
+                    layers = self._depth_cluster.detect(rgb, depth, rp, ry) or []
+                dets = self._merge_dets(layers)
             dm = self._depth_cluster.get_debug_mask()
             if dm is not None:
                 self._debug["fusion"] = dm
