@@ -1379,7 +1379,12 @@ class AlgSolution:
         lateral_error = float(target_pos_robot[1])
         goal_dist = remaining
 
-        phase = "near_refine" if target_dist <= self.target_near_range else "far_approach"
+        cons_dist = self._conservative_target_dist(target_nav)
+        if self.static_two_step:
+            near_thresh = self.coarse_approach_dist + 0.12
+        else:
+            near_thresh = self.target_near_range
+        phase = "near_refine" if cons_dist <= near_thresh else "far_approach"
 
         approach_scale = float(np.clip(remaining / self.slow_down_radius, 0.0, 1.0))
         heading_scale = max(self.min_heading_lin_scale, abs(math.cos(heading_error)))
@@ -1399,7 +1404,7 @@ class AlgSolution:
 
         if abs(heading_error) > self.turn_then_go_yaw_threshold and lin_x < 0.20:
             phase = "turn_to_target"
-        elif target_dist <= self.target_near_range:
+        elif cons_dist <= near_thresh:
             phase = "near_refine"
         else:
             phase = "far_approach"
@@ -1411,9 +1416,11 @@ class AlgSolution:
             elif abs(heading_error) < 1.25:
                 lin_x = max(lin_x, 0.22)
                 ang_z = float(np.clip(ang_z, -0.32, 0.32))
+        if self.static_two_step and cons_dist > self.coarse_approach_dist + 0.08:
+            lin_x = max(lin_x, 0.42 * approach_scale)
+            phase = "far_approach"
 
         stopped = False
-        cons_dist = self._conservative_target_dist(target_nav)
         if self.static_two_step:
             if (
                 cons_dist <= self.coarse_approach_dist + 0.14
@@ -2369,8 +2376,15 @@ class AlgSolution:
             jump_lim = self.track_jump_reject_m
             if float(np.linalg.norm(pw[:2])) > 2.0:
                 jump_lim = min(jump_lim, 0.38)
+            live_closer = float(np.linalg.norm(pw[:2])) + 0.05 < float(
+                np.linalg.norm(self._fuse_pos_world[:2])
+            )
             if jump_xy > jump_lim:
-                pw = self._fuse_pos_world.copy()
+                if live_closer and bool(target.get("visible", True)):
+                    self._fuse_pos_world = pw.copy()
+                    pw = self._fuse_pos_world.copy()
+                else:
+                    pw = self._fuse_pos_world.copy()
             else:
                 alpha = 0.62
                 self._fuse_pos_world = (1.0 - alpha) * self._fuse_pos_world + alpha * pw
