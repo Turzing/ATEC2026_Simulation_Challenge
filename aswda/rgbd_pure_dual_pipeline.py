@@ -140,6 +140,8 @@ EE_NAV_LOCK_MAX_DEPTH_M = 2.05   # EE 独锁最大深度 (log: 2.36m 偏 1.55m)
 EE_ONLY_HEAD_CONFIRM_MAX = 30    # EE-only 锁无 head 确认则解锁 (~0.6s)
 NAV_RELOCK_MAX_XY_M = 1.25       # 重锁不得离上一 lock_world 超过此距
 NAV_LOCK_WORLD_STICK_M = 0.48    # class_agnostic: 同 id 但超此距视为 tracker 复用 → 拒
+NAV_LOCK_CLOSE_STICK_M = 0.32    # <1.55m 时更紧, 防 lock 2→11 近距转圈
+NAV_LOCK_CLOSE_DIST_M = 1.55
 EE_HEAD_SPATIAL_CONFIRM_M = 0.32  # EE↔head 同类确认最大 XY 偏差 (log: 0.46m 误确认地板 phantom)
 TARGET_MATCH_RADIUS = 0.55       # 判定同一导航目标
 HEAD_MIRROR_EE_MIN_M = 0.85
@@ -1684,8 +1686,10 @@ class RgbdPureDualPipeline:
         ee_grasp = _best_ee_grasp(ee_objs, lock_ref or head_nav or ee_nav)
         ee_d = _obj_dist(ee_grasp or ee_nav)
         head_d = _obj_dist(head_nav)
+        prox_dist = min(head_d, ee_d)
+        close_prox = prox_dist < NAV_LOCK_CLOSE_DIST_M
 
-        if self._nav_lock_id is not None and head_objs:
+        if self._nav_lock_id is not None and head_objs and not close_prox:
             synced = _sync_lock_id_from_head(
                 self._nav_lock_id, self._nav_lock_class, head_objs, self._nav_lock_world,
             )
@@ -1699,9 +1703,17 @@ class RgbdPureDualPipeline:
                 self._nav_lock_id, self._nav_lock_class, self._nav_lock_world,
             )
             if live is not None and live.get("pos_world") is not None:
+                stick_m = NAV_LOCK_CLOSE_STICK_M if close_prox else NAV_LOCK_WORLD_STICK_M
                 if (
                     self._nav_lock_world is not None
-                    and _world_xy_dist(live, {"pos_world": self._nav_lock_world}) > NAV_LOCK_WORLD_STICK_M
+                    and _world_xy_dist(live, {"pos_world": self._nav_lock_world}) > stick_m
+                ):
+                    live = None
+                elif (
+                    close_prox
+                    and int(live.get("id", -1)) != int(self._nav_lock_id)
+                    and self._nav_lock_world is not None
+                    and _world_xy_dist(live, {"pos_world": self._nav_lock_world}) > 0.22
                 ):
                     live = None
                 new_cls = live.get("class") if live is not None else None

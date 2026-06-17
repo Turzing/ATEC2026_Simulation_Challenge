@@ -266,6 +266,7 @@ class AlgSolution:
         self._static_grasp_samples: list[dict[str, Any]] = []
         self._crouch_cooldown_remaining = 0
         self._live_ee_nav_streak = 0
+        self._live_nav_streak = 0
         self._static_blind_miss_streak = 0
         self.static_grasp_fuse_frames = max(2, int(os.getenv("ATEC_TASKB_STATIC_GRASP_FUSE", "3")))
         self._log(
@@ -1434,6 +1435,11 @@ class AlgSolution:
             ang_z = float(np.clip(ang_z * 0.42, -0.28, 0.28))
             lin_x = min(lin_x, 0.26)
             phase = "turn_to_target"
+        if self.static_two_step and cons_dist <= self.coarse_approach_dist + 0.18:
+            ang_z = float(np.clip(ang_z, -0.32, 0.32))
+            if abs(heading_error) > 0.55:
+                lin_x = min(lin_x, 0.18)
+                phase = "turn_to_target"
 
         stopped = False
         if self.static_two_step:
@@ -2470,10 +2476,14 @@ class AlgSolution:
 
         phase = str(perception_output.get("phase", "approach"))
         active = perception_output.get("active_camera")
+        nav_stage = str(perception_output.get("nav_stage") or "")
         if self.static_two_step and self._task_state in (
             "APPROACH_OBJECT", "CROUCHING", "STATIC_PERCEIVE", "NAV_TO_BIN",
         ):
-            preferred_camera = "ee"
+            if nav_stage == "near_head" or active == "head":
+                preferred_camera = "head"
+            else:
+                preferred_camera = "ee"
         elif active in ("head", "ee"):
             preferred_camera = str(active)
         else:
@@ -3537,27 +3547,43 @@ class AlgSolution:
         nav_info: dict[str, Any],
         cons_dist: float,
     ) -> bool:
-        """Only crouch when close, stopped, live EE lock — not coast / edge-only."""
+        """Close + stopped + live head/EE lock — allow crouch (not coast-only)."""
         if self._crouch_cooldown_remaining > 0:
             return False
         if perception_output is None:
             return False
-        if bool(target_nav.get("nav_coast")) or not bool(target_nav.get("visible", True)):
+        nav_cam = str(
+            target_nav.get("source_camera")
+            or target_nav.get("camera")
+            or perception_output.get("active_camera")
+            or ""
+        )
+        head_live = len(perception_output.get("head_objects") or []) > 0
+        ee_live = len(perception_output.get("ee_objects") or []) > 0
+        if bool(target_nav.get("nav_coast")):
+            self._live_nav_streak = 0
+            self._live_ee_nav_streak = 0
+            return False
+        visible_ok = bool(target_nav.get("visible", True)) or head_live or nav_cam == "head"
+        if not visible_ok:
+            self._live_nav_streak = 0
             self._live_ee_nav_streak = 0
             return False
         lock_id = perception_output.get("nav_lock_id")
         if lock_id is None:
+            self._live_nav_streak = 0
             self._live_ee_nav_streak = 0
             return False
-        ee_live = len(perception_output.get("ee_objects") or []) > 0
-        if ee_live:
-            self._live_ee_nav_streak += 1
+        if ee_live or head_live or nav_cam == "head":
+            self._live_nav_streak += 1
         else:
-            self._live_ee_nav_streak = 0
-        if self._live_ee_nav_streak < self.approach_live_ee_frames:
+            self._live_nav_streak = 0
+        self._live_ee_nav_streak = self._live_nav_streak
+        if self._live_nav_streak < self.approach_live_ee_frames:
             return False
-        n_pts = int(target_nav.get("nav_point_count") or 0)
-        if n_pts < self.approach_min_nav_points:
+        n_pts = int(target_nav.get("nav_point_count") or target_nav.get("cluster_pixels") or 0)
+        min_pts = 3 if nav_cam == "head" or target_nav.get("pos_from_pointcloud") else self.approach_min_nav_points
+        if n_pts < min_pts and not target_nav.get("pos_from_pointcloud"):
             return False
         bbox = target_nav.get("bbox")
         if bbox and len(bbox) == 4:
@@ -3571,7 +3597,8 @@ class AlgSolution:
         close_enough = cons_dist <= self.coarse_approach_dist + self.approach_crouch_dist_slack
         if not close_enough:
             return False
-        heading_ok = abs(float(nav_info.get("heading_error") or 999.0)) <= self.grasp_heading_tolerance
+        heading_tol = self.grasp_heading_tolerance * 1.35
+        heading_ok = abs(float(nav_info.get("heading_error") or 999.0)) <= heading_tol
         nav_phase = str(nav_info.get("phase", ""))
         stopped_ok = bool(nav_info.get("stopped")) and nav_phase in ("refine_hold", "ready_to_grasp")
         return heading_ok and stopped_ok
@@ -3606,6 +3633,7 @@ class AlgSolution:
         self._static_grasp_samples = []
         self._static_blind_miss_streak = 0
         self._live_ee_nav_streak = 0
+        self._live_nav_streak = 0
         self._task_state = "CROUCHING"
         stage_d = self._grasp_stage_dist(target_nav)
         self._log(
@@ -4150,7 +4178,7 @@ class AlgSolution:
                         self._log(
                             "[TaskB-STATIC] coarse nav done → crouch "
                             f"dist={cons_dist:.2f}m phase={nav_phase} lock={lock_id} "
-                            f"ee_streak={self._live_ee_nav_streak}"
+                            f"nav_streak={self._live_nav_streak}"
                         )
                         self._start_crouch_for_static_approach(target_nav, perception_output)
                 else:
