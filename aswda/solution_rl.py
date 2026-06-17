@@ -249,6 +249,8 @@ class AlgSolution:
         self.static_perceive_max_steps = max(10, int(os.getenv("ATEC_TASKB_STATIC_PERCEIVE_MAX_STEPS", "30")))
         self._static_nav_hint: dict[str, Any] | None = None
         self._static_perceive_steps = 0
+        self._static_grasp_samples: list[dict[str, Any]] = []
+        self.static_grasp_fuse_frames = max(2, int(os.getenv("ATEC_TASKB_STATIC_GRASP_FUSE", "3")))
         self._log(
             f"[TaskB-PERCEPTION] build={PERCEPTION_RANSAC_BUILD} "
             f"module={DEPTH_RANSAC_MODULE_PATH} repo={REPO_ROOT} "
@@ -382,6 +384,7 @@ class AlgSolution:
         self._pending_grasp_status = None
         self._static_nav_hint = None
         self._static_perceive_steps = 0
+        self._static_grasp_samples = []
         self._reset_sit_down_tracking()
         if self._leg_posture_controller is not None:
             self._leg_posture_controller.state = "IDLE"
@@ -1117,6 +1120,25 @@ class AlgSolution:
             return
         p_world, p_robot = reproj
 
+        if old_pos_robot is not None and obj.get("pos_from_pointcloud"):
+            n_pts = int(obj.get("nav_point_count") or 0)
+            src = str(obj.get("source") or "")
+            if src == "rgbd_nav_head":
+                w_gt = min(0.82, 0.55 + n_pts / 70.0)
+            elif src == "ransac_cluster":
+                w_gt = min(0.78, 0.50 + n_pts / 100.0)
+            else:
+                w_gt = min(0.72, 0.45 + n_pts / 90.0)
+            p_robot = (
+                w_gt * p_robot + (1.0 - w_gt) * np.asarray(old_pos_robot, dtype=np.float32)
+            ).astype(np.float32)
+            c, s = math.cos(robot_yaw), math.sin(robot_yaw)
+            p_world = robot_pos + np.array([
+                c * p_robot[0] - s * p_robot[1],
+                s * p_robot[0] + c * p_robot[1],
+                p_robot[2],
+            ], dtype=np.float32)
+
         obj["pos_world"] = [float(p_world[0]), float(p_world[1]), float(p_world[2])]
         obj["pose_source"] = "gt_camera"
         obj["pos_robot"] = [float(p_robot[0]), float(p_robot[1]), float(p_robot[2])]
@@ -1186,9 +1208,9 @@ class AlgSolution:
                 f"lock={perception_output.get('nav_lock_id')}:{perception_output.get('nav_lock_class')} "
                 f"build={build} pose_source={pose_source}"
             )
-            if "v6" not in str(build) and "v5" not in str(build):
+            if "v8" not in str(build) and "v7" not in str(build) and "v6" not in str(build):
                 self._log(
-                    f"[PERC-WARN] 感知版本过旧 build={build} — 请同步 taskb_perception/ (期望 v6 taskb-head)"
+                    f"[PERC-WARN] 感知版本过旧 build={build} — 请同步 taskb_perception/ (期望 v8)"
                 )
             elif head_n == 0 and int(hr.get("clusters") or 0) > 0:
                 self._log(
@@ -3304,6 +3326,7 @@ class AlgSolution:
         self._reset_sit_down_tracking()
         self._pending_grasp_target = None
         self._static_perceive_steps = 0
+        self._static_grasp_samples = []
         self._task_state = "CROUCHING"
         stage_d = self._grasp_stage_dist(target_nav)
         self._log(
@@ -3312,6 +3335,37 @@ class AlgSolution:
             f"stage_dist={stage_d:.2f}m"
         )
         return True
+
+    def _fuse_static_grasp_targets(self, samples: list[dict[str, Any]]) -> dict[str, Any] | None:
+        """多帧 static RANSAC 中值融合 grasp 点位."""
+        if not samples:
+            return None
+        if len(samples) == 1:
+            return dict(samples[0])
+        pw = []
+        gw = []
+        for s in samples:
+            p = s.get("pos_world")
+            g = s.get("grasp_pos_world")
+            if p is not None:
+                pw.append(np.asarray(p, dtype=np.float32).reshape(3))
+            if g is not None:
+                gw.append(np.asarray(g, dtype=np.float32).reshape(3))
+        if not pw:
+            return dict(samples[-1])
+        out = dict(samples[-1])
+        med_p = np.median(np.stack(pw, axis=0), axis=0)
+        out["pos_world"] = med_p.tolist()
+        if gw:
+            med_g = np.median(np.stack(gw, axis=0), axis=0)
+            out["grasp_pos_world"] = med_g.tolist()
+            go = out.get("grasp_offset_robot")
+            if go is not None and out.get("pos_robot") is not None:
+                pr = np.asarray(out["pos_robot"], dtype=np.float32)
+                out["grasp_pos_robot"] = (med_g - med_p + pr).tolist()
+        out["static_fused_frames"] = len(samples)
+        out["pose_source"] = "static_fused"
+        return out
 
     def _run_static_ransac_perceive(
         self,
@@ -3511,6 +3565,7 @@ class AlgSolution:
                     if self.static_two_step:
                         self._task_state = "STATIC_PERCEIVE"
                         self._static_perceive_steps = 0
+                        self._static_grasp_samples = []
                         self._log("[TaskB-STATIC] crouch stable, enter STATIC_PERCEIVE (RANSAC)")
                     elif self._pending_grasp_target is not None and controller is not None:
                         self._pending_grasp_target = self._refresh_grasp_target_from_perception(
@@ -3587,7 +3642,18 @@ class AlgSolution:
                         robot_pos_world,
                         robot_yaw,
                     ) or grasp_tgt
-                    self._pending_grasp_target = dict(grasp_tgt)
+                    self._static_grasp_samples.append(dict(grasp_tgt))
+                need = self.static_grasp_fuse_frames
+                fused = None
+                if len(self._static_grasp_samples) >= need:
+                    fused = self._fuse_static_grasp_targets(self._static_grasp_samples[-need:])
+                elif (
+                    self._static_grasp_samples
+                    and self._static_perceive_steps >= self.static_perceive_max_steps - 2
+                ):
+                    fused = self._fuse_static_grasp_targets(self._static_grasp_samples)
+                if fused is not None:
+                    self._pending_grasp_target = dict(fused)
                     try:
                         grasp_pos_world = self._grasp_reference_world(self._pending_grasp_target)
                         current_ee_quat_w = controller.get_ee_pose()[1]
@@ -3600,7 +3666,8 @@ class AlgSolution:
                         self._log(
                             "[TaskB-STATIC] static RANSAC → grasp started "
                             f"id={self._pending_grasp_target.get('id')} "
-                            f"class={self._pending_grasp_target.get('class')}"
+                            f"class={self._pending_grasp_target.get('class')} "
+                            f"fused={self._pending_grasp_target.get('static_fused_frames', 1)}"
                         )
                     except Exception as exc:
                         self._log(f"[TaskB-STATIC] start_grasp after RANSAC failed: {exc}")

@@ -245,11 +245,15 @@ def _as_head_nav(o: dict) -> dict:
 
 
 def _finalize_ee(o: dict, robot_pos, robot_yaw, arm_joints) -> dict:
-    if o.get("source") == "ransac_cluster" and o.get("pos_from_pointcloud"):
+    src = str(o.get("source") or "")
+    px = int(o.get("cluster_pixels") or 0)
+    if src == "ransac_cluster" and o.get("pos_from_pointcloud"):
         out = dict(o)
         out["camera"] = "ee"
         out["role"] = "nav_grasp"
-        out["skip_camera_correction"] = True
+        # 静态抓取帧允许 GT 相机校正以提升 grasp 精度
+        if not out.get("static_snapshot"):
+            out["skip_camera_correction"] = px > 120
         return _enrich_nav(out) or out
     cam_pos = compute_dynamic_ee_cam_pos(arm_joints) if arm_joints is not None else None
     if cam_pos is None:
@@ -263,7 +267,9 @@ def _finalize_ee(o: dict, robot_pos, robot_yaw, arm_joints) -> dict:
 
 
 def _finalize_head(o: dict, robot_pos, robot_yaw, grav) -> dict:
-    if o.get("source") == "ransac_cluster" and o.get("pos_from_pointcloud"):
+    src = str(o.get("source") or "")
+    px = int(o.get("cluster_pixels") or 0)
+    if src == "ransac_cluster" and o.get("pos_from_pointcloud") and px > 72:
         out = dict(o)
         out["camera"] = "head"
         out["role"] = "nav"
@@ -276,6 +282,24 @@ def _finalize_head(o: dict, robot_pos, robot_yaw, grav) -> dict:
     out["camera"] = "head"
     out["role"] = "nav"
     return _enrich_nav(out) or out
+
+
+def _smooth_lock_world(
+    prev: Optional[List[float]],
+    new_w: List[float],
+    *,
+    alpha: float = 0.42,
+    jump_m: float = 0.48,
+) -> List[float]:
+    """nav lock 世界坐标 EMA, 拒大跳变."""
+    if prev is None:
+        return list(new_w)
+    old = np.asarray(prev, dtype=np.float32).reshape(3)
+    new = np.asarray(new_w, dtype=np.float32).reshape(3)
+    if float(np.linalg.norm(new[:2] - old[:2])) > jump_m:
+        return list(new_w)
+    blended = alpha * new + (1.0 - alpha) * old
+    return blended.tolist()
 
 
 def _object_summary(o: dict, cam: str) -> dict:
@@ -568,13 +592,25 @@ def _filter_phantom_ee(ee_objs: List[dict], head_objs: List[dict]) -> List[dict]
     return kept
 
 
+def _nav_det_source_rank(o: dict) -> int:
+    if o.get("head_far_fallback") or o.get("head_depth_fallback") or o.get("head_neutral_fallback"):
+        return 0
+    src = str(o.get("source") or "")
+    if src == "rgbd_nav_head":
+        return 1
+    if src == "ransac_cluster":
+        px = int(o.get("cluster_pixels") or 0)
+        return 3 if px > 80 else 2
+    return 4
+
+
 def _nav_lock_rank(o: dict, prefer_head: bool = True) -> tuple:
     d = _obj_dist(o)
     is_head = o.get("camera") == "head"
     cam_pen = 0 if (prefer_head and is_head) else 1
     ee_pen = 1.2 if (not is_head and d < 2.0) else 0.0
     conf = float(o.get("pos_confidence") or head_nav_pos_confidence(o))
-    return (cam_pen, d + ee_pen, -conf)
+    return (cam_pen, _nav_det_source_rank(o), d + ee_pen, -conf)
 
 
 def _best_nav_target(
@@ -1511,15 +1547,22 @@ class RgbdPureDualPipeline:
                     self._nav_lock_class
                     and new_cls
                     and new_cls != self._nav_lock_class
-                    and self._nav_lock_world is not None
-                    and _world_xy_dist(live, {"pos_world": self._nav_lock_world}) > 0.85
                 ):
-                    live = None
-            if live is not None and live.get("pos_world") is not None:
+                    same_cls = _find_in_pool(
+                        head_objs, self._nav_lock_id, self._nav_lock_class, self._nav_lock_world,
+                    )
+                    if same_cls is not None:
+                        live = same_cls
+                    elif _world_xy_dist(live, {"pos_world": self._nav_lock_world or live["pos_world"]}) > 0.55:
+                        live = None
                 self._nav_lock_id = int(live["id"])
-                if live.get("class"):
+                if live.get("class") and (
+                    self._nav_lock_class is None or live.get("class") == self._nav_lock_class
+                ):
                     self._nav_lock_class = live.get("class")
-                self._nav_lock_world = list(live["pos_world"])
+                pw = live.get("pos_world")
+                if pw is not None:
+                    self._nav_lock_world = _smooth_lock_world(self._nav_lock_world, list(pw))
                 self._nav_lock_miss = 0
                 locked = live
                 lock_ref = live

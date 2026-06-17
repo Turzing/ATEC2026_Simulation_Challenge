@@ -727,7 +727,15 @@ def refresh_head_object_pose(
         pc_r = np.asarray(out["pos_robot"], dtype=np.float32)
         n = int(out.get("nav_point_count") or 0)
         src = str(out.get("source") or "")
-        if src == "ransac_cluster" or n >= 18:
+        if src == "rgbd_nav_head":
+            w_pc = min(0.90, 0.68 + n / 55.0)
+            pos_r = (w_pc * pc_r + (1.0 - w_pc) * anchor_r).astype(np.float32)
+            pos_r[2] = float(pc_r[2])
+        elif src == "ransac_cluster" and n <= 72:
+            w_pc = min(0.72, 0.48 + n / 90.0)
+            pos_r = (w_pc * pc_r + (1.0 - w_pc) * anchor_r).astype(np.float32)
+            pos_r[2] = float(pc_r[2])
+        elif src == "ransac_cluster" or n >= 18:
             pos_r = pc_r.copy()
         else:
             w_pc = min(0.82, 0.55 + n / 80.0)

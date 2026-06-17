@@ -46,7 +46,7 @@ def _classify_cluster_rgb(
         return "sugar_box", 0.35
 
     bgr = patch.reshape(-1, 1, 3).astype(np.uint8)
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV).reshape(-1, 3)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_RGB2HSV).reshape(-1, 3)
     hue = float(np.median(hsv[:, 0]))
     sat = float(np.median(hsv[:, 1]))
     val = float(np.median(hsv[:, 2]))
@@ -61,12 +61,15 @@ def _classify_cluster_rgb(
     if yellow:
         scores["mustard_bottle"] += 0.28
         scores["banana"] += 0.26
-    if bw >= bh * 1.15 and aspect > 1.28:
+    if bh >= bw * 1.12 and aspect > 1.18:
+        scores["mustard_bottle"] += 0.42
+        scores["banana"] -= 0.12
+    elif bw >= bh * 1.15 and aspect > 1.28:
         scores["banana"] += 0.40
-    elif bh >= bw * 1.12 and aspect > 1.22:
-        scores["mustard_bottle"] += 0.36
     elif aspect < 1.18:
         scores["sugar_box"] += 0.38
+    if yellow and bh >= bw * 1.08 and sat >= 30:
+        return "mustard_bottle", min(0.90, 0.78 + 0.04 * (aspect - 1.0))
     if z_extent < 0.10 and aspect < 1.32:
         scores["sugar_box"] += 0.32
     if z_extent > 0.11 and aspect < 1.22 and yellow:
@@ -121,20 +124,24 @@ class DepthClusterDetector:
         )
         out: List[dict] = []
         for det in dets:
-            if not DEPTH_ONLY_CLASS:
-                bbox = det.get("bbox") or [0, 0, 0, 0]
-                z_ext = float(det.get("geom_z_extent") or 0.08)
-                geom_cls = det.get("class")
-                rgb_cls, rgb_conf = _classify_cluster_rgb(rgb, bbox, z_ext)
-                if rgb_conf >= 0.68:
-                    det["class"] = rgb_cls
-                    det["class_id"] = CLASS_NAME_TO_ID.get(rgb_cls, -1)
-                    det["class_conf"] = rgb_conf
-                else:
-                    det["class"] = geom_cls or rgb_cls
-                    det["class_id"] = CLASS_NAME_TO_ID.get(det["class"], -1)
-                    det["class_conf"] = max(float(det.get("class_conf") or 0), rgb_conf * 0.85)
-                det["conf"] = float(min(0.93, 0.45 + float(det["class_conf"]) * 0.48))
+            bbox = det.get("bbox") or [0, 0, 0, 0]
+            z_ext = float(det.get("geom_z_extent") or 0.08)
+            geom_cls = det.get("class")
+            rgb_cls, rgb_conf = _classify_cluster_rgb(rgb, bbox, z_ext)
+            use_rgb = self.camera_name == "head" or not DEPTH_ONLY_CLASS
+            if use_rgb and rgb_conf >= 0.55:
+                det["class"] = rgb_cls
+                det["class_id"] = CLASS_NAME_TO_ID.get(rgb_cls, -1)
+                det["class_conf"] = rgb_conf
+            elif not DEPTH_ONLY_CLASS and rgb_conf >= 0.68:
+                det["class"] = rgb_cls
+                det["class_id"] = CLASS_NAME_TO_ID.get(rgb_cls, -1)
+                det["class_conf"] = rgb_conf
+            else:
+                det["class"] = geom_cls or rgb_cls
+                det["class_id"] = CLASS_NAME_TO_ID.get(det["class"], -1)
+                det["class_conf"] = max(float(det.get("class_conf") or 0), rgb_conf * 0.85)
+            det["conf"] = float(min(0.93, 0.45 + float(det["class_conf"]) * 0.48))
             out.append(det)
         return out
 

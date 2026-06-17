@@ -716,13 +716,18 @@ class RgbdPureCamera:
         if yellow:
             scores["mustard_bottle"] += 0.30
             scores["banana"] += 0.28
-        if horiz and aspect > 1.30:
+        if bh >= bw * 1.10 and aspect > 1.15:
+            scores["mustard_bottle"] += 0.44
+            scores["banana"] -= 0.14
+        elif horiz and aspect > 1.30:
             scores["banana"] += 0.42
             scores["mustard_bottle"] += 0.12
         elif vert and aspect > 1.25:
             scores["mustard_bottle"] += 0.38
         elif aspect < 1.15:
             scores["sugar_box"] += 0.40
+        if yellow and vert and sat >= 28:
+            return "mustard_bottle", min(0.91, 0.80 + 0.03 * (aspect - 1.0))
         if z_extent < 0.10 and aspect < 1.35:
             scores["sugar_box"] += 0.35
         if z_extent > 0.11 and aspect < 1.25 and yellow:
@@ -1122,13 +1127,28 @@ class RgbdPureCamera:
     def _merge_dets(self, dets: List[dict]) -> List[dict]:
         if len(dets) < 2:
             return dets
-        dets = sorted(
-            dets,
-            key=lambda x: (
-                -(float(x.get("blob_sat_mean", 0)) * 0.5 + float(x.get("blob_val_mean", 0)) * 0.3),
-                x.get("depth_m") or 999.0,
-            ),
-        )
+        if self.camera_name == "head":
+
+            def _head_src_rank(d: dict) -> tuple:
+                if d.get("head_far_fallback") or d.get("head_depth_fallback") or d.get("head_neutral_fallback"):
+                    return (0, float(d.get("depth_m") or 999.0))
+                src = str(d.get("source") or "")
+                if src == "rgbd_nav_head":
+                    return (1, float(d.get("depth_m") or 999.0))
+                px = int(d.get("cluster_pixels") or 0)
+                if src == "ransac_cluster":
+                    return (3 if px > 80 else 2, float(d.get("depth_m") or 999.0))
+                return (4, float(d.get("depth_m") or 999.0))
+
+            dets = sorted(dets, key=_head_src_rank)
+        else:
+            dets = sorted(
+                dets,
+                key=lambda x: (
+                    -(float(x.get("blob_sat_mean", 0)) * 0.5 + float(x.get("blob_val_mean", 0)) * 0.3),
+                    x.get("depth_m") or 999.0,
+                ),
+            )
         kept: List[dict] = []
         for d in dets:
             dup = False
@@ -1157,6 +1177,7 @@ class RgbdPureCamera:
         val: Optional[np.ndarray] = None, sat: Optional[np.ndarray] = None,
         hue: Optional[np.ndarray] = None,
         relief: Optional[np.ndarray] = None,
+        rgb: Optional[np.ndarray] = None,
     ) -> Optional[dict]:
         if self._is_shadow_shape(ys, xs, val, sat, h, w, relief):
             return None
@@ -1291,6 +1312,15 @@ class RgbdPureCamera:
             cls, cls_conf, geom_ext = self._classify_object(
                 bbox, len(ys), ys, xs, depth, sm, depth_m, use_3d=True, hue_mean=hm, val_mean=vm,
             )
+            if rgb is not None and self.camera_name == "head":
+                try:
+                    from rgbd_depth_cluster import _classify_cluster_rgb
+                    z_ext = float(geom_ext[2]) if geom_ext else 0.08
+                    rgb_cls, rgb_conf = _classify_cluster_rgb(rgb, bbox, z_ext)
+                    if rgb_conf >= 0.58:
+                        cls, cls_conf = rgb_cls, rgb_conf
+                except Exception:
+                    pass
             conf = float(min(0.94, 0.45 + cls_conf * 0.55))
             yaw_rel = float(np.arctan2(pos_r[1], pos_r[0]))
             depth_f = float(az if az > self._depth_min() else depth_m)
@@ -1419,7 +1449,7 @@ class RgbdPureCamera:
             ys, xs = np.where(labeled == cid)
             det = self._blob_det(
                 ys, xs, depth, h, w, robot_pos, robot_yaw,
-                val=val, sat=sat, hue=hue, relief=relief,
+                val=val, sat=sat, hue=hue, relief=relief, rgb=rgb,
             )
             if det is not None:
                 dets.append(det)
@@ -1591,15 +1621,8 @@ class RgbdPureCamera:
         depth = sanitize_depth(depth)
         rgb = align_rgb_to_depth(rgb, depth)
         if self._simple_mode:
-            dets = self._depth_cluster.detect(
-                rgb, depth, np.asarray(robot_pos, dtype=np.float32), float(robot_yaw),
-            )
-            dm = self._depth_cluster.get_debug_mask()
-            if dm is not None:
-                self._debug["fusion"] = dm
-            # Task B 20m 平地: simple 模式也要 relief/远距补检 (官方 head_depth 米制)
+            layers: List[dict] = []
             if self.camera_name == "head":
-                layers: List[dict] = list(dets or [])
                 for extra_fn in (
                     self._detect_head_far_yellow,
                     self._detect_head_neutral_boxes,
@@ -1612,7 +1635,21 @@ class RgbdPureCamera:
                     strip_dets = self._detect_bottom_strip(rgb, depth, robot_pos, robot_yaw)
                     if strip_dets:
                         layers.extend(strip_dets)
+                ransac = self._depth_cluster.detect(
+                    rgb, depth, np.asarray(robot_pos, dtype=np.float32), float(robot_yaw),
+                )
+                layers.extend(
+                    d for d in (ransac or [])
+                    if int(d.get("cluster_pixels") or 0) <= 72
+                )
                 dets = self._prune_fallback_phantoms(self._merge_dets(layers))
+            else:
+                dets = self._depth_cluster.detect(
+                    rgb, depth, np.asarray(robot_pos, dtype=np.float32), float(robot_yaw),
+                )
+            dm = self._depth_cluster.get_debug_mask()
+            if dm is not None:
+                self._debug["fusion"] = dm
             dets.sort(key=lambda x: x.get("depth_m") or 999.0)
             return dets
         mask = self._build_fusion_mask(rgb, depth)

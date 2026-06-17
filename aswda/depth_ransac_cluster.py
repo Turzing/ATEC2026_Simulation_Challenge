@@ -25,11 +25,12 @@ from config import (
 )
 from rgbd_utils import (
     compute_dynamic_ee_cam_pos,
+    compute_dynamic_head_cam_pos,
     pixel_to_robot,
     sanitize_depth,
 )
 
-PERCEPTION_RANSAC_BUILD = "20260617-taskb-head-v6"
+PERCEPTION_RANSAC_BUILD = "20260617-taskb-head-v8"
 
 _CAM_CFG = {
     "head": {
@@ -227,10 +228,12 @@ class RansacClusterDetector:
             self._projected_gravity = np.asarray(grav, dtype=np.float32).reshape(3)
 
     def _cam_pose(self) -> Tuple[dict, np.ndarray, np.ndarray]:
-        """head 粗导航用静态外参建点云; EE 静态抓取用臂关节动态外参."""
+        """head 用 gravity 动态外参 (与 rgbd_pure_pipeline 一致); EE 用臂关节."""
         c = self._cfg
         if self.camera_name == "ee" and self._arm_joints is not None:
             pos = compute_dynamic_ee_cam_pos(self._arm_joints)
+        elif self.camera_name == "head" and self._projected_gravity is not None:
+            pos = compute_dynamic_head_cam_pos(self._projected_gravity)
         else:
             pos = c["pos_def"].copy()
         return c["cam"], pos.astype(np.float32), c["rot"].astype(np.float32)
@@ -289,6 +292,59 @@ class RansacClusterDetector:
         yaw = float(np.arctan2(dy, dx))
         return _quat_multiply_wxyz(_quat_from_yaw_wxyz(yaw), fixed)
 
+    def _cluster_bottom_indices(
+        self,
+        vs: np.ndarray,
+        idx: np.ndarray,
+        *,
+        bottom_frac: float = 0.35,
+    ) -> np.ndarray:
+        """图像 v 越大越靠下; 取簇内靠下像素用于地面接触定位."""
+        v_idx = vs[idx]
+        if len(v_idx) < 6:
+            return idx
+        v_cut = float(np.percentile(v_idx, 100.0 * (1.0 - bottom_frac)))
+        bot = v_idx >= v_cut
+        if int(np.sum(bot)) >= max(4, len(idx) // 6):
+            return idx[bot]
+        return idx
+
+    def _cluster_top_indices(
+        self,
+        vs: np.ndarray,
+        idx: np.ndarray,
+        *,
+        top_frac: float = 0.30,
+    ) -> np.ndarray:
+        v_idx = vs[idx]
+        if len(v_idx) < 6:
+            return idx
+        v_cut = float(np.percentile(v_idx, 100.0 * top_frac))
+        top = v_idx <= v_cut
+        if int(np.sum(top)) >= max(4, len(idx) // 8):
+            return idx[top]
+        return idx
+
+    def _cluster_nav_pos(
+        self,
+        points: np.ndarray,
+        us: np.ndarray,
+        vs: np.ndarray,
+        z_cam: np.ndarray,
+        idx: np.ndarray,
+    ) -> Tuple[np.ndarray, float, float, float, float]:
+        """底边加权 3D + nav anchor (贴地接触点)."""
+        bot_idx = self._cluster_bottom_indices(vs, idx)
+        nav_pts = points[bot_idx]
+        if len(nav_pts) < 4:
+            nav_pts = points[idx]
+        pos_robot = np.median(nav_pts, axis=0).astype(np.float32)
+        pos_robot[2] = float(np.percentile(points[idx, 2], 18))
+        nav_u = float(np.median(us[bot_idx]))
+        nav_v = float(np.max(vs[bot_idx]))
+        anchor_depth = float(np.median(z_cam[bot_idx]))
+        return pos_robot, nav_u, nav_v, anchor_depth
+
     def _cluster_to_det(
         self,
         points: np.ndarray,
@@ -301,14 +357,16 @@ class RansacClusterDetector:
         det_id: int,
     ) -> dict:
         cpts = points[idx]
-        pos_robot = np.median(cpts, axis=0).astype(np.float32)
+        pos_robot, nav_u, nav_v, anchor_depth = self._cluster_nav_pos(
+            points, us, vs, z_cam, idx,
+        )
         extent = (cpts.max(axis=0) - cpts.min(axis=0)).astype(np.float32)
         pos_world = _robot_to_world(pos_robot, robot_pos, robot_yaw)
         cls, cls_conf = _classify_geometry(extent)
         cu = float(np.median(us[idx]))
         cv = float(np.median(vs[idx]))
         dist_xy = float(np.linalg.norm(pos_robot[:2]))
-        depth_m = float(np.median(z_cam[idx]))
+        depth_m = float(anchor_depth if anchor_depth > 0.05 else np.median(z_cam[idx]))
         yaw_rel = float(np.arctan2(pos_robot[1], pos_robot[0]))
         x1, x2 = int(us[idx].min()), int(us[idx].max())
         y1, y2 = int(vs[idx].min()), int(vs[idx].max())
@@ -333,8 +391,8 @@ class RansacClusterDetector:
             "pos_world": pos_world.tolist(),
             "pos_from_pointcloud": True,
             "nav_point_count": int(len(idx)),
-            "nav_anchor_uv": [cu, float(y2)],
-            "nav_anchor_depth": depth_m,
+            "nav_anchor_uv": [nav_u, nav_v],
+            "nav_anchor_depth": anchor_depth,
             "source": "ransac_cluster",
             "camera": self._cfg["camera_label"],
             "role": self._cfg["role"],
@@ -345,9 +403,16 @@ class RansacClusterDetector:
             "geom_z_extent": float(extent[2]),
         }
         if is_ee:
-            z_top = float(pos_world[2]) + max(0.035, float(extent[2]) * 0.42)
+            top_idx = self._cluster_top_indices(vs, idx)
+            top_pts = points[top_idx]
+            z_top_r = float(np.percentile(top_pts[:, 2], 82))
+            z_top_w = float(pos_world[2]) + max(0.035, float(extent[2]) * 0.38)
+            z_top_w = max(z_top_w, float(_robot_to_world(
+                np.array([pos_robot[0], pos_robot[1], z_top_r], dtype=np.float32),
+                robot_pos, robot_yaw,
+            )[2]))
             grasp_world = pos_world.copy()
-            grasp_world[2] = z_top - GRASP_DEPTH_OFFSET
+            grasp_world[2] = z_top_w - GRASP_DEPTH_OFFSET
             c, s = np.cos(robot_yaw), np.sin(robot_yaw)
             rot_inv = np.array([[c, s, 0.0], [-s, c, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
             grasp_robot = rot_inv @ (grasp_world - robot_pos)
@@ -355,8 +420,8 @@ class RansacClusterDetector:
             det["grasp_pos_world"] = grasp_world.tolist()
             det["grasp_pos_robot"] = grasp_robot.tolist()
             det["grasp_quat_world"] = self._grasp_quat(cls, grasp_world, robot_pos).tolist()
-            det["grasp_anchor_uv"] = [cu, float(y2)]
-            det["grasp_anchor_depth"] = depth_m
+            det["grasp_anchor_uv"] = [nav_u, nav_v]
+            det["grasp_anchor_depth"] = anchor_depth
         return det
 
     def _cluster_passes_filters(self, points: np.ndarray, idx: np.ndarray) -> bool:
