@@ -139,6 +139,7 @@ NAV_LOCK_MISS_MAX_STATIC = 120   # 两步走 EE 主导: 允许更长的 lock coa
 EE_NAV_LOCK_MAX_DEPTH_M = 2.05   # EE 独锁最大深度 (log: 2.36m 偏 1.55m)
 EE_ONLY_HEAD_CONFIRM_MAX = 30    # EE-only 锁无 head 确认则解锁 (~0.6s)
 NAV_RELOCK_MAX_XY_M = 1.25       # 重锁不得离上一 lock_world 超过此距
+NAV_LOCK_WORLD_STICK_M = 0.48    # class_agnostic: 同 id 但超此距视为 tracker 复用 → 拒
 EE_HEAD_SPATIAL_CONFIRM_M = 0.32  # EE↔head 同类确认最大 XY 偏差 (log: 0.46m 误确认地板 phantom)
 TARGET_MATCH_RADIUS = 0.55       # 判定同一导航目标
 HEAD_MIRROR_EE_MIN_M = 0.85
@@ -820,6 +821,8 @@ def _resolve_live_lock_hit(
         for pool in (head_objs, ee_objs):
             by_id = _find_in_pool_by_id(pool, lock_id)
             if by_id is not None:
+                if lock_world is not None and _world_xy_dist(by_id, {"pos_world": lock_world}) > NAV_LOCK_WORLD_STICK_M:
+                    continue
                 if (
                     not CLASS_AGNOSTIC
                     and lock_class
@@ -848,7 +851,11 @@ def _resolve_live_lock_hit(
     if CLASS_AGNOSTIC and lock_world is not None:
         ref = {"pos_world": lock_world}
         combined = list(head_objs) + list(ee_objs)
-        near = [o for o in combined if o.get("pos_world") is not None and _world_xy_dist(o, ref) <= NAV_RELOCK_MAX_XY_M]
+        near = [
+            o for o in combined
+            if o.get("pos_world") is not None
+            and _world_xy_dist(o, ref) <= NAV_LOCK_WORLD_STICK_M
+        ]
         if near:
             return min(near, key=_obj_dist)
     return None
@@ -1662,8 +1669,13 @@ class RgbdPureDualPipeline:
                 self._nav_lock_id, self._nav_lock_class, self._nav_lock_world,
             )
             if live is not None and live.get("pos_world") is not None:
-                new_cls = live.get("class")
                 if (
+                    self._nav_lock_world is not None
+                    and _world_xy_dist(live, {"pos_world": self._nav_lock_world}) > NAV_LOCK_WORLD_STICK_M
+                ):
+                    live = None
+                new_cls = live.get("class") if live is not None else None
+                if live is not None and (
                     not CLASS_AGNOSTIC
                     and self._nav_lock_class
                     and new_cls
@@ -1676,17 +1688,18 @@ class RgbdPureDualPipeline:
                         live = same_cls
                     elif _world_xy_dist(live, {"pos_world": self._nav_lock_world or live["pos_world"]}) > 0.55:
                         live = None
-                self._nav_lock_id = int(live["id"])
-                if not CLASS_AGNOSTIC and live.get("class") and (
-                    self._nav_lock_class is None or live.get("class") == self._nav_lock_class
-                ):
-                    self._nav_lock_class = live.get("class")
-                pw = live.get("pos_world")
-                if pw is not None:
-                    self._nav_lock_world = _smooth_lock_world(self._nav_lock_world, list(pw))
-                self._nav_lock_miss = 0
-                locked = live
-                lock_ref = live
+                if live is not None:
+                    self._nav_lock_id = int(live["id"])
+                    if not CLASS_AGNOSTIC and live.get("class") and (
+                        self._nav_lock_class is None or live.get("class") == self._nav_lock_class
+                    ):
+                        self._nav_lock_class = live.get("class")
+                    pw = live.get("pos_world")
+                    if pw is not None:
+                        self._nav_lock_world = _smooth_lock_world(self._nav_lock_world, list(pw))
+                    self._nav_lock_miss = 0
+                    locked = live
+                    lock_ref = live
 
         if locked is None and self._nav_lock_id is None and self.frame_count >= self._nav_lock_reject_until:
             seed = _acquire_nav_lock(head_objs, ee_objs, head_nav, ee_nav, head_d, ee_d)

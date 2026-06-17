@@ -92,6 +92,8 @@ class AlgSolution:
         self._pregrasp_stall_steps = 0
         self._pregrasp_last_robot_xy: np.ndarray | None = None
         self._nav_heading_error_f: float | None = None
+        self._nav_raw_heading_prev: float | None = None
+        self._nav_heading_jump_damp = 0
         self._nav_turn_sign: int = 0
         self._nav_turn_sign_hold = 0
         self._fuse_lock_key: tuple[Any, Any] | None = None
@@ -1373,7 +1375,15 @@ class AlgSolution:
         target_pos_robot: np.ndarray,
     ) -> tuple[np.ndarray, dict[str, Any]]:
         target_dist = float(np.linalg.norm(target_pos_robot[:2]))
-        heading_error = self._smooth_nav_heading(float(math.atan2(target_pos_robot[1], target_pos_robot[0])))
+        raw_heading = float(math.atan2(target_pos_robot[1], target_pos_robot[0]))
+        if (
+            self.static_two_step
+            and self._nav_raw_heading_prev is not None
+            and abs(raw_heading - self._nav_raw_heading_prev) > 0.50
+        ):
+            self._nav_heading_jump_damp = max(self._nav_heading_jump_damp, 14)
+        self._nav_raw_heading_prev = raw_heading
+        heading_error = self._smooth_nav_heading(raw_heading)
         stop_distance = self._dynamic_stop_distance_for_target(target_nav)
         remaining = max(0.0, target_dist - stop_distance)
         lateral_error = float(target_pos_robot[1])
@@ -1419,6 +1429,11 @@ class AlgSolution:
         if self.static_two_step and cons_dist > self.coarse_approach_dist + 0.08:
             lin_x = max(lin_x, 0.42 * approach_scale)
             phase = "far_approach"
+        if self._nav_heading_jump_damp > 0:
+            self._nav_heading_jump_damp -= 1
+            ang_z = float(np.clip(ang_z * 0.42, -0.28, 0.28))
+            lin_x = min(lin_x, 0.26)
+            phase = "turn_to_target"
 
         stopped = False
         if self.static_two_step:
@@ -2365,28 +2380,41 @@ class AlgSolution:
         pw = self._safe_numpy(target.get("pos_world"), np.zeros(3, dtype=np.float32))
         resolved_id = lock_id if lock_id is not None else target.get("id")
         resolved_class = lock_class or target.get("class")
+        reject_jump_m = self.track_jump_reject_m
         if lock_key != self._fuse_lock_key or self._fuse_pos_world is None:
-            self._fuse_lock_key = lock_key
-            self._fuse_lock_id = resolved_id
-            self._fuse_lock_class = resolved_class
-            self._fuse_pos_world = pw.copy()
-            self._nav_heading_error_f = None
+            if self._fuse_pos_world is not None and self.static_two_step:
+                jump_xy = float(np.linalg.norm(pw[:2] - self._fuse_pos_world[:2]))
+                if jump_xy > reject_jump_m:
+                    pw = self._fuse_pos_world.copy()
+                    lock_key = self._fuse_lock_key
+                    resolved_id = self._fuse_lock_id
+                    resolved_class = self._fuse_lock_class
+                else:
+                    self._fuse_lock_key = lock_key
+                    self._fuse_lock_id = resolved_id
+                    self._fuse_lock_class = resolved_class
+                    self._fuse_pos_world = pw.copy()
+                    self._nav_heading_error_f = None
+            else:
+                self._fuse_lock_key = lock_key
+                self._fuse_lock_id = resolved_id
+                self._fuse_lock_class = resolved_class
+                self._fuse_pos_world = pw.copy()
+                self._nav_heading_error_f = None
         else:
             jump_xy = float(np.linalg.norm(pw[:2] - self._fuse_pos_world[:2]))
-            jump_lim = self.track_jump_reject_m
-            if float(np.linalg.norm(pw[:2])) > 2.0:
-                jump_lim = min(jump_lim, 0.38)
-            live_closer = float(np.linalg.norm(pw[:2])) + 0.05 < float(
-                np.linalg.norm(self._fuse_pos_world[:2])
-            )
+            jump_lim = reject_jump_m
+            pr_new = self._world_to_robot_frame(pw, robot_pos_world, robot_yaw)
+            pr_fuse = self._world_to_robot_frame(self._fuse_pos_world, robot_pos_world, robot_yaw)
+            live_closer = float(np.linalg.norm(pr_new[:2])) + 0.08 < float(np.linalg.norm(pr_fuse[:2]))
             if jump_xy > jump_lim:
-                if live_closer and bool(target.get("visible", True)):
-                    self._fuse_pos_world = pw.copy()
+                if self.static_two_step or not (live_closer and bool(target.get("visible", True))):
                     pw = self._fuse_pos_world.copy()
                 else:
+                    self._fuse_pos_world = pw.copy()
                     pw = self._fuse_pos_world.copy()
             else:
-                alpha = 0.62
+                alpha = 0.42 if self.static_two_step else 0.62
                 self._fuse_pos_world = (1.0 - alpha) * self._fuse_pos_world + alpha * pw
                 pw = self._fuse_pos_world.copy()
         self._fuse_pos_world = pw.copy()
