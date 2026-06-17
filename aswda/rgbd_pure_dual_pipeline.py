@@ -882,12 +882,39 @@ def _head_confirms_lock(
     return _find_in_pool(head_objs, lock_id, lock_class, None) is not None
 
 
+def _ee_nav_lock_quality_ok(seed: dict) -> bool:
+    """Reject thin edge / sparse EE nav blobs that cause premature crouch."""
+    relaxed = bool(seed.get("nav_relaxed"))
+    npts = int(seed.get("nav_point_count") or 0)
+    min_pts = 8 if relaxed else 6
+    if npts < min_pts:
+        return False
+    bbox = seed.get("bbox")
+    if bbox and len(bbox) == 4:
+        bw = float(bbox[2]) - float(bbox[0]) + 1.0
+        bh = float(bbox[3]) - float(bbox[1]) + 1.0
+        area = bw * bh
+        min_side = 7.0 if relaxed else 6.0
+        min_area = 220.0 if relaxed else 120.0
+        if min(bw, bh) < min_side or area < min_area:
+            return False
+        asp = max(bw / max(bh, 1.0), bh / max(bw, 1.0))
+        max_asp = 4.0 if relaxed else 5.0
+        if asp > max_asp:
+            return False
+    if _is_ee_sourced(seed) and not bool(seed.get("world_reliable", True)):
+        return False
+    return True
+
+
 def _can_acquire_nav_lock(seed: Optional[dict], head_objs: List[dict]) -> bool:
-    """首锁: 有 3D 位置即可，不再要求 blob/RANSAC/类名/EE 互证."""
+    """首锁: EE 需足够 blob/深度点; head 仍允许较松."""
     if seed is None:
         return False
     if RGBD_SIMPLE or CLASS_AGNOSTIC:
         if seed.get("pos_world") is not None or seed.get("pos_robot") is not None:
+            if _is_ee_sourced(seed) or str(seed.get("source") or "").startswith("ee_"):
+                return _ee_nav_lock_quality_ok(seed)
             return True
         return bool(head_objs)
     if not head_objs:
@@ -1581,6 +1608,8 @@ class RgbdPureDualPipeline:
         if not RGBD_SIMPLE:
             head_objs = [self._pos_gate.apply(o, "head", rp, ry) for o in head_objs]
             ee_objs = [self._pos_gate.apply(o, "ee", rp, ry) for o in ee_objs]
+        elif STATIC_TWO_STEP and ee_objs:
+            ee_objs = self._temporal.apply(ee_objs, "ee", rp, ry, motion)
 
         ee_objs = filter_plausible_objects(ee_objs, "ee")
         ee_objs = _filter_phantom_ee(ee_objs, head_objs)
@@ -2010,13 +2039,37 @@ class RgbdPureDualPipeline:
             ee_objs_raw = filter_plausible_objects(ee_objs_raw, "ee")
             ee_objs_raw = [apply_class_agnostic(o) for o in ee_objs_raw]
 
-        if not ee_objs_raw and e_depth is not None:
+        ransac_raw: List[dict] = []
+        if e_depth is not None:
             raw = self._ransac.detect(e_depth, rp, ry, nav_hint=nav_hint)
-            ee_objs_raw = [_finalize_ee(o, rp, ry, arm_q) for o in (raw or [])]
-            ee_objs_raw = filter_plausible_objects(ee_objs_raw, "ee")
-            ee_objs_raw = [apply_class_agnostic(o) for o in ee_objs_raw]
+            ransac_raw = [_finalize_ee(o, rp, ry, arm_q) for o in (raw or [])]
+            ransac_raw = filter_plausible_objects(ransac_raw, "ee")
+            ransac_raw = [apply_class_agnostic(o) for o in ransac_raw]
+
+        if ransac_raw:
+            if not ee_objs_raw:
+                ee_objs_raw = ransac_raw
+            else:
+                merged = list(ee_objs_raw)
+                for ro in ransac_raw:
+                    dup = False
+                    rw = ro.get("pos_world")
+                    if rw is None:
+                        continue
+                    for eo in ee_objs_raw:
+                        ew = eo.get("pos_world")
+                        if ew is not None and _world_xy_dist(ro, {"pos_world": ew}) < 0.22:
+                            dup = True
+                            break
+                    if not dup:
+                        ro["id"] = len(merged)
+                        merged.append(ro)
+                ee_objs_raw = merged
             if e_depth is not None and not ee_stats:
                 ee_stats = depth_stats(e_depth)
+
+        if not ee_objs_raw and e_depth is not None and not ee_stats:
+            ee_stats = depth_stats(e_depth)
 
         grasp_tgt = ee_objs_raw[0] if ee_objs_raw else None
         if grasp_tgt is not None and nav_hint is not None:

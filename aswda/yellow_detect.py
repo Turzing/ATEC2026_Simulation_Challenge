@@ -1,12 +1,13 @@
 """
-Task B 黄物检测 v16 — 两步感知:
-  1) ee:   站立远距黄物 3D 导航 (head 远距看不见)
+Task B 黄物检测 v22 — 两步感知 + 远距召回增强:
+  1) ee:   站立远距黄物 3D 导航 (strict + relaxed HSV 双通道)
   2) ee:   趴下后近距黄物 + 顶边抓取点
   head 仅作近距补充，不作远距主导
 """
 
 from __future__ import annotations
 
+import os
 from typing import List, Optional, Tuple
 
 import cv2
@@ -26,15 +27,23 @@ from config import (
 from rgbd_utils import classify_taskb_simple, is_head_sky_phantom, pixel_depth_to_cam
 
 HUE_LO, HUE_HI = 6, 58
+HUE_LO_RELAX, HUE_HI_RELAX = 4, 62
 SAT_MIN, VAL_MIN = 4, 20
+SAT_MIN_RELAX, VAL_MIN_RELAX = 2, 14
 MIN_BLOB_PX_HEAD = 10
 MIN_BLOB_PX_HEAD_FAR = 6
-MIN_BLOB_PX_EE = 24
+MIN_BLOB_PX_EE = max(12, int(os.getenv("ATEC_TASKB_MIN_BLOB_PX_EE", "22")))
 MIN_SIDE = 3
 DEPTH_MIN, DEPTH_MAX = 0.08, 9.5
 EE_DEPTH_MIN, EE_DEPTH_MAX = 0.12, 1.65
 EE_NAV_DEPTH_MIN, EE_NAV_DEPTH_MAX = 0.85, 5.5
-MIN_BLOB_PX_EE_NAV = 5
+MIN_BLOB_PX_EE_NAV = max(10, int(os.getenv("ATEC_TASKB_MIN_BLOB_PX_EE_NAV", "14")))
+MIN_BLOB_PX_EE_NAV_RELAX = max(8, int(os.getenv("ATEC_TASKB_MIN_BLOB_PX_EE_NAV_RELAX", "10")))
+EE_NAV_MIN_SIDE = 5
+EE_NAV_MIN_NAV_PTS = max(4, int(os.getenv("ATEC_TASKB_EE_NAV_MIN_PTS", "5")))
+EE_NAV_MIN_NAV_PTS_RELAX = 8
+EE_NAV_MAX_ASPECT = 4.5
+EE_NAV_MIN_BBOX_AREA = max(80, int(os.getenv("ATEC_TASKB_EE_NAV_MIN_AREA", "120")))
 EE_NAV_GRIPPER_V0 = 0.82
 MAX_BLOB_SIDE_HEAD = 240
 MAX_BLOB_SIDE_EE = 320
@@ -94,6 +103,44 @@ def _yellow_mask(
             yellow = yellow | rel
     valid = (depth > d_near) & (depth < d_far) & np.isfinite(depth)
     vk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
+    valid_near = cv2.dilate(valid.astype(np.uint8), vk, iterations=2).astype(bool)
+    mask = (yellow & valid_near).astype(np.uint8)
+    k = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    return mask
+
+
+def _yellow_mask_relaxed(
+    rgb: np.ndarray,
+    depth: np.ndarray,
+    roi: np.ndarray,
+    *,
+    d_near: float = DEPTH_MIN,
+    d_far: float = DEPTH_MAX,
+) -> np.ndarray:
+    """远距/侧视低饱和黄物 — 仅作第二通道，锁目标时仍走 quality gate."""
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    hue, sat, val = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+    yellow = (
+        roi
+        & (hue >= HUE_LO_RELAX) & (hue <= HUE_HI_RELAX)
+        & (sat >= SAT_MIN_RELAX) & (val >= VAL_MIN_RELAX)
+    )
+    roi_vals = roi & np.isfinite(val) & (val > VAL_MIN_RELAX)
+    if int(np.sum(roi_vals)) > 80:
+        gs = float(np.percentile(sat[roi_vals], 32))
+        gv = float(np.percentile(val[roi_vals], 42))
+        rel = (
+            roi
+            & (hue >= HUE_LO_RELAX) & (hue <= HUE_HI_RELAX)
+            & (sat >= max(SAT_MIN_RELAX, gs * 0.55))
+            & (val >= max(VAL_MIN_RELAX, gv * 0.45))
+            & (val <= 252)
+        )
+        yellow = yellow | rel
+    valid = (depth > d_near) & (depth < d_far) & np.isfinite(depth)
+    vk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
     valid_near = cv2.dilate(valid.astype(np.uint8), vk, iterations=2).astype(bool)
     mask = (yellow & valid_near).astype(np.uint8)
     k = np.ones((5, 5), np.uint8)
@@ -381,14 +428,24 @@ def _ee_blob_to_nav_det(
     ys: np.ndarray, xs: np.ndarray, depth: np.ndarray, rgb: np.ndarray,
     robot_pos: np.ndarray, robot_yaw: float,
     cam_pos: np.ndarray, img_h: int, img_w: int,
+    *, min_px: int = MIN_BLOB_PX_EE_NAV,
+    min_npts: int = EE_NAV_MIN_NAV_PTS,
+    relaxed: bool = False,
 ) -> Optional[dict]:
     """EE 站立远距: 黄物 3D 导航点 (无 grasp)."""
-    if len(ys) < MIN_BLOB_PX_EE_NAV:
+    if len(ys) < min_px:
         return None
     x1, x2 = int(xs.min()), int(xs.max())
     y1, y2 = int(ys.min()), int(ys.max())
     bw, bh = x2 - x1 + 1, y2 - y1 + 1
-    if min(bw, bh) < 3 or max(bw, bh) > MAX_BLOB_SIDE_EE_NAV:
+    area = bw * bh
+    if area < EE_NAV_MIN_BBOX_AREA:
+        return None
+    if min(bw, bh) < EE_NAV_MIN_SIDE or max(bw, bh) > MAX_BLOB_SIDE_EE_NAV:
+        return None
+    aspect = float(bw) / float(max(bh, 1))
+    max_aspect = EE_NAV_MAX_ASPECT if not relaxed else EE_NAV_MAX_ASPECT + 1.2
+    if aspect > max_aspect or aspect < (1.0 / max_aspect):
         return None
     if y2 < img_h * 0.12:
         return None
@@ -407,7 +464,8 @@ def _ee_blob_to_nav_det(
     pos_r, _, npts = _points_from_blob(
         ys, xs, depth, EE_CAM, cam_pos, EE_CAM_ROT_MATRIX, bottom_frac=0.72,
     )
-    if pos_r is None:
+    need_pts = min_npts if not relaxed else EE_NAV_MIN_NAV_PTS_RELAX
+    if pos_r is None or npts < need_pts:
         return None
     pz = float(pos_r[2])
     if float(pos_r[0]) < -0.35 or pz < EE_NAV_Z_LO or pz > EE_NAV_Z_HI:
@@ -415,7 +473,6 @@ def _ee_blob_to_nav_det(
 
     pos_w = _robot_to_world(pos_r, robot_pos, robot_yaw)
     cx, cy = float(np.median(xs)), float(np.median(ys))
-    aspect = float(bw) / float(max(bh, 1))
     cls, cls_conf = classify_taskb_simple(hm, sm, vm, aspect, 0.12)
 
     return {
@@ -445,7 +502,35 @@ def _ee_blob_to_nav_det(
         "pipeline_tier": 1,
         "class_agnostic": True,
         "world_reliable": depth_m < 4.8,
+        "nav_relaxed": bool(relaxed),
     }
+
+
+def _detect_ee_nav_from_mask(
+    mask: np.ndarray,
+    depth: np.ndarray,
+    rgb: np.ndarray,
+    rp: np.ndarray,
+    ry: float,
+    cp: np.ndarray,
+    h: int,
+    w: int,
+    *,
+    min_px: int,
+    min_npts: int,
+    relaxed: bool,
+) -> List[dict]:
+    labeled, n = ndimage.label(mask > 0)
+    dets: List[dict] = []
+    for cid in range(1, n + 1):
+        ys, xs = np.where(labeled == cid)
+        det = _ee_blob_to_nav_det(
+            ys, xs, depth, rgb, rp, ry, cp, h, w,
+            min_px=min_px, min_npts=min_npts, relaxed=relaxed,
+        )
+        if det is not None:
+            dets.append(det)
+    return dets
 
 
 def detect_ee_yellow_nav(
@@ -462,15 +547,20 @@ def detect_ee_yellow_nav(
     h, w = depth.shape[:2]
     roi = np.zeros((h, w), dtype=bool)
     roi[int(h * 0.06) : int(h * EE_NAV_GRIPPER_V0), int(w * 0.02) : int(w * 0.98)] = True
-    mask = _yellow_mask(rgb, depth, roi, d_near=EE_NAV_DEPTH_MIN, d_far=EE_NAV_DEPTH_MAX)
-    labeled, n = ndimage.label(mask > 0)
-    dets: List[dict] = []
-    for cid in range(1, n + 1):
-        ys, xs = np.where(labeled == cid)
-        det = _ee_blob_to_nav_det(ys, xs, depth, rgb, rp, ry, cp, h, w)
-        if det is not None:
-            dets.append(det)
-    dets = _dedupe_dets(dets)
+    mask_strict = _yellow_mask(rgb, depth, roi, d_near=EE_NAV_DEPTH_MIN, d_far=EE_NAV_DEPTH_MAX)
+    dets = _detect_ee_nav_from_mask(
+        mask_strict, depth, rgb, rp, ry, cp, h, w,
+        min_px=MIN_BLOB_PX_EE_NAV, min_npts=EE_NAV_MIN_NAV_PTS, relaxed=False,
+    )
+    if len(dets) < 2:
+        mask_relax = _yellow_mask_relaxed(
+            rgb, depth, roi, d_near=EE_NAV_DEPTH_MIN, d_far=EE_NAV_DEPTH_MAX,
+        )
+        dets_relax = _detect_ee_nav_from_mask(
+            mask_relax, depth, rgb, rp, ry, cp, h, w,
+            min_px=MIN_BLOB_PX_EE_NAV_RELAX, min_npts=EE_NAV_MIN_NAV_PTS_RELAX, relaxed=True,
+        )
+        dets = _dedupe_dets(dets + dets_relax)
     dets.sort(key=lambda d: float(d.get("depth_m") or 99.0))
     return dets
 
@@ -497,6 +587,17 @@ def detect_ee_yellow(
         det = _ee_blob_to_det(ys, xs, depth, rgb, rp, ry, cp, h, w)
         if det is not None:
             dets.append(det)
+    if not dets:
+        mask_relax = _yellow_mask_relaxed(rgb, depth, roi, d_near=EE_DEPTH_MIN, d_far=EE_DEPTH_MAX)
+        labeled, n = ndimage.label(mask_relax > 0)
+        for cid in range(1, n + 1):
+            ys, xs = np.where(labeled == cid)
+            if len(ys) < max(12, MIN_BLOB_PX_EE - 6):
+                continue
+            det = _ee_blob_to_det(ys, xs, depth, rgb, rp, ry, cp, h, w)
+            if det is not None:
+                det["nav_relaxed"] = True
+                dets.append(det)
     dets = _dedupe_dets(dets)
     dets.sort(key=lambda d: float(d.get("depth_m") or 99.0))
     return dets

@@ -250,9 +250,17 @@ class AlgSolution:
         self.coarse_approach_dist = float(os.getenv("ATEC_TASKB_COARSE_APPROACH_DIST", "1.32"))
         self.static_perceive_settle_steps = max(3, int(os.getenv("ATEC_TASKB_STATIC_PERCEIVE_SETTLE", "8")))
         self.static_perceive_max_steps = max(10, int(os.getenv("ATEC_TASKB_STATIC_PERCEIVE_MAX_STEPS", "30")))
+        self.crouch_retry_cooldown_steps = max(0, int(os.getenv("ATEC_TASKB_CROUCH_RETRY_COOLDOWN", "120")))
+        self.static_blind_abort_steps = max(4, int(os.getenv("ATEC_TASKB_STATIC_BLIND_ABORT", "10")))
+        self.approach_live_ee_frames = max(1, int(os.getenv("ATEC_TASKB_APPROACH_LIVE_EE_FRAMES", "4")))
+        self.approach_crouch_dist_slack = float(os.getenv("ATEC_TASKB_APPROACH_CROUCH_SLACK", "0.08"))
+        self.approach_min_nav_points = max(1, int(os.getenv("ATEC_TASKB_APPROACH_MIN_NAV_PTS", "5")))
         self._static_nav_hint: dict[str, Any] | None = None
         self._static_perceive_steps = 0
         self._static_grasp_samples: list[dict[str, Any]] = []
+        self._crouch_cooldown_remaining = 0
+        self._live_ee_nav_streak = 0
+        self._static_blind_miss_streak = 0
         self.static_grasp_fuse_frames = max(2, int(os.getenv("ATEC_TASKB_STATIC_GRASP_FUSE", "3")))
         self._log(
             f"[TaskB-PERCEPTION] build={PERCEPTION_RANSAC_BUILD} "
@@ -3407,6 +3415,52 @@ class AlgSolution:
 
         return action_env
 
+    def _static_crouch_approach_ready(
+        self,
+        target_nav: dict[str, Any],
+        perception_output: dict[str, Any] | None,
+        nav_info: dict[str, Any],
+        cons_dist: float,
+    ) -> bool:
+        """Only crouch when close, stopped, live EE lock — not coast / edge-only."""
+        if self._crouch_cooldown_remaining > 0:
+            return False
+        if perception_output is None:
+            return False
+        if bool(target_nav.get("nav_coast")) or not bool(target_nav.get("visible", True)):
+            self._live_ee_nav_streak = 0
+            return False
+        lock_id = perception_output.get("nav_lock_id")
+        if lock_id is None:
+            self._live_ee_nav_streak = 0
+            return False
+        ee_live = len(perception_output.get("ee_objects") or []) > 0
+        if ee_live:
+            self._live_ee_nav_streak += 1
+        else:
+            self._live_ee_nav_streak = 0
+        if self._live_ee_nav_streak < self.approach_live_ee_frames:
+            return False
+        n_pts = int(target_nav.get("nav_point_count") or 0)
+        if n_pts < self.approach_min_nav_points:
+            return False
+        bbox = target_nav.get("bbox")
+        if bbox and len(bbox) == 4:
+            bw = float(bbox[2]) - float(bbox[0]) + 1.0
+            bh = float(bbox[3]) - float(bbox[1]) + 1.0
+            if min(bw, bh) < 6.0:
+                return False
+            asp = max(bw / max(bh, 1.0), bh / max(bw, 1.0))
+            if asp > 5.0:
+                return False
+        close_enough = cons_dist <= self.coarse_approach_dist + self.approach_crouch_dist_slack
+        if not close_enough:
+            return False
+        heading_ok = abs(float(nav_info.get("heading_error") or 999.0)) <= self.grasp_heading_tolerance
+        nav_phase = str(nav_info.get("phase", ""))
+        stopped_ok = bool(nav_info.get("stopped")) and nav_phase in ("refine_hold", "ready_to_grasp")
+        return heading_ok and stopped_ok
+
     def _start_crouch_for_static_approach(
         self,
         target_nav: dict[str, Any],
@@ -3435,6 +3489,8 @@ class AlgSolution:
         self._pending_grasp_target = None
         self._static_perceive_steps = 0
         self._static_grasp_samples = []
+        self._static_blind_miss_streak = 0
+        self._live_ee_nav_streak = 0
         self._task_state = "CROUCHING"
         stage_d = self._grasp_stage_dist(target_nav)
         self._log(
@@ -3563,8 +3619,14 @@ class AlgSolution:
         else:
             self._task_state = "APPROACH_OBJECT"
             self._pending_grasp_target = None
-            self._clear_locked_target()
-            self._log("[TaskB-GRASP] stand up complete without success, return to APPROACH_OBJECT")
+            self._clear_fuse_nav_lock("static grasp failed, re-approach")
+            self._crouch_cooldown_remaining = self.crouch_retry_cooldown_steps
+            self._live_ee_nav_streak = 0
+            self._static_blind_miss_streak = 0
+            self._log(
+                "[TaskB-GRASP] stand up complete without success, return to APPROACH_OBJECT "
+                f"(crouch_cooldown={self._crouch_cooldown_remaining})"
+            )
         self._static_nav_hint = None
 
     def predicts(self, obs, current_score):
@@ -3582,6 +3644,8 @@ class AlgSolution:
 
     def _predicts_impl(self, obs):
         self._step_count += 1
+        if self._crouch_cooldown_remaining > 0:
+            self._crouch_cooldown_remaining -= 1
         local_nav = self._update_local_odometry(obs)
         perception_output, robot_pos_world, robot_yaw, pose_source = self._get_perception_output(obs, local_nav)
         self._last_perception_output = perception_output
@@ -3751,6 +3815,9 @@ class AlgSolution:
                         robot_yaw,
                     ) or grasp_tgt
                     self._static_grasp_samples.append(dict(grasp_tgt))
+                    self._static_blind_miss_streak = 0
+                else:
+                    self._static_blind_miss_streak += 1
                 need = self.static_grasp_fuse_frames
                 fused = None
                 if len(self._static_grasp_samples) >= need:
@@ -3786,6 +3853,19 @@ class AlgSolution:
                             pass
                         self._reset_sit_down_tracking()
                         self._task_state = "STAND_UP"
+                elif self._static_blind_miss_streak >= self.static_blind_abort_steps:
+                    self._log(
+                        f"[TaskB-STATIC] blind {self._static_blind_miss_streak} frames "
+                        f"(ee_n=0), stand up early."
+                    )
+                    self._pending_grasp_status = "failed"
+                    try:
+                        self._leg_posture_controller.start_stand_up(robot)
+                    except Exception:
+                        pass
+                    self._reset_sit_down_tracking()
+                    self._task_state = "STAND_UP"
+                    self._static_nav_hint = None
                 elif self._static_perceive_steps >= self.static_perceive_max_steps:
                     self._log(
                         f"[TaskB-STATIC] RANSAC timeout after {self._static_perceive_steps} steps, stand up."
@@ -3942,35 +4022,26 @@ class AlgSolution:
                     )
                 perception_phase = None if perception_output is None else str(perception_output.get("phase", "approach"))
                 cons_dist = self._grasp_stage_dist(target_nav, robot_pos_world)
-                dist_ok = cons_dist <= self.coarse_approach_dist + 0.18 if self.static_two_step else self._grasp_range_ok(
-                    target_nav, robot_pos_world, cons_dist,
-                )
-                heading_ok = abs(float(nav_info.get("heading_error") or 999.0)) <= self.grasp_heading_tolerance * 1.35
-                lock_id = perception_output.get("nav_lock_id") if isinstance(perception_output, dict) else None
                 if self.static_two_step:
                     nav_phase = str(nav_info.get("phase", ""))
-                    close_enough = cons_dist <= self.coarse_approach_dist + 0.18
-                    approach_ready = (
-                        target_nav is not None
-                        and (lock_id is not None or target_nav.get("nav_coast"))
-                        and dist_ok
-                        and heading_ok
-                        and close_enough
-                        and (
-                            bool(nav_info.get("stopped"))
-                            or nav_phase in ("refine_hold", "ready_to_grasp", "near_refine")
-                        )
+                    approach_ready = self._static_crouch_approach_ready(
+                        target_nav, perception_output, nav_info, cons_dist,
                     )
                     if approach_ready:
                         base_cmd = np.zeros(3, dtype=np.float32)
                         nav_info["phase"] = "start_static_crouch"
                         nav_info["stopped"] = True
+                        lock_id = perception_output.get("nav_lock_id") if isinstance(perception_output, dict) else None
                         self._log(
                             "[TaskB-STATIC] coarse nav done → crouch "
-                            f"dist={cons_dist:.2f}m phase={nav_phase} lock={lock_id}"
+                            f"dist={cons_dist:.2f}m phase={nav_phase} lock={lock_id} "
+                            f"ee_streak={self._live_ee_nav_streak}"
                         )
                         self._start_crouch_for_static_approach(target_nav, perception_output)
                 else:
+                    dist_ok = self._grasp_range_ok(target_nav, robot_pos_world, cons_dist)
+                    heading_ok = abs(float(nav_info.get("heading_error") or 999.0)) <= self.grasp_heading_tolerance * 1.35
+                    lock_id = perception_output.get("nav_lock_id") if isinstance(perception_output, dict) else None
                     matched_grasp_target = self._select_grasp_target(
                         target_nav,
                         target_grasp,

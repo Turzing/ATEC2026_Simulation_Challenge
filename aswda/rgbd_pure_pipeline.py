@@ -1676,7 +1676,19 @@ class RgbdPureCamera:
                     layers = detect_ee_yellow_nav(rgb, depth, rp, ry, cam_pos)
                 else:
                     layers = detect_ee_yellow(rgb, depth, rp, ry, cam_pos)
-                if not layers:
+                ransac_supp = os.environ.get("ATEC_TASKB_EE_RANSAC_NAV_SUPP", "1") != "0"
+                need_ransac = (not layers) or (
+                    ransac_supp
+                    and layers
+                    and float(layers[0].get("depth_m") or 99.0) > 1.65
+                )
+                if need_ransac:
+                    rlayers = self._depth_cluster.detect(rgb, depth, rp, ry) or []
+                    if layers:
+                        layers = self._merge_dets(list(layers) + list(rlayers))
+                    else:
+                        layers = rlayers
+                elif not layers:
                     layers = self._depth_cluster.detect(rgb, depth, rp, ry) or []
                 dets = self._merge_dets(layers)
             dm = self._depth_cluster.get_debug_mask()
