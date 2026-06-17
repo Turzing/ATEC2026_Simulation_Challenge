@@ -300,7 +300,8 @@ def is_blob_nav_det(obj: dict) -> bool:
     """Tier-1: HSV 黄/白盒 + relief blob (主导 class 与 2D 区域)."""
     if obj.get("head_far_fallback") or obj.get("head_depth_fallback") or obj.get("head_neutral_fallback"):
         return True
-    return str(obj.get("source") or "") == "rgbd_nav_head"
+    src = str(obj.get("source") or "")
+    return src in ("rgbd_nav_head", "yellow_detect")
 
 
 def is_ransac_supplement(obj: dict, *, max_px: int = RANSAC_SUPPLEMENT_MAX_PX) -> bool:
@@ -311,7 +312,9 @@ def is_ransac_supplement(obj: dict, *, max_px: int = RANSAC_SUPPLEMENT_MAX_PX) -
 
 
 def blob_nav_pool(objects: list) -> list:
-    """有 blob 时只用 blob; 否则保留小 RANSAC 补充."""
+    """导航候选池 — 类无关模式下不过滤来源."""
+    if CLASS_AGNOSTIC or RGBD_SIMPLE:
+        return list(objects)
     blobs = [o for o in objects if is_blob_nav_det(o)]
     if blobs:
         return blobs
@@ -430,10 +433,22 @@ def _is_head_fallback_det(obj: dict) -> bool:
 
 
 def is_valid_taskb_ground_det(obj: dict, *, img_h: int = IMG_H) -> bool:
-    """
-    Task B 平地垃圾: 用 robot 系 3D 高度判断是否在地面, 不用 bbox 上下位置.
-    head 俯拍时远距物体在画面上方 (小 v), 不能用 is_sky_phantom_bbox 误杀.
-    """
+    """Task B 地面物体 — 类无关/简化模式下仅做基本 3D 范围检查."""
+    if CLASS_AGNOSTIC or RGBD_SIMPLE:
+        pr = obj.get("pos_robot")
+        if pr is None:
+            dm = obj.get("depth_m") or obj.get("nav_depth_m")
+            return dm is not None and 0.08 < float(dm) < 9.5
+        try:
+            px, py, pz = float(pr[0]), float(pr[1]), float(pr[2])
+        except (TypeError, ValueError, IndexError):
+            return False
+        if px < 0.04:
+            return False
+        if pz < -1.15 or pz > 0.70:
+            return False
+        return True
+
     pr = obj.get("pos_robot")
     if pr is None:
         return False
@@ -477,35 +492,33 @@ def is_head_ransac_phantom(obj: dict, *, img_h: int = IMG_H, img_w: int = IMG_W)
     return not is_valid_taskb_ground_det(obj, img_h=img_h)
 
 
-def _filter_plausible_simple(objects: list, camera: str) -> list:
-    """简化后滤: 杀 sky/地板 phantom (含 RANSAC)."""
+def _filter_minimal(objects: list, camera: str) -> list:
+    """最小过滤: 只杀明显无效坐标，不做 phantom/天空/边缘限制."""
     out = []
     for o in objects:
         pr = o.get("pos_robot")
         if pr is None:
+            dm = o.get("depth_m") or o.get("nav_depth_m")
+            if dm is not None and 0.06 < float(dm) < 9.5:
+                out.append(o)
             continue
         try:
             px, py, pz = float(pr[0]), float(pr[1]), float(pr[2])
         except (TypeError, ValueError, IndexError):
             continue
-        if pz < -0.95 or pz > 0.45:
+        if px < 0.03:
             continue
-        if float(np.hypot(px, py)) < 0.08 and abs(py) < 0.14:
+        if pz < -1.20 or pz > 0.75:
             continue
-        if float(px) < 0.12:
+        if float(np.hypot(px, py)) < 0.05 and abs(py) < 0.10:
             continue
-        if camera == "head":
-            if is_upper_corner_phantom(o):
-                continue
-            if not is_valid_taskb_ground_det(o):
-                continue
-            if is_head_floor_phantom(o) and int(o.get("cluster_pixels") or 0) > 2200:
-                continue
-        if camera == "ee":
-            if is_upper_corner_phantom(o) or is_ee_sky_blob(o) or is_ee_floor_phantom(o):
-                continue
         out.append(o)
     return out
+
+
+def _filter_plausible_simple(objects: list, camera: str) -> list:
+    """简化模式: 使用最小过滤，废弃旧 phantom 链."""
+    return _filter_minimal(objects, camera)
 
 
 def filter_plausible_objects(

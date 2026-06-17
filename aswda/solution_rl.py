@@ -254,8 +254,8 @@ class AlgSolution:
         self.static_grasp_fuse_frames = max(2, int(os.getenv("ATEC_TASKB_STATIC_GRASP_FUSE", "3")))
         self._log(
             f"[TaskB-PERCEPTION] build={PERCEPTION_RANSAC_BUILD} "
-            f"pipeline=blob_gt_coast "
-            f"(HSV-blob→GT-3D→ransac≤72→lock-coast→EE-fuse×{self.static_grasp_fuse_frames}) "
+            f"pipeline=yellow_clean "
+            f"(HSV-yellow→3D→lock→EE-grasp×{self.static_grasp_fuse_frames}) "
             f"module={DEPTH_RANSAC_MODULE_PATH} repo={REPO_ROOT} "
             f"static_two_step={self.static_two_step} "
             f"class_agnostic={int(self.class_agnostic)} "
@@ -1212,9 +1212,14 @@ class AlgSolution:
                 f"lock={perception_output.get('nav_lock_id')}:{perception_output.get('nav_lock_class')} "
                 f"build={build} pose_source={pose_source}"
             )
-            if "v11" not in str(build) and "yellow-nav" not in str(build) and "v10" not in str(build):
+            if "v13" not in str(build) and "yellow-clean" not in str(build):
                 self._log(
-                    f"[PERC-WARN] 感知版本过旧 build={build} — 请同步 taskb_perception/ (期望 v11 class-agnostic yellow-nav)"
+                    f"[PERC-WARN] 感知版本过旧 build={build} — 请同步 taskb_perception/ (期望 v13 yellow_clean)"
+                )
+            elif head_n == 0 and cloud > 5000 and int(hr.get("obj_pts") or 0) == 0:
+                self._log(
+                    "[PERC-WARN] 摄像头正常(cloud>0)但 head=0 — "
+                    "黄物 HSV/depth 未对齐; 需 v12+ (RGB黄+depth邻域补洞), 非相机硬件故障"
                 )
             elif head_n == 0 and int(hr.get("clusters") or 0) > 0:
                 self._log(
@@ -2882,6 +2887,8 @@ class AlgSolution:
         target: dict[str, Any] | None,
         robot_pos_world: np.ndarray,
     ) -> tuple[bool, str]:
+        if self.class_agnostic:
+            return False, ""
         if not isinstance(target, dict):
             return False, ""
         cons_dist = self._conservative_target_dist(target, robot_pos_world)

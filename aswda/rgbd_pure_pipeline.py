@@ -66,8 +66,8 @@ CAMERA_CFG = {
         "cam": HEAD_CAM,
         "pos": HEAD_CAM_POS_ROBOT,
         "rot": HEAD_CAM_ROT_MATRIX,
-        "roi_v_min": 0.08,
-        "roi_v_max": 0.78,
+        "roi_v_min": 0.02,
+        "roi_v_max": 0.96,
         "roi_v_max_near": 0.96,
         "roi_u_margin": 0.04,
         "bottom_strip_v0": 0.66,
@@ -1199,7 +1199,7 @@ class RgbdPureCamera:
         relief: Optional[np.ndarray] = None,
         rgb: Optional[np.ndarray] = None,
     ) -> Optional[dict]:
-        if self._is_shadow_shape(ys, xs, val, sat, h, w, relief):
+        if self._is_shadow_shape(ys, xs, val, sat, h, w, relief) and not (self._simple_mode and self.camera_name == "head"):
             return None
         ys, xs = self._refine_blob(ys, xs, depth, val, h)
         if len(ys) < 5:
@@ -1233,8 +1233,9 @@ class RgbdPureCamera:
                 return None
         d_vals = depth[ys, xs]
         d_vals = d_vals[(d_vals > self._depth_min()) & (d_vals < DEPTH_MAX)]
-        if float(np.std(d_vals)) > self._cfg.get("max_depth_std", MAX_BLOB_DEPTH_STD):
-            return None
+        if not (simple and is_head):
+            if float(np.std(d_vals)) > self._cfg.get("max_depth_std", MAX_BLOB_DEPTH_STD):
+                return None
         vm = float(np.mean(val[ys, xs])) if val is not None else 128.0
         sm = float(np.mean(sat[ys, xs])) if sat is not None else 64.0
         hm = float(np.mean(hue[ys, xs])) if hue is not None else 0.0
@@ -1324,7 +1325,7 @@ class RgbdPureCamera:
                 if pos_r is None:
                     return None
                 nav_point_count = int(len(ys))
-            if float(pos_r[2]) < -0.82 or float(pos_r[2]) > 0.32:
+            if float(pos_r[2]) < (-1.05 if simple else -0.82) or float(pos_r[2]) > (0.55 if simple else 0.32):
                 return None
             if not simple and depth_m < 0.85 and sm < 58 and cy > h * 0.30 and abs(cx - w * 0.5) < w * 0.34:
                 return None
@@ -1487,30 +1488,50 @@ class RgbdPureCamera:
         strip = self._bottom_strip_roi(h, w)
         hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
         hue, sat, val = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
-        mask = (
-            strip & valid
-            & (hue >= HEAD_HUE_LO) & (hue <= HEAD_HUE_HI)
-            & (sat >= 32) & (val >= 52)
-        ).astype(np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+        mask = self._mask_yellow_with_depth(
+            rgb, depth, strip & valid, d_near=0.28, d_far=2.8, dilate_k=15,
+        )
         self._debug["bottom_strip"] = mask * 255
-        return self._dets_from_mask(mask, rgb, depth, robot_pos, robot_yaw)
+        dets = self._dets_from_mask(mask, rgb, depth, robot_pos, robot_yaw)
+        for d in dets or []:
+            d["head_far_fallback"] = True
+            d["pipeline_tier"] = 1
+            d["gt_correctable"] = True
+        return dets
+
+    def _mask_yellow_with_depth(
+        self,
+        rgb: np.ndarray,
+        depth: np.ndarray,
+        roi: np.ndarray,
+        *,
+        d_near: float = 0.40,
+        d_far: float = 6.8,
+        dilate_k: int = 13,
+    ) -> np.ndarray:
+        """RGB 黄物先检; depth 用膨胀邻域补洞 (小物体/远距常 depth=0)."""
+        hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+        hue, sat, val = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+        yellow = (
+            roi
+            & (hue >= HEAD_HUE_LO) & (hue <= HEAD_HUE_HI)
+            & (sat >= 8) & (val >= 28)
+        )
+        valid = self._valid_depth(depth, near=False) & (depth >= d_near) & (depth <= d_far)
+        if int(np.sum(valid)) < 80:
+            return np.zeros(depth.shape, dtype=np.uint8)
+        vk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_k, dilate_k))
+        valid_near = cv2.dilate(valid.astype(np.uint8), vk, iterations=2).astype(bool)
+        mask = (yellow & valid_near).astype(np.uint8)
+        return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
 
     def _detect_head_far_yellow(
         self, rgb: np.ndarray, depth: np.ndarray, robot_pos, robot_yaw,
     ) -> List[dict]:
-        """head 0.75~6m 远距黄物 (fusion relief 漏检时 head=0 的根因)."""
+        """head 0.4~6.8m 黄物 (v12: depth 邻域补洞, 解决 RGB 有黄但 head=0)."""
         h, w = depth.shape
-        valid = self._valid_depth(depth, near=False) & (depth >= 0.75) & (depth <= 6.5)
         roi = self._roi(h, w, near=False)
-        hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
-        hue, sat, val = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
-        mask = (
-            roi & valid
-            & (hue >= HEAD_HUE_LO) & (hue <= HEAD_HUE_HI)
-            & (sat >= 8) & (val >= 28)
-        ).astype(np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+        mask = self._mask_yellow_with_depth(rgb, depth, roi, d_near=0.40, d_far=6.8)
         dets = self._dets_from_mask(mask, rgb, depth, robot_pos, robot_yaw)
         for d in dets or []:
             d["head_far_fallback"] = True
@@ -1568,57 +1589,37 @@ class RgbdPureCamera:
     ) -> List[dict]:
         """head 2~4m 画面中部香蕉/黄物补检 (log: head=0 但 EE 见 banana@2.3m)."""
         h, w = depth.shape
-        st = depth_stats(depth)
-        p10 = float(st.get("p10", 99.0))
-        if p10 < 1.0 or p10 > 5.5:
-            return []
         roi = np.zeros((h, w), dtype=bool)
         roi[int(h * 0.08) : int(h * 0.58), int(w * 0.10) : int(w * 0.90)] = True
-        valid = (
-            self._valid_depth(depth, near=False)
-            & (depth >= 1.0)
-            & (depth <= 5.0)
-        )
-        hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
-        hue, sat, val = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
-        mask = (
-            roi & valid
-            & (hue >= HEAD_HUE_LO) & (hue <= HEAD_HUE_HI)
-            & (sat >= 20) & (val >= 42)
-        ).astype(np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
-        return self._dets_from_mask(mask, rgb, depth, robot_pos, robot_yaw)
+        mask = self._mask_yellow_with_depth(rgb, depth, roi, d_near=0.85, d_far=5.5, dilate_k=11)
+        dets = self._dets_from_mask(mask, rgb, depth, robot_pos, robot_yaw)
+        for d in dets or []:
+            d["head_far_fallback"] = True
+            d["pipeline_tier"] = 1
+            d["gt_correctable"] = True
+        return dets
 
     def _detect_edge_yellow(
         self, rgb: np.ndarray, depth: np.ndarray, robot_pos, robot_yaw,
     ) -> List[dict]:
-        """画面左右边缘黄物 (截图: banana 在 FOV 左缘 head YOLO 漏检)."""
+        """画面左右边缘黄物 (截图: banana 在 FOV 边缘)."""
         h, w = depth.shape
-        st = depth_stats(depth)
-        p10 = float(st.get("p10", 99.0))
-        if p10 < 1.0 or p10 > 5.5:
-            return []
-        valid = (
-            self._valid_depth(depth, near=False)
-            & (depth >= 1.0)
-            & (depth <= 5.0)
-        )
         roi = np.zeros((h, w), dtype=bool)
         roi[int(h * 0.05) : int(h * 0.62), : int(w * 0.18)] = True
         roi[int(h * 0.05) : int(h * 0.62), int(w * 0.82) :] = True
-        hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
-        hue, sat, val = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
-        mask = (
-            roi & valid
-            & (hue >= HEAD_HUE_LO) & (hue <= HEAD_HUE_HI)
-            & (sat >= 18) & (val >= 40)
-        ).astype(np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
-        return self._dets_from_mask(mask, rgb, depth, robot_pos, robot_yaw)
+        mask = self._mask_yellow_with_depth(rgb, depth, roi, d_near=0.85, d_far=5.5, dilate_k=11)
+        dets = self._dets_from_mask(mask, rgb, depth, robot_pos, robot_yaw)
+        for d in dets or []:
+            d["head_far_fallback"] = True
+            d["pipeline_tier"] = 1
+            d["gt_correctable"] = True
+        return dets
 
     @staticmethod
     def _prune_fallback_phantoms(dets: List[dict]) -> List[dict]:
-        """只杀近距地板 phantom; 远距 depth/neutral 保留."""
+        """简化模式不再做 phantom 裁剪 (遗留逻辑易误杀真黄物)."""
+        if RGBD_SIMPLE:
+            return list(dets or [])
         kept: List[dict] = []
         for d in dets or []:
             if not (
@@ -1651,27 +1652,14 @@ class RgbdPureCamera:
         if self._simple_mode:
             layers: List[dict] = []
             if self.camera_name == "head":
-                for extra_fn in (
-                    self._detect_head_far_yellow,
-                    self._detect_head_neutral_boxes,
-                    self._detect_head_depth_relief,
-                ):
-                    extra = extra_fn(rgb, depth, robot_pos, robot_yaw)
-                    if extra:
-                        layers.extend(extra)
-                if self._scene_near(depth):
-                    strip_dets = self._detect_bottom_strip(rgb, depth, robot_pos, robot_yaw)
-                    if strip_dets:
-                        layers.extend(strip_dets)
+                from yellow_detect import detect_head_yellow
+                layers = detect_head_yellow(rgb, depth, robot_pos, robot_yaw)
                 ransac = self._depth_cluster.detect(
                     rgb, depth, np.asarray(robot_pos, dtype=np.float32), float(robot_yaw),
                 )
-                from rgbd_utils import is_ransac_supplement, RANSAC_SUPPLEMENT_MAX_PX
-                layers.extend(
-                    d for d in (ransac or [])
-                    if is_ransac_supplement(d, max_px=RANSAC_SUPPLEMENT_MAX_PX)
-                )
-                dets = self._prune_fallback_phantoms(self._merge_dets(layers))
+                if not layers:
+                    layers = list(ransac or [])
+                dets = self._merge_dets(layers)
             else:
                 dets = self._depth_cluster.detect(
                     rgb, depth, np.asarray(robot_pos, dtype=np.float32), float(robot_yaw),

@@ -30,7 +30,7 @@ from rgbd_utils import (
     sanitize_depth,
 )
 
-PERCEPTION_RANSAC_BUILD = "20260617-taskb-yellow-nav-v11"
+PERCEPTION_RANSAC_BUILD = "20260617-taskb-yellow-clean-v13"
 TASKB_PIPELINE_MODE = "blob_gt_coast"
 RANSAC_HEAD_SUPPLEMENT_PX = 72
 
@@ -44,11 +44,11 @@ _CAM_CFG = {
         "pixel_step": 2,
         "ransac_iters": 220,
         "ransac_thresh": 0.022,
-        "ransac_min_inl": 40,
+        "ransac_min_inl": 28,
         "cluster_eps": 0.038,
-        "cluster_min_pts": 6,
-        "max_cluster_pts": 480,
-        "max_cluster_extent_m": 0.85,
+        "cluster_min_pts": 4,
+        "max_cluster_pts": 900,
+        "max_cluster_extent_m": 1.25,
         # 远距搜索: 物体在画面上半/下半都可能出现; robot_z 须含地面 (~-0.55)
         "roi_u": (0.02, 0.98),
         "roi_v": (0.02, 0.98),
@@ -440,8 +440,6 @@ class RansacClusterDetector:
         if float(pos_robot[0]) < float(c["robot_x_min"]):
             return False
         if float(pos_robot[2]) < z_lo or float(pos_robot[2]) > z_hi:
-            return False
-        if self.camera_name == "head" and float(pos_robot[2]) > -0.10:
             return False
         return True
 

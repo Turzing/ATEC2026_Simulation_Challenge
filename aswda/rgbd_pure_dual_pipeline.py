@@ -874,28 +874,14 @@ def _head_confirms_lock(
 
 
 def _can_acquire_nav_lock(seed: Optional[dict], head_objs: List[dict]) -> bool:
-    """必须 head blob 确认才首锁 (blob_gt_coast 管线)."""
-    if seed is None or not head_objs:
+    """首锁: 有 3D 位置即可，不再要求 blob/RANSAC/类名/EE 互证."""
+    if seed is None:
         return False
-    nav_pool = blob_nav_pool(head_objs) if TASKB_PIPELINE == "blob_gt_coast" else head_objs
-    if not nav_pool:
-        return False
-    if RGBD_SIMPLE:
-        sid = seed.get("id")
-        if sid is not None and _find_in_pool_by_id(nav_pool, sid) is not None:
+    if RGBD_SIMPLE or CLASS_AGNOSTIC:
+        if seed.get("pos_world") is not None or seed.get("pos_robot") is not None:
             return True
-        if _is_head_sourced(seed) and is_blob_nav_det(seed):
-            return True
-        if is_blob_nav_det(seed) or is_ransac_supplement(seed):
-            if CLASS_AGNOSTIC:
-                return True
-            return any(
-                o.get("class") == seed.get("class")
-                for o in nav_pool
-                if seed.get("class")
-            ) or is_blob_nav_det(seed)
-        if _is_head_sourced(seed):
-            return _find_in_pool_by_id(nav_pool, sid) is not None if sid is not None else True
+        return bool(head_objs)
+    if not head_objs:
         return False
     if _head_confirms_lock(head_objs, seed.get("id"), seed.get("class")):
         ho = _find_in_pool(head_objs, seed.get("id"), seed.get("class"), None)
@@ -1391,8 +1377,8 @@ class RgbdPureDualPipeline:
         else:
             mode = "legacy-fusion"
         print(
-            f"[RgbdPureDual] pipeline={TASKB_PIPELINE} | {mode} | "
-            f"blob→GT→ransac≤{RANSAC_SUPPLEMENT_MAX_PX}px→lock_coast | "
+            f"[RgbdPureDual] pipeline=yellow_clean | {mode} | "
+            f"HSV-yellow→3D→lock→static-EE-grasp | "
             f"depth_cluster={_DEPTH_CLUSTER_BUILD} | "
             f"ransac={'ok' if self._ransac is not None else 'MISSING'}"
         )
