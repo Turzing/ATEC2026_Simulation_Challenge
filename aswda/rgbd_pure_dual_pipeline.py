@@ -249,7 +249,7 @@ def _finalize_ee(o: dict, robot_pos, robot_yaw, arm_joints) -> dict:
         out = dict(o)
         out["camera"] = "ee"
         out["role"] = "nav_grasp"
-        out["skip_camera_correction"] = False
+        out["skip_camera_correction"] = True
         return _enrich_nav(out) or out
     cam_pos = compute_dynamic_ee_cam_pos(arm_joints) if arm_joints is not None else None
     if cam_pos is None:
@@ -267,6 +267,7 @@ def _finalize_head(o: dict, robot_pos, robot_yaw, grav) -> dict:
         out = dict(o)
         out["camera"] = "head"
         out["role"] = "nav"
+        out["skip_camera_correction"] = True
         return _enrich_nav(out) or out
     cam_pos = compute_dynamic_head_cam_pos(grav)
     out = refresh_head_object_pose(o, robot_pos, robot_yaw, cam_pos)

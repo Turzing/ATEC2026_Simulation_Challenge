@@ -1186,9 +1186,9 @@ class AlgSolution:
                 f"lock={perception_output.get('nav_lock_id')}:{perception_output.get('nav_lock_class')} "
                 f"build={build} pose_source={pose_source}"
             )
-            if "v4" not in str(build) and "v3" not in str(build):
+            if "v5" not in str(build) and "v4" not in str(build):
                 self._log(
-                    f"[PERC-WARN] 感知版本过旧 build={build} — 请同步 depth_ransac_cluster.py (期望 v4)"
+                    f"[PERC-WARN] 感知版本过旧 build={build} — 请同步 depth_ransac_cluster.py (期望 v5)"
                 )
             if head_n == 0 and cloud > 80 and obj_pts > 12 and clusters == 0:
                 self._log(
@@ -1549,9 +1549,8 @@ class AlgSolution:
             self._nav_stall_dist_start = None
         gt_err = self._gt_perc_xy_error(target_nav)
         if self.static_two_step:
-            head_n = len((self._last_perception_output or {}).get("head_objects") or [])
-            if head_n == 0 or bool(target_nav.get("nav_coast")):
-                gt_err = None
+            gt_err = None
+            self._phantom_gt_err_steps = 0
         if gt_err is not None and gt_err > self.grasp_gt_max_err:
             self._phantom_gt_err_steps += 1
             phantom_limit = 28 if self.static_two_step else 12
@@ -3770,16 +3769,19 @@ class AlgSolution:
                 lock_id = perception_output.get("nav_lock_id") if isinstance(perception_output, dict) else None
                 if self.static_two_step:
                     nav_phase = str(nav_info.get("phase", ""))
-                    close_enough = cons_dist <= self.coarse_approach_dist + 0.12
+                    head_live = len(perception_output.get("head_objects") or []) > 0
+                    close_enough = cons_dist <= self.coarse_approach_dist + 0.08
                     approach_ready = (
                         target_nav is not None
-                        and (lock_id is not None or len(perception_output.get("head_objects") or []) > 0)
+                        and lock_id is not None
+                        and head_live
                         and dist_ok
                         and heading_ok
                         and close_enough
+                        and cons_dist <= self.coarse_approach_dist + 0.05
                         and (
                             bool(nav_info.get("stopped"))
-                            or nav_phase in ("refine_hold", "ready_to_grasp", "near_refine")
+                            or nav_phase in ("refine_hold", "ready_to_grasp")
                         )
                     )
                     if approach_ready:

@@ -29,7 +29,7 @@ from rgbd_utils import (
     sanitize_depth,
 )
 
-PERCEPTION_RANSAC_BUILD = "20260617-head-ransac-v4"
+PERCEPTION_RANSAC_BUILD = "20260617-head-ransac-v5"
 
 _CAM_CFG = {
     "head": {
@@ -38,12 +38,14 @@ _CAM_CFG = {
         "rot": HEAD_CAM_ROT_MATRIX,
         "depth_min": 0.12,
         "depth_max": 8.5,
-        "pixel_step": 1,
+        "pixel_step": 2,
         "ransac_iters": 220,
-        "ransac_thresh": 0.024,
-        "ransac_min_inl": 35,
-        "cluster_eps": 0.042,
+        "ransac_thresh": 0.022,
+        "ransac_min_inl": 40,
+        "cluster_eps": 0.038,
         "cluster_min_pts": 6,
+        "max_cluster_pts": 320,
+        "max_cluster_extent_m": 0.58,
         # 远距搜索: 物体在画面上半/下半都可能出现; robot_z 须含地面 (~-0.55)
         "roi_u": (0.02, 0.98),
         "roi_v": (0.02, 0.98),
@@ -179,7 +181,6 @@ def _cluster_objects_adaptive(
     base_eps: float,
     base_min_pts: int,
 ) -> List[np.ndarray]:
-    """远距物体像素少 → 自适应放大 eps、降低 min_pts."""
     if len(points) == 0:
         return []
     med_depth = float(np.median(np.linalg.norm(points, axis=1)))
@@ -358,6 +359,25 @@ class RansacClusterDetector:
             det["grasp_anchor_depth"] = depth_m
         return det
 
+    def _cluster_passes_filters(self, points: np.ndarray, idx: np.ndarray) -> bool:
+        c = self._cfg
+        n = int(len(idx))
+        if n < int(c["cluster_min_pts"]) or n > int(c.get("max_cluster_pts", 9999)):
+            return False
+        cpts = points[idx]
+        extent = float(np.max(np.linalg.norm(cpts - cpts.mean(axis=0, keepdims=True), axis=1)))
+        if extent > float(c.get("max_cluster_extent_m", 0.75)):
+            return False
+        pos_robot = np.median(cpts, axis=0)
+        z_lo, z_hi = c["robot_z"]
+        if float(pos_robot[0]) < float(c["robot_x_min"]):
+            return False
+        if float(pos_robot[2]) < z_lo or float(pos_robot[2]) > z_hi:
+            return False
+        if self.camera_name == "head" and float(pos_robot[2]) > -0.20:
+            return False
+        return True
+
     def detect(
         self,
         depth: np.ndarray,
@@ -408,12 +428,27 @@ class RansacClusterDetector:
         cluster_indices = _cluster_objects_adaptive(
             obj_pts, float(c["cluster_eps"]), int(c["cluster_min_pts"]),
         )
+        if (
+            len(cluster_indices) == 1
+            and len(cluster_indices[0]) > int(c.get("max_cluster_pts", 320))
+        ):
+            members = cluster_indices[0]
+            sub = _cluster_objects_adaptive(
+                obj_pts[members],
+                float(c["cluster_eps"]) * 0.38,
+                max(5, int(c["cluster_min_pts"])),
+            )
+            if len(sub) >= 2:
+                cluster_indices = [members[s] for s in sub]
+
         self._last_n_clusters = len(cluster_indices)
         if not cluster_indices:
             return []
 
         dets: List[dict] = []
         for members in cluster_indices[:MAX_CLUSTERS]:
+            if not self._cluster_passes_filters(obj_pts, members):
+                continue
             self._track_id += 1
             dets.append(
                 self._cluster_to_det(
@@ -421,6 +456,7 @@ class RansacClusterDetector:
                     robot_pos, robot_yaw, self._track_id,
                 )
             )
+        self._last_n_clusters = len(dets)
 
         if nav_hint is not None and nav_hint.get("pos_world") is not None:
             hint_w = np.asarray(nav_hint["pos_world"], dtype=np.float32)
