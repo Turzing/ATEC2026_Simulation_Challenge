@@ -1384,6 +1384,13 @@ class AlgSolution:
         else:
             phase = "far_approach"
 
+        if self.static_two_step and target_dist > 1.6:
+            if abs(heading_error) < 0.72:
+                lin_x = max(lin_x, 0.40 if abs(heading_error) < 0.50 else 0.22)
+                phase = "far_approach"
+            elif abs(heading_error) < 1.05:
+                lin_x = max(lin_x, 0.14)
+
         stopped = False
         cons_dist = self._conservative_target_dist(target_nav)
         if self.static_two_step:
@@ -1561,7 +1568,14 @@ class AlgSolution:
             target_nav,
             robot_pos_world,
         ):
-            if not (self.static_two_step and len((self._last_perception_output or {}).get("head_objects") or []) > 0):
+            perc = self._last_perception_output or {}
+            lock_id = perc.get("nav_lock_id")
+            ee_live = len(perc.get("ee_objects") or []) > 0
+            head_live = len(perc.get("head_objects") or []) > 0
+            keep_lock = self.static_two_step and (
+                lock_id is not None or ee_live or head_live
+            )
+            if not keep_lock:
                 self._log(
                     f"[NAV] turn stall ({self._nav_stall_turn_rad:.2f}rad, "
                     f"dist={nav_info.get('target_dist', 0):.2f}m), unlock and search"
@@ -2084,11 +2098,42 @@ class AlgSolution:
                 prep["confirmed"] = False
                 prep["visible"] = True
                 return prep
+
+        if self.static_two_step:
+            ee_objs = perception_output.get("ee_objects") or []
+            if ee_objs:
+                best = min(
+                    ee_objs,
+                    key=lambda o: float(
+                        o.get("depth_m") or o.get("dist_to_robot") or o.get("nav_depth_m") or 999.0
+                    ),
+                )
+                prep = self._prepare_pipeline_object(best, "ee", robot_pos_world, robot_yaw)
+                if prep is not None:
+                    prep["confirmed"] = False
+                    prep["visible"] = True
+                    return prep
         return None
 
     def _compute_search_cmd(self, perception_output: dict[str, Any] | None) -> np.ndarray:
-        """head 无 lock 时优先朝 head 检测转向+慢走, 减少盲转圈."""
+        """无 lock 时优先朝 EE/head 检测转向+慢走, 减少盲转圈."""
         if isinstance(perception_output, dict):
+            if self.static_two_step:
+                ee_objs = perception_output.get("ee_objects") or []
+                if ee_objs:
+                    best = min(
+                        ee_objs,
+                        key=lambda o: float(
+                            o.get("depth_m") or o.get("dist_to_robot") or o.get("nav_depth_m") or 999.0
+                        ),
+                    )
+                    pr = self._safe_numpy(best.get("pos_robot"), np.zeros(3, dtype=np.float32))
+                    if float(np.linalg.norm(pr[:2])) > 0.12:
+                        bearing = float(math.atan2(pr[1], pr[0]))
+                        ang = float(np.clip(bearing * self.heading_kp, -0.55, 0.55))
+                        lin = 0.28 if abs(bearing) < 0.55 else 0.12
+                        self._search_turn_accum = 0.0
+                        return np.array([lin, 0.0, ang], dtype=np.float32)
             heads = perception_output.get("head_objects") or []
             if heads:
                 best = min(
@@ -2265,7 +2310,10 @@ class AlgSolution:
                 pr = self._safe_numpy(target.get("pos_robot"), np.zeros(3, dtype=np.float32))
                 if float(pr[0]) > 0.05:
                     return target
-                if perception_output.get("nav_lock_stable") and len(perception_output.get("head_objects") or []) > 0:
+                if perception_output.get("nav_lock_stable") and (
+                    len(perception_output.get("head_objects") or []) > 0
+                    or len(perception_output.get("ee_objects") or []) > 0
+                ):
                     return target
                 self._clear_fuse_nav_lock(f"perc unreliable in static mode: {reason}")
                 return None
@@ -3888,12 +3936,10 @@ class AlgSolution:
                 lock_id = perception_output.get("nav_lock_id") if isinstance(perception_output, dict) else None
                 if self.static_two_step:
                     nav_phase = str(nav_info.get("phase", ""))
-                    head_live = len(perception_output.get("head_objects") or []) > 0
                     close_enough = cons_dist <= self.coarse_approach_dist + 0.08
                     approach_ready = (
                         target_nav is not None
                         and lock_id is not None
-                        and head_live
                         and dist_ok
                         and heading_ok
                         and close_enough

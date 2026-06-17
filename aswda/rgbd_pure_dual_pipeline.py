@@ -135,6 +135,7 @@ NAV_EE_FAR_MIN_M = 1.35          # >= 远距 EE 导航
 NAV_EE_TO_HEAD_M = 1.28          # 迟滞: 远→近
 NAV_HEAD_TO_EE_M = 1.42          # 迟滞: 近→远
 NAV_LOCK_MISS_MAX = 45           # 丢失多少帧后解锁重选 (~0.9s)
+NAV_LOCK_MISS_MAX_STATIC = 120   # 两步走 EE 主导: 允许更长的 lock coast
 EE_NAV_LOCK_MAX_DEPTH_M = 2.05   # EE 独锁最大深度 (log: 2.36m 偏 1.55m)
 EE_ONLY_HEAD_CONFIRM_MAX = 30    # EE-only 锁无 head 确认则解锁 (~0.6s)
 NAV_RELOCK_MAX_XY_M = 1.25       # 重锁不得离上一 lock_world 超过此距
@@ -1731,8 +1732,17 @@ class RgbdPureDualPipeline:
             self._nav_lock_id, self._nav_lock_class, self._nav_lock_world,
         )
         if auth_tgt is not None and self._nav_lock_id is not None:
-            if int(auth_tgt.get("id", -1)) != int(self._nav_lock_id):
-                auth_tgt = None
+            id_mismatch = int(auth_tgt.get("id", -1)) != int(self._nav_lock_id)
+            if id_mismatch:
+                if (
+                    CLASS_AGNOSTIC
+                    and self._nav_lock_world is not None
+                    and _world_xy_dist(auth_tgt, {"pos_world": self._nav_lock_world}) <= NAV_RELOCK_MAX_XY_M
+                ):
+                    auth_tgt = dict(auth_tgt)
+                    auth_tgt["id"] = int(self._nav_lock_id)
+                else:
+                    auth_tgt = None
             elif (
                 self._nav_lock_class
                 and auth_tgt.get("class")
@@ -1767,7 +1777,8 @@ class RgbdPureDualPipeline:
         else:
             self._nav_lock_miss += 1
 
-        if self._nav_lock_miss >= NAV_LOCK_MISS_MAX:
+        lock_miss_max = NAV_LOCK_MISS_MAX_STATIC if STATIC_TWO_STEP else NAV_LOCK_MISS_MAX
+        if self._nav_lock_miss >= lock_miss_max:
             if self.frame_count < self._nav_lock_reject_until:
                 self._nav_lock_miss = NAV_LOCK_MISS_MAX // 2
             else:
@@ -1787,15 +1798,11 @@ class RgbdPureDualPipeline:
                     self._nav_lock_class = None if CLASS_AGNOSTIC else seed.get("class")
                     pw = seed.get("pos_world")
                     self._nav_lock_world = list(pw) if pw is not None else None
-                elif (
-                    prev_id is not None
-                    and prev_world is not None
-                    and (not STATIC_TWO_STEP or head_objs)
-                ):
+                elif prev_id is not None and prev_world is not None:
                     self._nav_lock_id = int(prev_id)
                     self._nav_lock_class = prev_class
                     self._nav_lock_world = prev_world
-                    self._nav_lock_miss = NAV_LOCK_MISS_MAX // 2
+                    self._nav_lock_miss = lock_miss_max // 2
 
         grasp_src = ee_grasp_nav if _same_nav_target(ee_grasp_nav, auth_tgt) else None
         if grasp_src is None and auth_tgt is not None:
@@ -1844,7 +1851,7 @@ class RgbdPureDualPipeline:
             auth_tgt is None
             and self._nav_lock_id is not None
             and self._nav_lock_world is not None
-            and self._nav_lock_miss < NAV_LOCK_MISS_MAX
+            and self._nav_lock_miss < lock_miss_max
         ):
             auth_tgt = _coast_nav_from_lock(
                 self._nav_lock_id,
