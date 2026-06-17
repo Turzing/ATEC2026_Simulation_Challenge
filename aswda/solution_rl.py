@@ -95,7 +95,11 @@ class AlgSolution:
         self._nav_turn_sign: int = 0
         self._nav_turn_sign_hold = 0
         self._fuse_lock_key: tuple[Any, Any] | None = None
+        self._fuse_lock_id: Any | None = None
+        self._fuse_lock_class: str | None = None
         self._fuse_pos_world: np.ndarray | None = None
+        self._fuse_coast_miss_steps = 0
+        self.fuse_coast_max_miss_steps = max(20, int(os.getenv("ATEC_TASKB_FUSE_COAST_MAX_MISS", "90")))
         self._ee_only_no_head_frames = 0
         self._nav_stall_turn_rad = 0.0
         self._nav_stall_dist_start: float | None = None
@@ -1401,11 +1405,12 @@ class AlgSolution:
             phase = "far_approach"
 
         if self.static_two_step and target_dist > 1.6:
-            if abs(heading_error) < 0.72:
-                lin_x = max(lin_x, 0.40 if abs(heading_error) < 0.50 else 0.22)
+            if abs(heading_error) < 0.85:
+                lin_x = max(lin_x, 0.55 if abs(heading_error) < 0.45 else 0.32)
                 phase = "far_approach"
-            elif abs(heading_error) < 1.05:
-                lin_x = max(lin_x, 0.14)
+            elif abs(heading_error) < 1.25:
+                lin_x = max(lin_x, 0.22)
+                ang_z = float(np.clip(ang_z, -0.32, 0.32))
 
         stopped = False
         cons_dist = self._conservative_target_dist(target_nav)
@@ -2129,6 +2134,10 @@ class AlgSolution:
                     prep["confirmed"] = False
                     prep["visible"] = True
                     return prep
+
+        coast = self._build_fuse_coast_target(robot_pos_world, robot_yaw)
+        if coast is not None:
+            return coast
         return None
 
     def _compute_search_cmd(self, perception_output: dict[str, Any] | None) -> np.ndarray:
@@ -2220,7 +2229,10 @@ class AlgSolution:
         if reason:
             self._log(f"[NAV] fuse unlock: {reason}")
         self._fuse_lock_key = None
+        self._fuse_lock_id = None
+        self._fuse_lock_class = None
         self._fuse_pos_world = None
+        self._fuse_coast_miss_steps = 0
         self._ee_only_no_head_frames = 0
         self._nav_stall_turn_rad = 0.0
         self._nav_stall_dist_start = None
@@ -2263,6 +2275,46 @@ class AlgSolution:
             return True
         return False
 
+    def _build_fuse_coast_target(
+        self,
+        robot_pos_world: np.ndarray,
+        robot_yaw: float,
+    ) -> dict[str, Any] | None:
+        """EE 短暂丢失时沿 fuse 锁定的 world 点继续走，避免 searching_lost_target 转圈."""
+        if self._fuse_pos_world is None:
+            return None
+        if self._fuse_coast_miss_steps > self.fuse_coast_max_miss_steps:
+            return None
+        pw = self._safe_numpy(self._fuse_pos_world, np.zeros(3, dtype=np.float32))
+        if float(np.linalg.norm(pw[:2] - robot_pos_world[:2])) < 0.08:
+            return None
+        lock_id = self._fuse_lock_id
+        lock_class = self._fuse_lock_class
+        if isinstance(self._locked_target, dict):
+            lock_id = lock_id if lock_id is not None else self._locked_target.get("id")
+            lock_class = lock_class or self._locked_target.get("class")
+        pr = self._world_to_robot_frame(pw, robot_pos_world, robot_yaw)
+        coast = {
+            "id": lock_id,
+            "class": lock_class,
+            "pos_world": pw.tolist(),
+            "pos_robot": pr.tolist(),
+            "dist_to_robot": float(np.linalg.norm(pr[:2])),
+            "depth_m": float(np.linalg.norm(pr[:2])),
+            "yaw_rel": float(math.atan2(pr[1], pr[0])),
+            "source_camera": "fuse_coast",
+            "camera": "ee",
+            "nav_coast": True,
+            "confirmed": True,
+            "visible": False,
+        }
+        prep = self._prepare_pipeline_object(coast, "ee", robot_pos_world, robot_yaw)
+        if prep is not None:
+            prep["nav_coast"] = True
+            prep["visible"] = False
+            prep["confirmed"] = True
+        return prep
+
     def _fuse_perception_target(
         self,
         perception_output: dict[str, Any],
@@ -2272,8 +2324,14 @@ class AlgSolution:
         """单一导航出口：只跟感知 target_nav."""
         raw_nav = perception_output.get("target_nav")
         if not isinstance(raw_nav, dict) or raw_nav.get("pos_world") is None:
+            if self.static_two_step and self._fuse_pos_world is not None:
+                self._fuse_coast_miss_steps += 1
+                coast = self._build_fuse_coast_target(robot_pos_world, robot_yaw)
+                if coast is not None:
+                    return coast
             return None
 
+        self._fuse_coast_miss_steps = 0
         lock_id = perception_output.get("nav_lock_id")
         lock_class = perception_output.get("nav_lock_class")
 
@@ -2290,21 +2348,36 @@ class AlgSolution:
             target["confirmed"] = True
             target["visible"] = False
             self._fuse_lock_key = (lock_id,) if self.class_agnostic else (lock_id, lock_class)
+            self._fuse_lock_id = lock_id if lock_id is not None else target.get("id")
+            self._fuse_lock_class = lock_class or target.get("class")
             pw = self._safe_numpy(target.get("pos_world"), np.zeros(3, dtype=np.float32))
             self._fuse_pos_world = pw.copy()
             return target
 
         lock_key = (lock_id,) if self.class_agnostic else (lock_id, lock_class)
         pw = self._safe_numpy(target.get("pos_world"), np.zeros(3, dtype=np.float32))
+        resolved_id = lock_id if lock_id is not None else target.get("id")
+        resolved_class = lock_class or target.get("class")
         if lock_key != self._fuse_lock_key or self._fuse_pos_world is None:
             self._fuse_lock_key = lock_key
+            self._fuse_lock_id = resolved_id
+            self._fuse_lock_class = resolved_class
             self._fuse_pos_world = pw.copy()
             self._nav_heading_error_f = None
         else:
-            alpha = 0.62
-            self._fuse_pos_world = (1.0 - alpha) * self._fuse_pos_world + alpha * pw
-            pw = self._fuse_pos_world.copy()
+            jump_xy = float(np.linalg.norm(pw[:2] - self._fuse_pos_world[:2]))
+            jump_lim = self.track_jump_reject_m
+            if float(np.linalg.norm(pw[:2])) > 2.0:
+                jump_lim = min(jump_lim, 0.38)
+            if jump_xy > jump_lim:
+                pw = self._fuse_pos_world.copy()
+            else:
+                alpha = 0.62
+                self._fuse_pos_world = (1.0 - alpha) * self._fuse_pos_world + alpha * pw
+                pw = self._fuse_pos_world.copy()
         self._fuse_pos_world = pw.copy()
+        self._fuse_lock_id = resolved_id if resolved_id is not None else self._fuse_lock_id
+        self._fuse_lock_class = resolved_class or self._fuse_lock_class
         pos_robot = self._world_to_robot_frame(pw, robot_pos_world, robot_yaw)
         target["id"] = lock_id if lock_id is not None else target.get("id")
         target["class"] = lock_class or target.get("class")

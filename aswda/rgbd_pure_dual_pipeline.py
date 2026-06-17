@@ -1703,6 +1703,17 @@ class RgbdPureDualPipeline:
                 )
                 self._nav_lock_ee_only_frames = 0
                 locked = seed
+            elif STATIC_TWO_STEP and ee_objs:
+                seed = min(ee_objs, key=_obj_dist)
+                pw = seed.get("pos_world")
+                if pw is not None and _ee_nav_lock_quality_ok(seed):
+                    self._nav_lock_id = int(seed["id"])
+                    self._nav_lock_class = None if CLASS_AGNOSTIC else seed.get("class")
+                    self._nav_lock_world = list(pw)
+                    self._nav_lock_ee_only = True
+                    self._nav_lock_ee_only_frames = 0
+                    self._nav_lock_miss = 0
+                    locked = seed
 
         if self._nav_lock_id is not None:
             if _head_confirms_lock(head_objs, self._nav_lock_id, self._nav_lock_class):
