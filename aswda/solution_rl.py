@@ -244,6 +244,7 @@ class AlgSolution:
         self.grasp_gt_max_err = float(os.getenv("ATEC_TASKB_GRASP_GT_MAX_ERR", "0.45"))
         self.grasp_heading_tolerance = float(os.getenv("ATEC_TASKB_GRASP_HEADING_TOL", "0.28"))
         self.static_two_step = os.getenv("ATEC_TASKB_STATIC_TWO_STEP", "1").lower() not in {"0", "false", "no"}
+        self.class_agnostic = os.getenv("ATEC_TASKB_CLASS_AGNOSTIC", "1").lower() not in {"0", "false", "no"}
         self.coarse_approach_dist = float(os.getenv("ATEC_TASKB_COARSE_APPROACH_DIST", "1.32"))
         self.static_perceive_settle_steps = max(3, int(os.getenv("ATEC_TASKB_STATIC_PERCEIVE_SETTLE", "8")))
         self.static_perceive_max_steps = max(10, int(os.getenv("ATEC_TASKB_STATIC_PERCEIVE_MAX_STEPS", "30")))
@@ -253,8 +254,11 @@ class AlgSolution:
         self.static_grasp_fuse_frames = max(2, int(os.getenv("ATEC_TASKB_STATIC_GRASP_FUSE", "3")))
         self._log(
             f"[TaskB-PERCEPTION] build={PERCEPTION_RANSAC_BUILD} "
+            f"pipeline=blob_gt_coast "
+            f"(HSV-blob→GT-3D→ransac≤72→lock-coast→EE-fuse×{self.static_grasp_fuse_frames}) "
             f"module={DEPTH_RANSAC_MODULE_PATH} repo={REPO_ROOT} "
             f"static_two_step={self.static_two_step} "
+            f"class_agnostic={int(self.class_agnostic)} "
             f"coarse_dist={self.coarse_approach_dist:.2f}m"
         )
         self.bin_drop_radius = float(os.getenv("ATEC_TASKB_BIN_DROP_RADIUS", "1.0"))
@@ -1123,8 +1127,8 @@ class AlgSolution:
         if old_pos_robot is not None and obj.get("pos_from_pointcloud"):
             n_pts = int(obj.get("nav_point_count") or 0)
             src = str(obj.get("source") or "")
-            if src == "rgbd_nav_head":
-                w_gt = min(0.82, 0.55 + n_pts / 70.0)
+            if src == "rgbd_nav_head" or obj.get("gt_correctable") or obj.get("pipeline_tier") == 1:
+                w_gt = min(0.88, 0.62 + n_pts / 55.0)
             elif src == "ransac_cluster":
                 w_gt = min(0.78, 0.50 + n_pts / 100.0)
             else:
@@ -1208,9 +1212,9 @@ class AlgSolution:
                 f"lock={perception_output.get('nav_lock_id')}:{perception_output.get('nav_lock_class')} "
                 f"build={build} pose_source={pose_source}"
             )
-            if "v8" not in str(build) and "v7" not in str(build) and "v6" not in str(build):
+            if "v11" not in str(build) and "yellow-nav" not in str(build) and "v10" not in str(build):
                 self._log(
-                    f"[PERC-WARN] 感知版本过旧 build={build} — 请同步 taskb_perception/ (期望 v8)"
+                    f"[PERC-WARN] 感知版本过旧 build={build} — 请同步 taskb_perception/ (期望 v11 class-agnostic yellow-nav)"
                 )
             elif head_n == 0 and int(hr.get("clusters") or 0) > 0:
                 self._log(
@@ -2028,7 +2032,7 @@ class AlgSolution:
         robot_pos_world: np.ndarray,
         robot_yaw: float,
     ) -> dict[str, Any] | None:
-        """融合层丢目标时: 用感知 raw target_nav 或最近 head 检测兜底, 避免盲转."""
+        """融合层丢目标时: 用感知 raw target_nav / nav lock / 最近 head 检测兜底."""
         raw = perception_output.get("target_nav")
         if isinstance(raw, dict) and raw.get("pos_world") is not None:
             prep = self._prepare_pipeline_object(
@@ -2037,6 +2041,28 @@ class AlgSolution:
                 robot_pos_world,
                 robot_yaw,
             )
+            if prep is not None:
+                return prep
+
+        lock_id = perception_output.get("nav_lock_id")
+        lock_class = perception_output.get("nav_lock_class")
+        lock_world = perception_output.get("nav_lock_world")
+        if lock_id is not None and lock_world is not None:
+            pw = self._safe_numpy(lock_world, np.zeros(3, dtype=np.float32))
+            pr = self._world_to_robot_frame(pw, robot_pos_world, robot_yaw)
+            coast = {
+                "id": lock_id,
+                "class": lock_class,
+                "pos_world": pw.tolist(),
+                "pos_robot": pr.tolist(),
+                "dist_to_robot": float(np.linalg.norm(pr[:2])),
+                "depth_m": float(np.linalg.norm(pr[:2])),
+                "source_camera": "lock_coast",
+                "nav_coast": True,
+                "confirmed": True,
+                "visible": False,
+            }
+            prep = self._prepare_pipeline_object(coast, "head", robot_pos_world, robot_yaw)
             if prep is not None:
                 return prep
 
@@ -2194,7 +2220,15 @@ class AlgSolution:
         if target is None:
             return None
 
-        lock_key = (lock_id, lock_class)
+        if target.get("nav_coast"):
+            target["confirmed"] = True
+            target["visible"] = False
+            self._fuse_lock_key = (lock_id,) if self.class_agnostic else (lock_id, lock_class)
+            pw = self._safe_numpy(target.get("pos_world"), np.zeros(3, dtype=np.float32))
+            self._fuse_pos_world = pw.copy()
+            return target
+
+        lock_key = (lock_id,) if self.class_agnostic else (lock_id, lock_class)
         pw = self._safe_numpy(target.get("pos_world"), np.zeros(3, dtype=np.float32))
         if lock_key != self._fuse_lock_key or self._fuse_pos_world is None:
             self._fuse_lock_key = lock_key
@@ -2851,8 +2885,10 @@ class AlgSolution:
         if not isinstance(target, dict):
             return False, ""
         cons_dist = self._conservative_target_dist(target, robot_pos_world)
-        # 两步走粗导航: 近距不拿 GT 否决, 避免锁错目标后一直转圈/罚站
+        # 两步走粗导航: 近距不拿 GT 否决; 远距也放宽 (RANSAC/外参 Y 常偏 0.3~0.7m)
         if self.static_two_step and cons_dist <= self.coarse_approach_dist + 0.35:
+            return False, ""
+        if self.static_two_step and cons_dist >= 1.20:
             return False, ""
         if cons_dist <= 1.15:
             return False, ""
@@ -3186,7 +3222,7 @@ class AlgSolution:
                     - tracked_pos[:2]
                 )
             )
-            if tracked_class is not None and candidate.get("class") not in {None, tracked_class}:
+            if not self.class_agnostic and tracked_class is not None and candidate.get("class") not in {None, tracked_class}:
                 if not (
                     lock_id is not None
                     and candidate.get("id") is not None

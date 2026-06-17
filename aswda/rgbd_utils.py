@@ -18,9 +18,17 @@ import numpy as np
 RGBD_SIMPLE = os.getenv("ATEC_RGBD_SIMPLE", "1").strip().lower() not in ("0", "false", "no")
 # 两步走: 粗导航(head depth) → 停稳趴下 → 静态 EE RANSAC 抓取
 STATIC_TWO_STEP = os.getenv("ATEC_TASKB_STATIC_TWO_STEP", "1").strip().lower() not in ("0", "false", "no")
+# 推荐管线: HSV blob → GT 校正 3D → RANSAC 小簇补充 → lock coast → EE 多帧 grasp
+TASKB_PIPELINE = os.getenv("ATEC_TASKB_PIPELINE", "blob_gt_coast").strip().lower()
+RANSAC_SUPPLEMENT_MAX_PX = int(os.getenv("ATEC_TASKB_RANSAC_SUPPLEMENT_PX", "72"))
+# 不细分 banana/mustard/bottle：黄物统一，锁 id+位置，抓准 3D 点即可
+CLASS_AGNOSTIC = os.getenv("ATEC_TASKB_CLASS_AGNOSTIC", "1").strip().lower() not in ("0", "false", "no")
+GENERIC_YELLOW_CLASS = "mustard_bottle"
+GENERIC_NEUTRAL_CLASS = "sugar_box"
 
 from config import (
     BBOX_LATERAL_TOL,
+    CLASS_NAME_TO_ID,
     DEFAULT_ARM_JOINTS,
     EE_CAM,
     EE_CAM_POS_ROBOT,
@@ -246,6 +254,91 @@ def is_head_edge_phantom(obj: dict, *, img_w: int = IMG_W) -> bool:
     return False
 
 
+def classify_taskb_simple(
+    hue_mean: float,
+    sat_mean: float,
+    val_mean: float,
+    aspect: float,
+    z_extent: float = 0.08,
+) -> Tuple[str, float]:
+    """
+    类名无关: 黄物统一 → mustard_bottle (竖直/top-down 抓); 低饱和浅色 → sugar_box.
+    不区分 banana / mustard_bottle.
+    """
+    yellow = 14.0 <= float(hue_mean) <= 46.0 and float(sat_mean) >= 20.0
+    if float(sat_mean) < 30.0 and float(val_mean) > 62.0 and float(aspect) < 1.55:
+        return GENERIC_NEUTRAL_CLASS, 0.82
+    if yellow or float(sat_mean) >= 18.0:
+        return GENERIC_YELLOW_CLASS, 0.88
+    if float(z_extent) < 0.10 and float(aspect) < 1.40:
+        return GENERIC_NEUTRAL_CLASS, 0.74
+    return GENERIC_YELLOW_CLASS, 0.78
+
+
+def apply_class_agnostic(obj: dict) -> dict:
+    """统一 class 标签，避免 lock 在 banana↔mustard 间乱跳."""
+    if not CLASS_AGNOSTIC or not isinstance(obj, dict):
+        return obj
+    out = dict(obj)
+    sm = float(out.get("blob_sat_mean") or 0.0)
+    hm = float(out.get("blob_hue_mean") or 0.0)
+    vm = float(out.get("blob_val_mean") or 128.0)
+    bbox = out.get("bbox") or [0, 0, 1, 1]
+    bw = max(1, int(bbox[2]) - int(bbox[0]) + 1)
+    bh = max(1, int(bbox[3]) - int(bbox[1]) + 1)
+    aspect = float(bw) / float(bh)
+    z_ext = float(out.get("geom_z_extent") or out.get("geom_extent", [0, 0, 0.08])[2] if isinstance(out.get("geom_extent"), (list, tuple)) else 0.08)
+    cls, conf = classify_taskb_simple(hm, sm, vm, aspect, z_ext)
+    out["class"] = cls
+    out["class_id"] = CLASS_NAME_TO_ID.get(cls, 1)
+    out["class_conf"] = conf
+    out["class_agnostic"] = True
+    return out
+
+
+def is_blob_nav_det(obj: dict) -> bool:
+    """Tier-1: HSV 黄/白盒 + relief blob (主导 class 与 2D 区域)."""
+    if obj.get("head_far_fallback") or obj.get("head_depth_fallback") or obj.get("head_neutral_fallback"):
+        return True
+    return str(obj.get("source") or "") == "rgbd_nav_head"
+
+
+def is_ransac_supplement(obj: dict, *, max_px: int = RANSAC_SUPPLEMENT_MAX_PX) -> bool:
+    """Tier-3: 小簇 RANSAC 仅作补充."""
+    if str(obj.get("source") or "") != "ransac_cluster":
+        return False
+    return int(obj.get("cluster_pixels") or 0) <= int(max_px)
+
+
+def blob_nav_pool(objects: list) -> list:
+    """有 blob 时只用 blob; 否则保留小 RANSAC 补充."""
+    blobs = [o for o in objects if is_blob_nav_det(o)]
+    if blobs:
+        return blobs
+    return [o for o in objects if is_ransac_supplement(o)]
+
+
+def is_upper_corner_phantom(obj: dict, *, img_h: int = IMG_H, img_w: int = IMG_W) -> bool:
+    """画面右上角/上沿小框 → 地平线假检 (截图红框打天)."""
+    bbox = obj.get("bbox")
+    if not bbox or len(bbox) != 4:
+        return False
+    x1, y1, x2, y2 = map(float, bbox)
+    cx = 0.5 * (x1 + x2)
+    cy = 0.5 * (y1 + y2)
+    bw = max(x2 - x1, 1.0)
+    bh = max(y2 - y1, 1.0)
+    area = bw * bh
+    img_area = float(img_h * img_w)
+    if cy < img_h * 0.38 and cx > img_w * 0.62 and area < img_area * 0.012:
+        return True
+    if y2 < img_h * 0.42 and cx > img_w * 0.70 and bh < img_h * 0.22:
+        return True
+    if cy < img_h * 0.28 and area < img_area * 0.008:
+        return True
+    return False
+
+
 def is_sky_phantom_bbox(obj: dict, *, img_h: int = IMG_H) -> bool:
     """物体在地面: bbox 底边应在画面下半区; 否则是天空/地平线假检 (截图红框打天)."""
     bbox = obj.get("bbox")
@@ -350,7 +443,8 @@ def is_valid_taskb_ground_det(obj: dict, *, img_h: int = IMG_H) -> bool:
         return False
     if px < 0.22 or px > 8.5:
         return False
-    if pz < -0.82 or pz > -0.04:
+    z_hi = 0.08 if _is_head_fallback_det(obj) else -0.04
+    if pz < -0.88 or pz > z_hi:
         return False
     if float(np.hypot(px, py)) < 0.10:
         return False
@@ -370,6 +464,8 @@ def is_valid_taskb_ground_det(obj: dict, *, img_h: int = IMG_H) -> bool:
         return True
 
     if is_sky_phantom_bbox(obj, img_h=img_h) and pz > -0.30:
+        return False
+    if is_upper_corner_phantom(obj, img_h=img_h):
         return False
     return True
 
@@ -399,12 +495,14 @@ def _filter_plausible_simple(objects: list, camera: str) -> list:
         if float(px) < 0.12:
             continue
         if camera == "head":
+            if is_upper_corner_phantom(o):
+                continue
             if not is_valid_taskb_ground_det(o):
                 continue
             if is_head_floor_phantom(o) and int(o.get("cluster_pixels") or 0) > 2200:
                 continue
         if camera == "ee":
-            if is_ee_sky_blob(o) or is_ee_floor_phantom(o):
+            if is_upper_corner_phantom(o) or is_ee_sky_blob(o) or is_ee_floor_phantom(o):
                 continue
         out.append(o)
     return out

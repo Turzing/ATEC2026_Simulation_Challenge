@@ -60,6 +60,13 @@ try:
         is_ee_sky_blob,
         is_head_edge_phantom,
         is_sky_phantom_bbox,
+        is_blob_nav_det,
+        is_ransac_supplement,
+        blob_nav_pool,
+        TASKB_PIPELINE,
+        RANSAC_SUPPLEMENT_MAX_PX,
+        CLASS_AGNOSTIC,
+        apply_class_agnostic,
         parse_ee_rgbd,
         parse_head_rgbd,
         refresh_ee_object_pose,
@@ -87,6 +94,13 @@ except ImportError:
         is_ee_sky_blob,
         is_head_edge_phantom,
         is_sky_phantom_bbox,
+        is_blob_nav_det,
+        is_ransac_supplement,
+        blob_nav_pool,
+        TASKB_PIPELINE,
+        RANSAC_SUPPLEMENT_MAX_PX,
+        CLASS_AGNOSTIC,
+        apply_class_agnostic,
         parse_ee_rgbd,
         parse_head_rgbd,
         refresh_ee_object_pose,
@@ -281,6 +295,12 @@ def _finalize_head(o: dict, robot_pos, robot_yaw, grav) -> dict:
         out = align_nav_pos_to_bbox_ray(out, robot_pos, robot_yaw, cam_pos, HEAD_CAM, HEAD_CAM_ROT_MATRIX)
     out["camera"] = "head"
     out["role"] = "nav"
+    if is_blob_nav_det(out):
+        out["pipeline_tier"] = 1
+        out["gt_correctable"] = True
+        out.pop("skip_camera_correction", None)
+    elif is_ransac_supplement(out):
+        out["pipeline_tier"] = 3
     return _enrich_nav(out) or out
 
 
@@ -580,9 +600,12 @@ def _is_ee_phantom_near(ee_o: dict, head_objs: List[dict]) -> bool:
 
 def _filter_phantom_ee(ee_objs: List[dict], head_objs: List[dict]) -> List[dict]:
     if RGBD_SIMPLE:
+        from rgbd_utils import is_upper_corner_phantom
         return [
             eo for eo in ee_objs
-            if not is_ee_sky_blob(eo) and not is_ee_floor_phantom(eo)
+            if not is_upper_corner_phantom(eo)
+            and not is_ee_sky_blob(eo)
+            and not is_ee_floor_phantom(eo)
         ]
     kept = []
     for eo in ee_objs:
@@ -722,6 +745,12 @@ def _is_head_nav_unreliable(obj: dict) -> bool:
         return True
     if is_sky_phantom_bbox(obj):
         return True
+    try:
+        from rgbd_utils import is_upper_corner_phantom
+        if is_upper_corner_phantom(obj):
+            return True
+    except Exception:
+        pass
     if is_head_edge_phantom(obj):
         return True
     depth = float(obj.get("depth_m") or obj.get("nav_depth_m") or 99.0)
@@ -747,7 +776,7 @@ def _find_in_pool(
 ) -> Optional[dict]:
     if lock_id is not None:
         cands = [o for o in pool if int(o.get("id", -1)) == int(lock_id)]
-        if lock_class and not RGBD_SIMPLE:
+        if lock_class and not RGBD_SIMPLE and not CLASS_AGNOSTIC:
             cands = [o for o in cands if o.get("class") == lock_class]
         if cands:
             if lock_world is not None:
@@ -758,12 +787,12 @@ def _find_in_pool(
                     return None
                 return best
             return cands[0]
-    if lock_class and lock_world is not None:
+    if lock_class and lock_world is not None and not CLASS_AGNOSTIC:
         cands = [o for o in pool if o.get("class") == lock_class]
         if cands:
             ref = {"pos_world": lock_world}
             return min(cands, key=lambda o: _world_xy_dist(o, ref))
-    if lock_class:
+    if lock_class and not CLASS_AGNOSTIC:
         cands = [o for o in pool if o.get("class") == lock_class]
         if cands:
             return min(cands, key=_obj_dist)
@@ -783,7 +812,8 @@ def _resolve_live_lock_hit(
             by_id = _find_in_pool_by_id(pool, lock_id)
             if by_id is not None:
                 if (
-                    lock_class
+                    not CLASS_AGNOSTIC
+                    and lock_class
                     and by_id.get("class")
                     and by_id.get("class") != lock_class
                     and lock_world is not None
@@ -797,7 +827,7 @@ def _resolve_live_lock_hit(
     live = _find_in_pool(ee_objs, lock_id, lock_class, None)
     if live is not None:
         return live
-    if lock_class and lock_world is not None:
+    if lock_class and lock_world is not None and not CLASS_AGNOSTIC:
         ref = {"pos_world": lock_world}
         for pool in (head_objs, ee_objs):
             same = [o for o in pool if o.get("class") == lock_class]
@@ -806,6 +836,12 @@ def _resolve_live_lock_hit(
             near = [o for o in same if _world_xy_dist(o, ref) <= NAV_RELOCK_MAX_XY_M]
             if near:
                 return min(near, key=_obj_dist)
+    if CLASS_AGNOSTIC and lock_world is not None:
+        ref = {"pos_world": lock_world}
+        combined = list(head_objs) + list(ee_objs)
+        near = [o for o in combined if o.get("pos_world") is not None and _world_xy_dist(o, ref) <= NAV_RELOCK_MAX_XY_M]
+        if near:
+            return min(near, key=_obj_dist)
     return None
 
 
@@ -832,24 +868,35 @@ def _head_confirms_lock(
 ) -> bool:
     if lock_id is None or not head_objs:
         return False
-    if RGBD_SIMPLE:
+    if RGBD_SIMPLE or CLASS_AGNOSTIC:
         return _find_in_pool_by_id(head_objs, lock_id) is not None
     return _find_in_pool(head_objs, lock_id, lock_class, None) is not None
 
 
 def _can_acquire_nav_lock(seed: Optional[dict], head_objs: List[dict]) -> bool:
-    """必须 head 确认才首锁 (log: ee-only / 同类远距 head → 错锁转圈)."""
+    """必须 head blob 确认才首锁 (blob_gt_coast 管线)."""
     if seed is None or not head_objs:
+        return False
+    nav_pool = blob_nav_pool(head_objs) if TASKB_PIPELINE == "blob_gt_coast" else head_objs
+    if not nav_pool:
         return False
     if RGBD_SIMPLE:
         sid = seed.get("id")
-        if sid is not None and _find_in_pool_by_id(head_objs, sid) is not None:
+        if sid is not None and _find_in_pool_by_id(nav_pool, sid) is not None:
             return True
+        if _is_head_sourced(seed) and is_blob_nav_det(seed):
+            return True
+        if is_blob_nav_det(seed) or is_ransac_supplement(seed):
+            if CLASS_AGNOSTIC:
+                return True
+            return any(
+                o.get("class") == seed.get("class")
+                for o in nav_pool
+                if seed.get("class")
+            ) or is_blob_nav_det(seed)
         if _is_head_sourced(seed):
-            return True
-        if seed.get("class"):
-            return any(o.get("class") == seed.get("class") for o in head_objs)
-        return True
+            return _find_in_pool_by_id(nav_pool, sid) is not None if sid is not None else True
+        return False
     if _head_confirms_lock(head_objs, seed.get("id"), seed.get("class")):
         ho = _find_in_pool(head_objs, seed.get("id"), seed.get("class"), None)
         if ho is not None and seed.get("pos_world") and ho.get("pos_world"):
@@ -934,7 +981,7 @@ def _acquire_nav_lock(
             return False
         return True
 
-    head_cands = [o for o in head_objs if _eligible(o, False) and _near_preferred(o)]
+    head_cands = blob_nav_pool([o for o in head_objs if _eligible(o, False) and _near_preferred(o)])
     if prefer_class and head_cands:
         same_cls = [o for o in head_cands if o.get("class") == prefer_class]
         if same_cls:
@@ -943,12 +990,17 @@ def _acquire_nav_lock(
         best = min(head_cands, key=lambda o: _nav_lock_rank(o))
         out = dict(best)
         out["pos_confidence"] = float(best.get("pos_confidence") or head_nav_pos_confidence(best))
+        out["pipeline_tier"] = 1 if is_blob_nav_det(best) else 3
         return out
 
     if prefer_world is not None:
         return None
 
-    if head_nav is not None and _eligible(head_nav, False):
+    if head_nav is not None and _eligible(head_nav, False) and (
+        TASKB_PIPELINE != "blob_gt_coast"
+        or is_blob_nav_det(head_nav)
+        or is_ransac_supplement(head_nav)
+    ):
         return head_nav
     return None
 
@@ -982,6 +1034,8 @@ def _resolve_authoritative_target(
     """
     primary = NAV_AUTHORITY[nav_stage]
     fallback = NAV_FALLBACK[nav_stage]
+    if STATIC_TWO_STEP and TASKB_PIPELINE == "blob_gt_coast":
+        primary, fallback = "head", None
     pools = {"head": head_objs, "ee": ee_objs}
     navs = {"head": head_nav, "ee": ee_nav}
     has_lock = lock_id is not None
@@ -1265,6 +1319,8 @@ def _suppress_far_ee_nav_target(
     """无 head lock 时禁止 EE 3D 当 target_nav；改走 ee_search_hint."""
     if nav_tgt is None or nav_stage == "grasp":
         return nav_tgt
+    if nav_tgt.get("nav_coast") or str(nav_tgt.get("source_camera") or "") == "lock_coast":
+        return nav_tgt
     if nav_tgt.get("nav_from_head"):
         return nav_tgt
     if nav_lock_id is not None and _head_confirms_lock(head_objs, nav_lock_id, nav_tgt.get("class")):
@@ -1277,7 +1333,7 @@ def _suppress_far_ee_nav_target(
         return nav_tgt
     if _is_far_ee_nav_unreliable(nav_tgt) or _nav_dist_conservative(nav_tgt) > EE_BEARING_ONLY_MAX_M:
         return None
-    if not head_objs:
+    if not head_objs and nav_lock_id is None:
         return None
     return nav_tgt
 
@@ -1286,16 +1342,23 @@ def _sync_lock_id_from_head(
     lock_id: Optional[int],
     lock_class: Optional[str],
     head_objs: List[dict],
+    lock_world: Optional[List[float]] = None,
 ) -> Optional[int]:
     """head/ee tracker id 不一致时以 head 为准 (log: lock=3 head id=0)."""
     if lock_id is None or not head_objs:
         return lock_id
-    hit = _find_in_pool(head_objs, lock_id, lock_class, None)
+    hit = _find_in_pool(head_objs, lock_id, None if CLASS_AGNOSTIC else lock_class, None)
     if hit is not None:
         return int(hit["id"])
-    same = [o for o in head_objs if o.get("class") == lock_class]
-    if same:
-        return int(min(same, key=_obj_dist)["id"])
+    if CLASS_AGNOSTIC and lock_world is not None:
+        ref = {"pos_world": lock_world}
+        near = [o for o in head_objs if _world_xy_dist(o, ref) <= NAV_RELOCK_MAX_XY_M]
+        if near:
+            return int(min(near, key=_obj_dist)["id"])
+    if lock_class and not CLASS_AGNOSTIC:
+        same = [o for o in head_objs if o.get("class") == lock_class]
+        if same:
+            return int(min(same, key=_obj_dist)["id"])
     return lock_id
 
 
@@ -1328,9 +1391,8 @@ class RgbdPureDualPipeline:
         else:
             mode = "legacy-fusion"
         print(
-            f"[RgbdPureDual] {mode} | head-nav | "
-            f"ee={'static-ransac' if STATIC_TWO_STEP else 'grasp'} | "
-            f"coast={'off' if RGBD_SIMPLE else str(DETECTION_COAST_FRAMES) + 'f'} | "
+            f"[RgbdPureDual] pipeline={TASKB_PIPELINE} | {mode} | "
+            f"blob→GT→ransac≤{RANSAC_SUPPLEMENT_MAX_PX}px→lock_coast | "
             f"depth_cluster={_DEPTH_CLUSTER_BUILD} | "
             f"ransac={'ok' if self._ransac is not None else 'MISSING'}"
         )
@@ -1487,7 +1549,9 @@ class RgbdPureDualPipeline:
             head_objs = self._temporal.apply(head_objs, "head", rp, ry, motion)
             ee_objs = self._temporal.apply(ee_objs, "ee", rp, ry, motion)
         head_objs = [_finalize_head(o, rp, ry, grav) for o in head_objs]
+        head_objs = [apply_class_agnostic(o) for o in head_objs]
         ee_objs = [_finalize_ee(o, rp, ry, arm_q) for o in ee_objs]
+        ee_objs = [apply_class_agnostic(o) for o in ee_objs]
         if not RGBD_SIMPLE:
             head_objs = [self._pos_gate.apply(o, "head", rp, ry) for o in head_objs]
             ee_objs = [self._pos_gate.apply(o, "ee", rp, ry) for o in ee_objs]
@@ -1516,7 +1580,8 @@ class RgbdPureDualPipeline:
             ee_objs, self._nav_lock_id, self._nav_lock_class, self._nav_lock_world,
         )
         head_nav = _best_nav_target(
-            head_objs, self._nav_lock_id, self._nav_lock_class, self._nav_lock_world,
+            blob_nav_pool(head_objs) if TASKB_PIPELINE == "blob_gt_coast" else head_objs,
+            self._nav_lock_id, self._nav_lock_class, self._nav_lock_world,
         )
 
         lock_ref = _find_locked_target(
@@ -1530,7 +1595,7 @@ class RgbdPureDualPipeline:
 
         if self._nav_lock_id is not None and head_objs:
             synced = _sync_lock_id_from_head(
-                self._nav_lock_id, self._nav_lock_class, head_objs,
+                self._nav_lock_id, self._nav_lock_class, head_objs, self._nav_lock_world,
             )
             if synced is not None and int(synced) != int(self._nav_lock_id):
                 self._nav_lock_id = int(synced)
@@ -1544,7 +1609,8 @@ class RgbdPureDualPipeline:
             if live is not None and live.get("pos_world") is not None:
                 new_cls = live.get("class")
                 if (
-                    self._nav_lock_class
+                    not CLASS_AGNOSTIC
+                    and self._nav_lock_class
                     and new_cls
                     and new_cls != self._nav_lock_class
                 ):
@@ -1556,7 +1622,7 @@ class RgbdPureDualPipeline:
                     elif _world_xy_dist(live, {"pos_world": self._nav_lock_world or live["pos_world"]}) > 0.55:
                         live = None
                 self._nav_lock_id = int(live["id"])
-                if live.get("class") and (
+                if not CLASS_AGNOSTIC and live.get("class") and (
                     self._nav_lock_class is None or live.get("class") == self._nav_lock_class
                 ):
                     self._nav_lock_class = live.get("class")
@@ -1573,7 +1639,7 @@ class RgbdPureDualPipeline:
                 seed = None
             if seed is not None and _can_acquire_nav_lock(seed, head_objs):
                 self._nav_lock_id = int(seed["id"])
-                self._nav_lock_class = seed.get("class")
+                self._nav_lock_class = None if CLASS_AGNOSTIC else seed.get("class")
                 pw = seed.get("pos_world")
                 self._nav_lock_world = list(pw) if pw is not None else None
                 self._nav_lock_ee_only = (
@@ -1648,9 +1714,16 @@ class RgbdPureDualPipeline:
         if auth_tgt is not None and self._nav_lock_id is not None:
             if int(auth_tgt.get("id", -1)) != int(self._nav_lock_id):
                 auth_tgt = None
-            elif self._nav_lock_class and auth_tgt.get("class") != self._nav_lock_class:
-                if RGBD_SIMPLE and auth_tgt.get("class"):
-                    self._nav_lock_class = auth_tgt.get("class")
+            elif (
+                self._nav_lock_class
+                and auth_tgt.get("class")
+                and auth_tgt.get("class") != self._nav_lock_class
+            ):
+                same_cls = _find_in_pool(
+                    head_objs, self._nav_lock_id, self._nav_lock_class, self._nav_lock_world,
+                )
+                if same_cls is not None:
+                    auth_tgt = same_cls
                 else:
                     auth_tgt = None
 
@@ -1692,7 +1765,7 @@ class RgbdPureDualPipeline:
                 )
                 if seed is not None and _can_acquire_nav_lock(seed, head_objs):
                     self._nav_lock_id = int(seed["id"])
-                    self._nav_lock_class = seed.get("class")
+                    self._nav_lock_class = None if CLASS_AGNOSTIC else seed.get("class")
                     pw = seed.get("pos_world")
                     self._nav_lock_world = list(pw) if pw is not None else None
                 elif (
@@ -1820,6 +1893,7 @@ class RgbdPureDualPipeline:
             "nav_authority_mode": auth_mode,
             "nav_lock_id": self._nav_lock_id,
             "nav_lock_class": self._nav_lock_class,
+            "nav_lock_world": list(self._nav_lock_world) if self._nav_lock_world is not None else None,
             "nav_lock_ee_only": self._nav_lock_ee_only,
             "nav_lock_stable": self._nav_lock_id is not None and self._nav_lock_miss == 0,
             "nav_pos_confidence": None if nav_tgt is None else nav_tgt.get("pos_confidence"),
@@ -1891,14 +1965,20 @@ class RgbdPureDualPipeline:
             raw = self._ransac.detect(e_depth, rp, ry, nav_hint=nav_hint)
             ee_objs_raw = [_finalize_ee(o, rp, ry, arm_q) for o in raw]
             ee_objs_raw = filter_plausible_objects(ee_objs_raw, "ee")
+            ee_objs_raw = [apply_class_agnostic(o) for o in ee_objs_raw]
 
         grasp_tgt = ee_objs_raw[0] if ee_objs_raw else None
         if grasp_tgt is not None and nav_hint is not None:
-            hint_cls = nav_hint.get("class")
-            if hint_cls:
-                same = [o for o in ee_objs_raw if o.get("class") == hint_cls]
-                if same:
-                    grasp_tgt = same[0]
+            hint_w = nav_hint.get("pos_world")
+            if hint_w is not None and ee_objs_raw:
+                ref = {"pos_world": hint_w}
+                grasp_tgt = min(ee_objs_raw, key=lambda o: _world_xy_dist(o, ref))
+            elif not CLASS_AGNOSTIC:
+                hint_cls = nav_hint.get("class")
+                if hint_cls:
+                    same = [o for o in ee_objs_raw if o.get("class") == hint_cls]
+                    if same:
+                        grasp_tgt = same[0]
 
         ee_list = [_object_summary(o, "ee") for o in ee_objs_raw]
         return {

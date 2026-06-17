@@ -38,20 +38,23 @@ def _classify_cluster_rgb(
     bbox: List[int],
     z_extent: float,
 ) -> Tuple[str, float]:
+    from rgbd_utils import CLASS_AGNOSTIC, classify_taskb_simple
     x1, y1, x2, y2 = bbox
     bw, bh = max(1, x2 - x1 + 1), max(1, y2 - y1 + 1)
     aspect = bw / bh
     patch = rgb[max(0, y1):y2 + 1, max(0, x1):x2 + 1]
     if patch.size == 0:
-        return "sugar_box", 0.35
+        return "mustard_bottle", 0.78
 
     bgr = patch.reshape(-1, 1, 3).astype(np.uint8)
     hsv = cv2.cvtColor(bgr, cv2.COLOR_RGB2HSV).reshape(-1, 3)
     hue = float(np.median(hsv[:, 0]))
     sat = float(np.median(hsv[:, 1]))
     val = float(np.median(hsv[:, 2]))
-    yellow = 14 <= hue <= 46 and sat >= 24
+    if CLASS_AGNOSTIC:
+        return classify_taskb_simple(hue, sat, val, aspect, z_extent)
 
+    yellow = 14 <= hue <= 46 and sat >= 24
     if sat < 32 and val > 65 and aspect < 1.55:
         return "sugar_box", min(0.88, 0.70 + 0.06 * (32 - sat) / 32)
     if not yellow and aspect < 1.35:

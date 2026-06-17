@@ -700,9 +700,13 @@ class RgbdPureCamera:
         val_mean: float,
         z_extent: float,
     ) -> Tuple[str, float]:
+        from rgbd_utils import CLASS_AGNOSTIC, classify_taskb_simple
         x1, y1, x2, y2 = bbox
         bw, bh = max(1, x2 - x1 + 1), max(1, y2 - y1 + 1)
         aspect = bw / bh
+        if CLASS_AGNOSTIC:
+            return classify_taskb_simple(hue_mean, sat_mean, val_mean, aspect, z_extent)
+
         fill = area / max(bw * bh, 1)
         vert, horiz = bh >= bw * 1.10, bw >= bh * 1.10
         yellow = 15 <= hue_mean <= 45 and sat_mean >= 26
@@ -726,7 +730,7 @@ class RgbdPureCamera:
             scores["mustard_bottle"] += 0.38
         elif aspect < 1.15:
             scores["sugar_box"] += 0.40
-        if yellow and vert and sat >= 28:
+        if yellow and vert and sat_mean >= 28:
             return "mustard_bottle", min(0.91, 0.80 + 0.03 * (aspect - 1.0))
         if z_extent < 0.10 and aspect < 1.35:
             scores["sugar_box"] += 0.35
@@ -1170,6 +1174,22 @@ class RgbdPureCamera:
                     break
             if not dup:
                 kept.append(d)
+        if self.camera_name == "head":
+            from rgbd_utils import is_blob_nav_det, is_ransac_supplement, RANSAC_SUPPLEMENT_MAX_PX
+            blob_depths = [
+                float(d.get("depth_m") or 999.0)
+                for d in kept
+                if is_blob_nav_det(d)
+            ]
+            if blob_depths:
+                pruned = []
+                for d in kept:
+                    if is_ransac_supplement(d, max_px=RANSAC_SUPPLEMENT_MAX_PX):
+                        dm = float(d.get("depth_m") or 999.0)
+                        if any(abs(dm - bd) < 0.55 for bd in blob_depths):
+                            continue
+                    pruned.append(d)
+                kept = pruned
         return kept
 
     def _blob_det(
@@ -1304,7 +1324,7 @@ class RgbdPureCamera:
                 if pos_r is None:
                     return None
                 nav_point_count = int(len(ys))
-            if float(pos_r[2]) < -0.78 or float(pos_r[2]) > 0.28:
+            if float(pos_r[2]) < -0.82 or float(pos_r[2]) > 0.32:
                 return None
             if not simple and depth_m < 0.85 and sm < 58 and cy > h * 0.30 and abs(cx - w * 0.5) < w * 0.34:
                 return None
@@ -1349,6 +1369,8 @@ class RgbdPureCamera:
                 "source": "rgbd_nav_head",
                 "camera": "head",
                 "role": "nav",
+                "pipeline_tier": 1,
+                "gt_correctable": True,
                 "world_reliable": depth_f < WORLD_RELIABLE_DEPTH_M and pos_from_pc,
                 "grasp_reliable": False,
             }
@@ -1366,7 +1388,7 @@ class RgbdPureCamera:
             pos_r = self._pos_from_mask(ys, xs, depth, depth_m)
         if pos_r is None:
             return None
-        if float(pos_r[2]) < -0.78 or float(pos_r[2]) > 0.28:
+        if float(pos_r[2]) < -0.82 or float(pos_r[2]) > 0.32:
             return None
 
         # EE 抓取 anchor: bbox 底边中心 (贴地物体更准)
@@ -1492,6 +1514,8 @@ class RgbdPureCamera:
         dets = self._dets_from_mask(mask, rgb, depth, robot_pos, robot_yaw)
         for d in dets or []:
             d["head_far_fallback"] = True
+            d["pipeline_tier"] = 1
+            d["gt_correctable"] = True
         return dets
 
     def _detect_head_neutral_boxes(
@@ -1515,6 +1539,8 @@ class RgbdPureCamera:
         dets = self._dets_from_mask(mask, rgb, depth, robot_pos, robot_yaw)
         for d in dets or []:
             d["head_neutral_fallback"] = True
+            d["pipeline_tier"] = 1
+            d["gt_correctable"] = True
         return dets
 
     def _detect_head_depth_relief(
@@ -1524,15 +1550,17 @@ class RgbdPureCamera:
         h, w = depth.shape
         valid = self._valid_depth(depth, near=False) & (depth >= 0.95) & (depth <= 5.5)
         roi = np.zeros((h, w), dtype=bool)
-        roi[int(h * 0.05) : int(h * 0.62), int(w * 0.06) : int(w * 0.94)] = True
+        roi[int(h * 0.04) : int(h * 0.68), int(w * 0.04) : int(w * 0.96)] = True
         ground = self._ground_depth(depth, valid)
         relief = ground - depth
-        rmin = float(self._cfg.get("relief_min", 0.012)) * 0.50
+        rmin = float(self._cfg.get("relief_min", 0.012)) * 0.38
         mask = (roi & valid & (relief >= rmin) & (relief <= RELIEF_MAX)).astype(np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
         dets = self._dets_from_mask(mask, rgb, depth, robot_pos, robot_yaw)
         for d in dets or []:
             d["head_depth_fallback"] = True
+            d["pipeline_tier"] = 1
+            d["gt_correctable"] = True
         return dets
 
     def _detect_midfield_yellow(
@@ -1638,9 +1666,10 @@ class RgbdPureCamera:
                 ransac = self._depth_cluster.detect(
                     rgb, depth, np.asarray(robot_pos, dtype=np.float32), float(robot_yaw),
                 )
+                from rgbd_utils import is_ransac_supplement, RANSAC_SUPPLEMENT_MAX_PX
                 layers.extend(
                     d for d in (ransac or [])
-                    if int(d.get("cluster_pixels") or 0) <= 72
+                    if is_ransac_supplement(d, max_px=RANSAC_SUPPLEMENT_MAX_PX)
                 )
                 dets = self._prune_fallback_phantoms(self._merge_dets(layers))
             else:

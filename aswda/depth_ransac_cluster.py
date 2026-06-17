@@ -30,7 +30,9 @@ from rgbd_utils import (
     sanitize_depth,
 )
 
-PERCEPTION_RANSAC_BUILD = "20260617-taskb-head-v8"
+PERCEPTION_RANSAC_BUILD = "20260617-taskb-yellow-nav-v11"
+TASKB_PIPELINE_MODE = "blob_gt_coast"
+RANSAC_HEAD_SUPPLEMENT_PX = 72
 
 _CAM_CFG = {
     "head": {
@@ -439,7 +441,7 @@ class RansacClusterDetector:
             return False
         if float(pos_robot[2]) < z_lo or float(pos_robot[2]) > z_hi:
             return False
-        if self.camera_name == "head" and float(pos_robot[2]) > -0.20:
+        if self.camera_name == "head" and float(pos_robot[2]) > -0.10:
             return False
         return True
 
