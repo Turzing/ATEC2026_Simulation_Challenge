@@ -379,6 +379,47 @@ def is_head_floor_phantom(obj: dict, *, img_h: int = IMG_H, img_w: int = IMG_W) 
     return False
 
 
+def is_ee_gripper_phantom(obj: dict, *, img_h: int = IMG_H, img_w: int = IMG_W) -> bool:
+    """EE/head 画面底部夹爪/机械臂误检为黄物."""
+    if obj.get("grasp_reliable"):
+        return False
+    bbox = obj.get("bbox")
+    if not bbox or len(bbox) != 4:
+        return False
+    y1, y2 = float(bbox[1]), float(bbox[3])
+    cy = 0.5 * (y1 + y2)
+    depth = float(obj.get("depth_m") or obj.get("nav_depth_m") or 99.0)
+    if y2 >= img_h * 0.78 and depth < 2.4:
+        return True
+    if cy >= img_h * 0.70 and depth < 1.8:
+        sm = float(obj.get("blob_sat_mean") or 0.0)
+        if sm < 55:
+            return True
+    pr = obj.get("pos_robot")
+    if pr is not None and depth < 1.6:
+        try:
+            px = float(pr[0])
+        except (TypeError, ValueError, IndexError):
+            px = 99.0
+        if px < 1.35 and y2 >= img_h * 0.68:
+            return True
+    return False
+
+
+def is_head_body_phantom(obj: dict, *, img_h: int = IMG_H, img_w: int = IMG_W) -> bool:
+    """head 画面底部可见的本体/夹爪误检."""
+    if is_ee_gripper_phantom(obj, img_h=img_h, img_w=img_w):
+        return True
+    bbox = obj.get("bbox")
+    if not bbox or len(bbox) != 4:
+        return False
+    y2 = float(bbox[3])
+    depth = float(obj.get("depth_m") or obj.get("nav_depth_m") or 99.0)
+    if y2 >= img_h * 0.80 and depth < 2.5:
+        return True
+    return False
+
+
 def is_ee_floor_phantom(obj: dict, *, img_h: int = IMG_H, img_w: int = IMG_W) -> bool:
     """EE 地砖/空地板假 mustard (log: 0.94 conf 框内无物, pos_w≈[-9,-9.87])."""
     if obj.get("grasp_reliable"):
@@ -451,7 +492,8 @@ def is_head_sky_phantom(obj: dict, *, img_h: int = IMG_H, img_w: int = IMG_W) ->
     y1, y2 = float(bbox[1]), float(bbox[3])
     cy = 0.5 * (y1 + y2)
     cx = 0.5 * (float(bbox[0]) + float(bbox[2]))
-    if y2 < img_h * 0.36:
+    depth = float(obj.get("depth_m") or obj.get("nav_depth_m") or 99.0)
+    if y2 < img_h * 0.36 and depth < 1.35:
         return True
     if cy < img_h * 0.34 and cx > img_w * 0.48:
         return True
@@ -543,6 +585,12 @@ def _filter_minimal(objects: list, camera: str) -> list:
         if float(np.hypot(px, py)) < 0.05 and abs(py) < 0.10:
             continue
         if camera == "head" and is_head_sky_phantom(o):
+            continue
+        if camera == "head" and is_head_body_phantom(o):
+            continue
+        if camera == "ee" and is_ee_gripper_phantom(o):
+            continue
+        if camera == "ee" and is_ee_floor_phantom(o):
             continue
         out.append(o)
     return out

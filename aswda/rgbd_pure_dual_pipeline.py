@@ -602,12 +602,13 @@ def _is_ee_phantom_near(ee_o: dict, head_objs: List[dict]) -> bool:
 
 def _filter_phantom_ee(ee_objs: List[dict], head_objs: List[dict]) -> List[dict]:
     if RGBD_SIMPLE:
-        from rgbd_utils import is_upper_corner_phantom
+        from rgbd_utils import is_upper_corner_phantom, is_ee_gripper_phantom
         return [
             eo for eo in ee_objs
             if not is_upper_corner_phantom(eo)
             and not is_ee_sky_blob(eo)
             and not is_ee_floor_phantom(eo)
+            and not is_ee_gripper_phantom(eo)
         ]
     kept = []
     for eo in ee_objs:

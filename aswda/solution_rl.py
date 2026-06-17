@@ -2548,7 +2548,11 @@ class AlgSolution:
         source_camera = nav_info.get("target_source_camera") or nav_info.get("preferred_camera") or "none"
         stopped = bool(nav_info.get("stopped", False))
         target = nav_info.get("target")
-        target_label = "none" if target is None else f"{target.get('class', '?')}#{target.get('id', '?')}"
+        target_label = "none" if target is None else (
+            f"yellow#{target.get('id', '?')}"
+            if target.get("class_agnostic") or getattr(self, "class_agnostic", True)
+            else f"{target.get('class', '?')}#{target.get('id', '?')}"
+        )
         target_robot = None if target is None else target.get("pos_robot")
         target_world = None if target is None else target.get("pos_world")
         target_dist = float(nav_info.get("target_dist", 0.0))
@@ -2576,7 +2580,7 @@ class AlgSolution:
                 if bbox is not None and len(bbox) == 4:
                     x1, y1, x2, y2 = bbox
                     x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-                    obj_class = obj.get("class", "unknown")
+                    obj_class = "yellow" if obj.get("class_agnostic") else obj.get("class", "unknown")
                     conf = obj.get("conf", 0.0)
                     is_target = target is not None and obj.get("id") == target.get("id")
                     color = (0, 0, 255) if is_target else (0, 255, 0)

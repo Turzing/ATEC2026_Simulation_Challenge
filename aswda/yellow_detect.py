@@ -28,12 +28,14 @@ from rgbd_utils import classify_taskb_simple, is_head_sky_phantom, pixel_depth_t
 HUE_LO, HUE_HI = 6, 58
 SAT_MIN, VAL_MIN = 4, 20
 MIN_BLOB_PX_HEAD = 10
+MIN_BLOB_PX_HEAD_FAR = 6
 MIN_BLOB_PX_EE = 24
 MIN_SIDE = 3
 DEPTH_MIN, DEPTH_MAX = 0.08, 9.5
 EE_DEPTH_MIN, EE_DEPTH_MAX = 0.12, 1.65
 EE_NAV_DEPTH_MIN, EE_NAV_DEPTH_MAX = 0.85, 5.5
-MIN_BLOB_PX_EE_NAV = 8
+MIN_BLOB_PX_EE_NAV = 5
+EE_NAV_GRIPPER_V0 = 0.82
 MAX_BLOB_SIDE_HEAD = 240
 MAX_BLOB_SIDE_EE = 320
 MAX_BLOB_SIDE_EE_NAV = 420
@@ -68,6 +70,7 @@ def _yellow_mask(
     *,
     d_near: float = DEPTH_MIN,
     d_far: float = DEPTH_MAX,
+    adaptive: bool = True,
 ) -> np.ndarray:
     hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
     hue, sat, val = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
@@ -76,11 +79,27 @@ def _yellow_mask(
         & (hue >= HUE_LO) & (hue <= HUE_HI)
         & (sat >= SAT_MIN) & (val >= VAL_MIN)
     )
+    if adaptive:
+        roi_vals = roi & np.isfinite(val)
+        if int(np.sum(roi_vals)) > 120:
+            gs = float(np.percentile(sat[roi_vals], 38))
+            gv = float(np.percentile(val[roi_vals], 48))
+            rel = (
+                roi
+                & (hue >= HUE_LO) & (hue <= HUE_HI)
+                & (sat >= max(SAT_MIN, gs + 5.0))
+                & (val >= max(VAL_MIN, gv * 0.52))
+                & (val <= 252)
+            )
+            yellow = yellow | rel
     valid = (depth > d_near) & (depth < d_far) & np.isfinite(depth)
     vk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
     valid_near = cv2.dilate(valid.astype(np.uint8), vk, iterations=2).astype(bool)
     mask = (yellow & valid_near).astype(np.uint8)
-    return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    k = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    return mask
 
 
 def _robust_depth(ys: np.ndarray, xs: np.ndarray, depth: np.ndarray, *, bottom_frac: float = 0.72) -> Optional[float]:
@@ -121,20 +140,22 @@ def _points_from_blob(
 
 
 def _head_rois(h: int, w: int) -> List[np.ndarray]:
-    """近距地面 + 中远距地面 (不含天空带)."""
+    """近距地面 + 中距 + 远距 (不含天空带)."""
     ground = np.zeros((h, w), dtype=bool)
-    ground[int(h * 0.38) : int(h * 0.97), int(w * 0.01) : int(w * 0.99)] = True
+    ground[int(h * 0.34) : int(h * 0.97), int(w * 0.01) : int(w * 0.99)] = True
     mid = np.zeros((h, w), dtype=bool)
-    mid[int(h * 0.28) : int(h * 0.72), int(w * 0.01) : int(w * 0.99)] = True
-    return [ground, mid]
+    mid[int(h * 0.22) : int(h * 0.78), int(w * 0.01) : int(w * 0.99)] = True
+    far = np.zeros((h, w), dtype=bool)
+    far[int(h * 0.18) : int(h * 0.72), int(w * 0.01) : int(w * 0.99)] = True
+    return [ground, mid, far]
 
 
 def _head_blob_to_det(
     ys: np.ndarray, xs: np.ndarray, depth: np.ndarray, rgb: np.ndarray,
     robot_pos: np.ndarray, robot_yaw: float, img_h: int, img_w: int,
-    *, min_y2_frac: float,
+    *, min_y2_frac: float, min_px: int = MIN_BLOB_PX_HEAD,
 ) -> Optional[dict]:
-    if len(ys) < MIN_BLOB_PX_HEAD:
+    if len(ys) < min_px:
         return None
     x1, x2 = int(xs.min()), int(xs.max())
     y1, y2 = int(ys.min()), int(ys.max())
@@ -334,14 +355,15 @@ def detect_head_yellow(
     ry = float(robot_yaw)
     h, w = depth.shape[:2]
     rois = _head_rois(h, w)
-    min_y2 = [0.36, 0.28]
+    min_y2 = [0.34, 0.24, 0.18]
+    min_px = [MIN_BLOB_PX_HEAD, MIN_BLOB_PX_HEAD, MIN_BLOB_PX_HEAD_FAR]
     dets: List[dict] = []
-    for roi, y2f in zip(rois, min_y2):
+    for roi, y2f, mpx in zip(rois, min_y2, min_px):
         mask = _yellow_mask(rgb, depth, roi)
         labeled, n = ndimage.label(mask > 0)
         for cid in range(1, n + 1):
             ys, xs = np.where(labeled == cid)
-            det = _head_blob_to_det(ys, xs, depth, rgb, rp, ry, h, w, min_y2_frac=y2f)
+            det = _head_blob_to_det(ys, xs, depth, rgb, rp, ry, h, w, min_y2_frac=y2f, min_px=mpx)
             if det is not None:
                 dets.append(det)
     dets = _dedupe_dets(dets)
@@ -366,9 +388,11 @@ def _ee_blob_to_nav_det(
     x1, x2 = int(xs.min()), int(xs.max())
     y1, y2 = int(ys.min()), int(ys.max())
     bw, bh = x2 - x1 + 1, y2 - y1 + 1
-    if min(bw, bh) < 4 or max(bw, bh) > MAX_BLOB_SIDE_EE_NAV:
+    if min(bw, bh) < 3 or max(bw, bh) > MAX_BLOB_SIDE_EE_NAV:
         return None
-    if y2 < img_h * 0.14:
+    if y2 < img_h * 0.12:
+        return None
+    if y2 >= img_h * EE_NAV_GRIPPER_V0:
         return None
 
     depth_m = _robust_depth(ys, xs, depth, bottom_frac=0.70)
@@ -437,7 +461,7 @@ def detect_ee_yellow_nav(
     cp = np.asarray(cam_pos if cam_pos is not None else EE_CAM_POS_ROBOT, dtype=np.float32)
     h, w = depth.shape[:2]
     roi = np.zeros((h, w), dtype=bool)
-    roi[int(h * 0.08) : int(h * 0.97), int(w * 0.03) : int(w * 0.97)] = True
+    roi[int(h * 0.06) : int(h * EE_NAV_GRIPPER_V0), int(w * 0.02) : int(w * 0.98)] = True
     mask = _yellow_mask(rgb, depth, roi, d_near=EE_NAV_DEPTH_MIN, d_far=EE_NAV_DEPTH_MAX)
     labeled, n = ndimage.label(mask > 0)
     dets: List[dict] = []
@@ -464,7 +488,7 @@ def detect_ee_yellow(
     cp = np.asarray(cam_pos if cam_pos is not None else EE_CAM_POS_ROBOT, dtype=np.float32)
     h, w = depth.shape[:2]
     roi = np.zeros((h, w), dtype=bool)
-    roi[int(h * 0.06) : int(h * 0.96), int(w * 0.04) : int(w * 0.96)] = True
+    roi[int(h * 0.06) : int(h * EE_NAV_GRIPPER_V0), int(w * 0.04) : int(w * 0.96)] = True
     mask = _yellow_mask(rgb, depth, roi, d_near=EE_DEPTH_MIN, d_far=EE_DEPTH_MAX)
     labeled, n = ndimage.label(mask > 0)
     dets: List[dict] = []
