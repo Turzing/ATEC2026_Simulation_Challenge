@@ -245,6 +245,8 @@ class AlgSolution:
         self.grasp_heading_tolerance = float(os.getenv("ATEC_TASKB_GRASP_HEADING_TOL", "0.28"))
         self.static_two_step = os.getenv("ATEC_TASKB_STATIC_TWO_STEP", "1").lower() not in {"0", "false", "no"}
         self.class_agnostic = os.getenv("ATEC_TASKB_CLASS_AGNOSTIC", "1").lower() not in {"0", "false", "no"}
+        # GT 默认仅 [GT-CMP] 日志对比；不参与导航/抓取 (比赛不可用 GT)
+        self.gt_control_enabled = os.getenv("ATEC_TASKB_GT_CONTROL", "0").lower() not in {"0", "false", "no"}
         self.coarse_approach_dist = float(os.getenv("ATEC_TASKB_COARSE_APPROACH_DIST", "1.32"))
         self.static_perceive_settle_steps = max(3, int(os.getenv("ATEC_TASKB_STATIC_PERCEIVE_SETTLE", "8")))
         self.static_perceive_max_steps = max(10, int(os.getenv("ATEC_TASKB_STATIC_PERCEIVE_MAX_STEPS", "30")))
@@ -259,6 +261,7 @@ class AlgSolution:
             f"module={DEPTH_RANSAC_MODULE_PATH} repo={REPO_ROOT} "
             f"static_two_step={self.static_two_step} "
             f"class_agnostic={int(self.class_agnostic)} "
+            f"gt_control={int(self.gt_control_enabled)} "
             f"coarse_dist={self.coarse_approach_dist:.2f}m"
         )
         self.bin_drop_radius = float(os.getenv("ATEC_TASKB_BIN_DROP_RADIUS", "1.0"))
@@ -1212,9 +1215,14 @@ class AlgSolution:
                 f"lock={perception_output.get('nav_lock_id')}:{perception_output.get('nav_lock_class')} "
                 f"build={build} pose_source={pose_source}"
             )
-            if "v14" not in str(build) and "yellow-ground" not in str(build):
+            if "v14" not in str(build) and "yellow-ground" not in str(build) and "nav-lock" not in str(build) and "perc-only" not in str(build) and "v20" not in str(build):
                 self._log(
                     f"[PERC-WARN] 感知版本过旧 build={build} — 请同步 taskb_perception/ (期望 v14 yellow-ground)"
+                )
+            elif head_n == 0 and ee_n == 0 and cloud > 5000 and perception_output.get("nav_lock_id") is not None:
+                self._log(
+                    "[PERC-WARN] lock coast active but ee=0 head=0 — "
+                    "live HSV miss; check yellow_detect ROI / lock coast export"
                 )
             elif head_n == 0 and cloud > 5000 and int(hr.get("obj_pts") or 0) == 0:
                 self._log(
@@ -1598,7 +1606,7 @@ class AlgSolution:
             self._nav_stall_turn_rad = 0.0
             self._nav_stall_dist_start = None
         gt_err = self._gt_perc_xy_error(target_nav)
-        if self.static_two_step:
+        if self.static_two_step or not self.gt_control_enabled:
             gt_err = None
             self._phantom_gt_err_steps = 0
         if gt_err is not None and gt_err > self.grasp_gt_max_err:
@@ -2317,13 +2325,14 @@ class AlgSolution:
                     return target
                 self._clear_fuse_nav_lock(f"perc unreliable in static mode: {reason}")
                 return None
-            gt_target = self._build_gt_nav_target(target, robot_pos_world, robot_yaw)
-            if gt_target is not None:
-                self._log(f"[NAV] perc unreliable ({reason}), GT fallback nav")
-                self._fuse_lock_key = (gt_target.get("class"), "gt_fallback")
-                self._fuse_pos_world = self._safe_numpy(gt_target.get("pos_world"), pw.copy())
-                self._nav_heading_error_f = None
-                return gt_target
+            if self.gt_control_enabled:
+                gt_target = self._build_gt_nav_target(target, robot_pos_world, robot_yaw)
+                if gt_target is not None:
+                    self._log(f"[NAV] perc unreliable ({reason}), GT fallback nav")
+                    self._fuse_lock_key = (gt_target.get("class"), "gt_fallback")
+                    self._fuse_pos_world = self._safe_numpy(gt_target.get("pos_world"), pw.copy())
+                    self._nav_heading_error_f = None
+                    return gt_target
             self._clear_fuse_nav_lock(f"perc unreliable: {reason}")
             return None
         return target
@@ -2943,6 +2952,8 @@ class AlgSolution:
             return False, ""
         if not isinstance(target, dict):
             return False, ""
+        if not self.gt_control_enabled:
+            return False, ""
         cons_dist = self._conservative_target_dist(target, robot_pos_world)
         # 两步走粗导航: 近距不拿 GT 否决; 远距也放宽 (RANSAC/外参 Y 常偏 0.3~0.7m)
         if self.static_two_step and cons_dist <= self.coarse_approach_dist + 0.35:
@@ -3140,12 +3151,14 @@ class AlgSolution:
         )
 
     def _enrich_grasp_target_with_gt(self, target: dict[str, Any] | None) -> dict[str, Any] | None:
+        """默认不修改目标 — GT 仅用于 [GT-CMP] 日志。调试时可 ATEC_TASKB_GT_CONTROL=1."""
         if not isinstance(target, dict):
             return None
+        if not self.gt_control_enabled:
+            return dict(target)
         enriched = dict(target)
         gt = self._match_gt_for_target(target)
         if gt is not None:
-            # ArmGraspController 用 trash_target["id"] 查 scene，须映射为 object_N
             if target.get("id") is not None:
                 enriched["perception_id"] = target.get("id")
             scene_id = gt.get("id")
@@ -3936,17 +3949,16 @@ class AlgSolution:
                 lock_id = perception_output.get("nav_lock_id") if isinstance(perception_output, dict) else None
                 if self.static_two_step:
                     nav_phase = str(nav_info.get("phase", ""))
-                    close_enough = cons_dist <= self.coarse_approach_dist + 0.08
+                    close_enough = cons_dist <= self.coarse_approach_dist + 0.18
                     approach_ready = (
                         target_nav is not None
-                        and lock_id is not None
+                        and (lock_id is not None or target_nav.get("nav_coast"))
                         and dist_ok
                         and heading_ok
                         and close_enough
-                        and cons_dist <= self.coarse_approach_dist + 0.05
                         and (
                             bool(nav_info.get("stopped"))
-                            or nav_phase in ("refine_hold", "ready_to_grasp")
+                            or nav_phase in ("refine_hold", "ready_to_grasp", "near_refine")
                         )
                     )
                     if approach_ready:

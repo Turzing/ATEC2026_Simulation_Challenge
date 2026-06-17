@@ -1240,6 +1240,12 @@ def _export_ee_for_motion(
     if auth_tgt is not None and auth_cam == "head":
         return [_make_head_mirror(auth_tgt)]
 
+    if auth_tgt is not None:
+        return [_make_head_mirror(auth_tgt)]
+
+    if ee_objs:
+        return list(ee_objs)
+
     return []
 
 
@@ -1831,22 +1837,6 @@ class RgbdPureDualPipeline:
         if nav_stage == "grasp" and ee_near < HEAD_DISABLE_DIST_M:
             pass  # 保留 head_objects 供 motion fallback
 
-        ee_objs_raw = list(ee_objs)
-        ee_motion = _export_ee_for_motion(
-            ee_objs, head_objs, auth_tgt, auth_cam, nav_stage, auth_mode,
-        )
-        ee_motion = _ensure_ee_motion_export(
-            ee_motion, auth_tgt, auth_cam, head_nav, ee_nav,
-            head_objs, ee_objs_raw, nav_stage,
-        )
-
-        if head_objs:
-            self._last_head_objs = [dict(o) for o in head_objs]
-        if ee_motion:
-            self._last_ee_motion = [dict(o) for o in ee_motion]
-
-        ee_objs = ee_motion
-
         if (
             auth_tgt is None
             and self._nav_lock_id is not None
@@ -1862,6 +1852,24 @@ class RgbdPureDualPipeline:
             )
             auth_cam = "lock_coast"
             auth_mode = "coast"
+
+        ee_objs_raw = list(ee_objs)
+        ee_motion = _export_ee_for_motion(
+            ee_objs, head_objs, auth_tgt, auth_cam, nav_stage, auth_mode,
+        )
+        ee_motion = _ensure_ee_motion_export(
+            ee_motion, auth_tgt, auth_cam, head_nav, ee_nav,
+            head_objs, ee_objs_raw, nav_stage,
+        )
+        if not ee_motion and auth_tgt is not None:
+            ee_motion = [_make_head_mirror(auth_tgt)]
+
+        if head_objs:
+            self._last_head_objs = [dict(o) for o in head_objs]
+        if ee_motion:
+            self._last_ee_motion = [dict(o) for o in ee_motion]
+
+        ee_objs = ee_motion
 
         nav_cam, nav_objs, nav_tgt = _navigation_for_stage(
             nav_stage, auth_tgt, auth_cam, ee_motion, ee_objs_raw, head_objs, grasp_tgt,

@@ -41,7 +41,7 @@ MAX_BLOB_SIDE_EE = 320
 MAX_BLOB_SIDE_EE_NAV = 420
 HEAD_MAX_ROBOT_Z = -0.05
 EE_Z_LO, EE_Z_HI = -0.92, 0.18
-EE_NAV_Z_LO, EE_NAV_Z_HI = -1.15, 0.45
+EE_NAV_Z_LO, EE_NAV_Z_HI = -1.35, 0.55
 
 
 def _robot_to_world(p_robot: np.ndarray, robot_pos: np.ndarray, robot_yaw: float) -> np.ndarray:
@@ -410,7 +410,7 @@ def _ee_blob_to_nav_det(
     if pos_r is None:
         return None
     pz = float(pos_r[2])
-    if float(pos_r[0]) < -0.22 or pz < EE_NAV_Z_LO or pz > EE_NAV_Z_HI:
+    if float(pos_r[0]) < -0.35 or pz < EE_NAV_Z_LO or pz > EE_NAV_Z_HI:
         return None
 
     pos_w = _robot_to_world(pos_r, robot_pos, robot_yaw)
