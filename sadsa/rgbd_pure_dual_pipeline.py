@@ -245,6 +245,12 @@ def _as_head_nav(o: dict) -> dict:
 
 
 def _finalize_ee(o: dict, robot_pos, robot_yaw, arm_joints) -> dict:
+    if o.get("source") == "ransac_cluster" and o.get("pos_from_pointcloud"):
+        out = dict(o)
+        out["camera"] = "ee"
+        out["role"] = "nav_grasp"
+        out["skip_camera_correction"] = False
+        return _enrich_nav(out) or out
     cam_pos = compute_dynamic_ee_cam_pos(arm_joints) if arm_joints is not None else None
     if cam_pos is None:
         from config import EE_CAM_POS_ROBOT
@@ -257,6 +263,11 @@ def _finalize_ee(o: dict, robot_pos, robot_yaw, arm_joints) -> dict:
 
 
 def _finalize_head(o: dict, robot_pos, robot_yaw, grav) -> dict:
+    if o.get("source") == "ransac_cluster" and o.get("pos_from_pointcloud"):
+        out = dict(o)
+        out["camera"] = "head"
+        out["role"] = "nav"
+        return _enrich_nav(out) or out
     cam_pos = compute_dynamic_head_cam_pos(grav)
     out = refresh_head_object_pose(o, robot_pos, robot_yaw, cam_pos)
     if not out.get("pos_from_pointcloud"):
@@ -1738,6 +1749,12 @@ class RgbdPureDualPipeline:
             ) is None:
                 auth_tgt = None
 
+        if nav_tgt is None and STATIC_TWO_STEP:
+            if head_nav is not None:
+                nav_tgt = head_nav
+            elif head_objs:
+                nav_tgt = _best_nav_target(head_objs)
+
         use_grasp = want_grasp and nav_stage == "grasp" and grasp_tgt is not None
         grasp_objs = ee_objs_raw
         if auth_tgt is not None:
@@ -1789,6 +1806,10 @@ class RgbdPureDualPipeline:
             "world_reliable": bool(nav_tgt and nav_tgt.get("world_reliable")),
             "motion_level": motion,
             "depth_stats": head_meta.get("depth_stats") or depth_stats(h_depth),
+            "ransac_stats": {
+                "head": head_meta.get("ransac"),
+                "build": _DEPTH_CLUSTER_BUILD,
+            },
             "ee_depth_stats": ee_stats,
             "bin": {
                 "center_world": BIN_CENTER.tolist(),
@@ -1868,6 +1889,7 @@ class RgbdPureDualPipeline:
             "ee_count_raw": len(ee_objs_raw),
             "static_perceive": True,
             "ee_depth_stats": ee_stats,
+            "ee_ransac_stats": self._ransac.last_stats if self._ransac is not None else {},
             "robot": {"pos_world": self.robot_pos.tolist(), "yaw": self.robot_yaw},
         }
 

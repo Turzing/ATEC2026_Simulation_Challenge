@@ -25,12 +25,11 @@ from config import (
 )
 from rgbd_utils import (
     compute_dynamic_ee_cam_pos,
-    compute_dynamic_head_cam_pos,
     pixel_to_robot,
     sanitize_depth,
 )
 
-PERCEPTION_RANSAC_BUILD = "20260617-head-ransac-v1"
+PERCEPTION_RANSAC_BUILD = "20260617-head-ransac-v3"
 
 _CAM_CFG = {
     "head": {
@@ -41,14 +40,15 @@ _CAM_CFG = {
         "depth_max": 6.5,
         "pixel_step": 2,
         "ransac_iters": 200,
-        "ransac_thresh": 0.016,
-        "ransac_min_inl": 90,
-        "cluster_eps": 0.032,
-        "cluster_min_pts": 22,
+        "ransac_thresh": 0.018,
+        "ransac_min_inl": 55,
+        "cluster_eps": 0.034,
+        "cluster_min_pts": 10,
+        # 俯仰 head 看地面: 物体在图像下半区; robot_z 须含地面 (~-0.55)
         "roi_u": (0.06, 0.94),
-        "roi_v": (0.08, 0.72),
-        "robot_x_min": 0.25,
-        "robot_z": (-0.35, 0.50),
+        "roi_v": (0.08, 0.90),
+        "robot_x_min": 0.18,
+        "robot_z": (-0.68, 0.42),
         "role": "nav",
         "camera_label": "head",
     },
@@ -61,7 +61,7 @@ _CAM_CFG = {
         "pixel_step": 3,
         "ransac_iters": 180,
         "ransac_thresh": 0.014,
-        "ransac_min_inl": 120,
+        "ransac_min_inl": 75,
         "cluster_eps": 0.028,
         "cluster_min_pts": 35,
         "roi_u": (0.04, 0.96),
@@ -201,11 +201,10 @@ class RansacClusterDetector:
             self._projected_gravity = np.asarray(grav, dtype=np.float32).reshape(3)
 
     def _cam_pose(self) -> Tuple[dict, np.ndarray, np.ndarray]:
+        """head 粗导航用静态外参建点云; EE 静态抓取用臂关节动态外参."""
         c = self._cfg
         if self.camera_name == "ee" and self._arm_joints is not None:
             pos = compute_dynamic_ee_cam_pos(self._arm_joints)
-        elif self.camera_name == "head":
-            pos = compute_dynamic_head_cam_pos(self._projected_gravity)
         else:
             pos = c["pos_def"].copy()
         return c["cam"], pos.astype(np.float32), c["rot"].astype(np.float32)
@@ -213,7 +212,7 @@ class RansacClusterDetector:
     def _depth_to_cloud(
         self,
         depth: np.ndarray,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         depth = sanitize_depth(depth)
         h, w = depth.shape
         cam_cfg, cam_pos, cam_rot = self._cam_pose()
@@ -227,6 +226,7 @@ class RansacClusterDetector:
         pts: List[np.ndarray] = []
         us: List[float] = []
         vs: List[float] = []
+        z_cam: List[float] = []
         for v in range(v0, v1, step):
             for u in range(u0, u1, step):
                 z = float(depth[v, u])
@@ -240,13 +240,20 @@ class RansacClusterDetector:
                 pts.append(pr)
                 us.append(float(u))
                 vs.append(float(v))
+                z_cam.append(z)
         self._last_n_cloud = len(pts)
         if not pts:
-            return np.zeros((0, 3), dtype=np.float32), np.zeros(0), np.zeros(0)
+            return (
+                np.zeros((0, 3), dtype=np.float32),
+                np.zeros(0),
+                np.zeros(0),
+                np.zeros(0),
+            )
         return (
             np.stack(pts, axis=0).astype(np.float32),
             np.asarray(us, dtype=np.float32),
             np.asarray(vs, dtype=np.float32),
+            np.asarray(z_cam, dtype=np.float32),
         )
 
     def _grasp_quat(self, class_name: str, pos_world: np.ndarray, robot_pos: np.ndarray) -> np.ndarray:
@@ -262,6 +269,7 @@ class RansacClusterDetector:
         idx: np.ndarray,
         us: np.ndarray,
         vs: np.ndarray,
+        z_cam: np.ndarray,
         robot_pos: np.ndarray,
         robot_yaw: float,
         det_id: int,
@@ -274,8 +282,7 @@ class RansacClusterDetector:
         cu = float(np.median(us[idx]))
         cv = float(np.median(vs[idx]))
         dist_xy = float(np.linalg.norm(pos_robot[:2]))
-        cam_pos = self._cam_pose()[1]
-        depth_m = float(np.linalg.norm(cpts - cam_pos, axis=1).min())
+        depth_m = float(np.median(z_cam[idx]))
         yaw_rel = float(np.arctan2(pos_robot[1], pos_robot[0]))
         x1, x2 = int(us[idx].min()), int(us[idx].max())
         y1, y2 = int(vs[idx].min()), int(vs[idx].max())
@@ -335,7 +342,7 @@ class RansacClusterDetector:
         nav_hint: Optional[dict] = None,
     ) -> List[dict]:
         c = self._cfg
-        points, us, vs = self._depth_to_cloud(depth)
+        points, us, vs, z_cam = self._depth_to_cloud(depth)
         if len(points) < int(c["ransac_min_inl"]) + int(c["cluster_min_pts"]):
             self._last_n_clusters = 0
             return []
@@ -350,6 +357,7 @@ class RansacClusterDetector:
         obj_pts = points[obj_mask]
         obj_us = us[obj_mask]
         obj_vs = vs[obj_mask]
+        obj_z = z_cam[obj_mask]
         if len(obj_pts) < int(c["cluster_min_pts"]):
             self._last_n_clusters = 0
             return []
@@ -366,7 +374,7 @@ class RansacClusterDetector:
             self._track_id += 1
             dets.append(
                 self._cluster_to_det(
-                    obj_pts, members, obj_us, obj_vs,
+                    obj_pts, members, obj_us, obj_vs, obj_z,
                     robot_pos, robot_yaw, self._track_id,
                 )
             )

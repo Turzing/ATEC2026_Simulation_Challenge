@@ -25,6 +25,11 @@ from rgbd_pure_dual_pipeline import RgbdPureDualPipeline
 from rgbd_utils import depth_to_vis, parse_ee_rgbd, parse_head_rgbd, depth_stats
 
 try:
+    from depth_ransac_cluster import PERCEPTION_RANSAC_BUILD
+except ImportError:
+    PERCEPTION_RANSAC_BUILD = "missing-depth_ransac_cluster"
+
+try:
     from .solution_gt import ArmGraspController, LegPostureController
 except Exception:
     from solution_gt import ArmGraspController, LegPostureController
@@ -241,6 +246,11 @@ class AlgSolution:
         self.static_perceive_max_steps = max(10, int(os.getenv("ATEC_TASKB_STATIC_PERCEIVE_MAX_STEPS", "30")))
         self._static_nav_hint: dict[str, Any] | None = None
         self._static_perceive_steps = 0
+        self._log(
+            f"[TaskB-PERCEPTION] build={PERCEPTION_RANSAC_BUILD} "
+            f"static_two_step={self.static_two_step} "
+            f"coarse_dist={self.coarse_approach_dist:.2f}m"
+        )
         self.bin_drop_radius = float(os.getenv("ATEC_TASKB_BIN_DROP_RADIUS", "1.0"))
         self.release_steps = max(1, int(os.getenv("ATEC_TASKB_RELEASE_STEPS", "25")))
         self.default_bin_center = np.asarray(BIN_CENTER, dtype=np.float32)
@@ -881,7 +891,7 @@ class AlgSolution:
             if not self._perception_error_printed:
                 self._log(
                     f"[TaskB-PERCEPTION] process failed: {type(exc).__name__}: {exc} "
-                    "(check taskb_perception/rgbd_depth_cluster.py has 'h, w = depth.shape[:2]' in detect())"
+                    f"(sync taskb_perception/, expect build={PERCEPTION_RANSAC_BUILD})"
                 )
                 self._perception_error_printed = True
             perception_output = None
@@ -904,8 +914,11 @@ class AlgSolution:
                 return False
             if obj.get("nav_from_head"):
                 return True
-            src = str(obj.get("source_camera") or obj.get("source") or "")
-            return "head" in src.lower()
+            cam = str(obj.get("camera") or obj.get("source_camera") or "").lower()
+            if cam == "head":
+                return True
+            src = str(obj.get("source_camera") or obj.get("source") or "").lower()
+            return "head" in src
 
         # 获取 EE 相机真实位姿并校正 (跳过 head mirror，由 head 相机校正)
         ee_cam_pose = self._get_ground_truth_camera_pose("ee_camera", robot_pos, robot_yaw)
@@ -1153,13 +1166,30 @@ class AlgSolution:
         all_objects = self._collect_pipeline_objects(perception_output, robot_pos_world, robot_yaw)
         
         if self._step_count % 10 == 0:
+            rs = perception_output.get("ransac_stats") or {}
+            hr = rs.get("head") if isinstance(rs.get("head"), dict) else {}
+            build = rs.get("build", PERCEPTION_RANSAC_BUILD)
+            head_n = len(perception_output.get("head_objects") or [])
+            ee_n = len(perception_output.get("ee_objects") or [])
+            cloud = int(hr.get("cloud_pts") or 0)
+            clusters = int(hr.get("clusters") or 0)
             self._log(
                 "[PERC] "
                 f"phase={perception_output.get('phase')} "
-                f"ee={len(perception_output.get('ee_objects') or [])} "
-                f"head={len(perception_output.get('head_objects') or [])} "
-                f"pose_source={pose_source}"
+                f"ee={ee_n} head={head_n} "
+                f"cloud={cloud} clusters={clusters} "
+                f"lock={perception_output.get('nav_lock_id')}:{perception_output.get('nav_lock_class')} "
+                f"build={build} pose_source={pose_source}"
             )
+            if head_n == 0 and cloud > 80 and clusters == 0:
+                self._log(
+                    "[PERC-WARN] head cloud>0 but no clusters — "
+                    "RANSAC table OK but objects not separated (tune cluster_eps/min_pts)"
+                )
+            elif head_n == 0 and cloud == 0 and self._step_count > 50:
+                self._log(
+                    "[PERC-WARN] head cloud=0 — check depth / robot_z ROI in depth_ransac_cluster.py"
+                )
         
         if target_nav is not None and self._step_count % 10 == 0:
             pos_w = target_nav.get("pos_world")
@@ -1209,6 +1239,8 @@ class AlgSolution:
         )
 
     def _dynamic_stop_distance_for_target(self, target_nav: dict[str, Any]) -> float:
+        if self.static_two_step:
+            return max(0.48, self.coarse_approach_dist - 0.42)
         target_dist = self._conservative_target_dist(target_nav)
         if target_dist <= self.target_near_range:
             return self.dynamic_stop_distance_near
@@ -1308,7 +1340,18 @@ class AlgSolution:
             phase = "far_approach"
 
         stopped = False
-        if goal_dist <= self.object_stop_tolerance and abs(heading_error) <= self.object_yaw_tolerance:
+        cons_dist = self._conservative_target_dist(target_nav)
+        if self.static_two_step:
+            if (
+                cons_dist <= self.coarse_approach_dist + 0.14
+                and abs(heading_error) <= self.grasp_heading_tolerance * 1.25
+            ):
+                lin_x = 0.0
+                lin_y = 0.0
+                ang_z = 0.0
+                stopped = True
+                phase = "refine_hold"
+        elif goal_dist <= self.object_stop_tolerance and abs(heading_error) <= self.object_yaw_tolerance:
             lin_x = 0.0
             lin_y = 0.0
             ang_z = 0.0
@@ -1317,7 +1360,10 @@ class AlgSolution:
 
         if stopped and phase == "refine_hold":
             stage_dist = self._grasp_stage_dist(target_nav)
-            if (
+            if self.static_two_step:
+                if cons_dist <= self.coarse_approach_dist + 0.12:
+                    phase = "ready_to_grasp"
+            elif (
                 stage_dist <= self.grasp_start_depth + 0.10
                 and abs(heading_error) <= self.grasp_heading_tolerance
             ):
@@ -1470,25 +1516,28 @@ class AlgSolution:
             target_nav,
             robot_pos_world,
         ):
-            self._log(
-                f"[NAV] turn stall ({self._nav_stall_turn_rad:.2f}rad, "
-                f"dist={nav_info.get('target_dist', 0):.2f}m), unlock and search"
-            )
-            self._clear_fuse_nav_lock("turn stall")
-            self._clear_frozen_pregrasp()
+            if not (self.static_two_step and len((self._last_perception_output or {}).get("head_objects") or []) > 0):
+                self._log(
+                    f"[NAV] turn stall ({self._nav_stall_turn_rad:.2f}rad, "
+                    f"dist={nav_info.get('target_dist', 0):.2f}m), unlock and search"
+                )
+                self._clear_fuse_nav_lock("turn stall")
+                self._clear_frozen_pregrasp()
+                self._nav_stall_turn_rad = 0.0
+                self._nav_stall_dist_start = None
+                search_cmd = self._compute_search_cmd(self._last_perception_output)
+                search_info = {
+                    "phase": "search_stall_recovery",
+                    "target": None,
+                    "target_dist": 0.0,
+                    "goal_dist": 0.0,
+                    "heading_error": 0.0,
+                    "stopped": False,
+                    "searching": True,
+                }
+                return search_cmd, search_info
             self._nav_stall_turn_rad = 0.0
             self._nav_stall_dist_start = None
-            search_cmd = self._compute_search_cmd(self._last_perception_output)
-            search_info = {
-                "phase": "search_stall_recovery",
-                "target": None,
-                "target_dist": 0.0,
-                "goal_dist": 0.0,
-                "heading_error": 0.0,
-                "stopped": False,
-                "searching": True,
-            }
-            return search_cmd, search_info
         gt_err = self._gt_perc_xy_error(target_nav)
         if self.static_two_step:
             head_n = len((self._last_perception_output or {}).get("head_objects") or [])
@@ -1496,8 +1545,9 @@ class AlgSolution:
                 gt_err = None
         if gt_err is not None and gt_err > self.grasp_gt_max_err:
             self._phantom_gt_err_steps += 1
+            phantom_limit = 28 if self.static_two_step else 12
             if (
-                self._phantom_gt_err_steps >= 12
+                self._phantom_gt_err_steps >= phantom_limit
                 and str(nav_info.get("phase", "")) in ("near_refine", "turn_to_target", "refine_hold")
             ):
                 self._log(f"[NAV] phantom lock gt_err={gt_err:.2f}m, unlock and search")
@@ -1937,8 +1987,58 @@ class AlgSolution:
                 return section.get("target")
         return None
 
+    def _fallback_nav_target(
+        self,
+        perception_output: dict[str, Any],
+        robot_pos_world: np.ndarray,
+        robot_yaw: float,
+    ) -> dict[str, Any] | None:
+        """融合层丢目标时: 用感知 raw target_nav 或最近 head 检测兜底, 避免盲转."""
+        raw = perception_output.get("target_nav")
+        if isinstance(raw, dict) and raw.get("pos_world") is not None:
+            prep = self._prepare_pipeline_object(
+                raw,
+                str(raw.get("camera") or raw.get("source_camera") or "head"),
+                robot_pos_world,
+                robot_yaw,
+            )
+            if prep is not None:
+                return prep
+
+        heads = perception_output.get("head_objects") or []
+        if heads:
+            best = min(
+                heads,
+                key=lambda o: float(
+                    o.get("depth_m") or o.get("dist_to_robot") or o.get("nav_depth_m") or 999.0
+                ),
+            )
+            prep = self._prepare_pipeline_object(best, "head", robot_pos_world, robot_yaw)
+            if prep is not None:
+                prep["confirmed"] = False
+                prep["visible"] = True
+                return prep
+        return None
+
     def _compute_search_cmd(self, perception_output: dict[str, Any] | None) -> np.ndarray:
-        """head 无 lock 时用 EE 方位转向+慢走，避免盲转或跟 EE 错 3D."""
+        """head 无 lock 时优先朝 head 检测转向+慢走, 减少盲转圈."""
+        if isinstance(perception_output, dict):
+            heads = perception_output.get("head_objects") or []
+            if heads:
+                best = min(
+                    heads,
+                    key=lambda o: float(
+                        o.get("depth_m") or o.get("dist_to_robot") or o.get("nav_depth_m") or 999.0
+                    ),
+                )
+                pr = self._safe_numpy(best.get("pos_robot"), np.zeros(3, dtype=np.float32))
+                if float(np.linalg.norm(pr[:2])) > 0.12:
+                    bearing = float(math.atan2(pr[1], pr[0]))
+                    ang = float(np.clip(bearing * self.heading_kp, -0.55, 0.55))
+                    lin = 0.24 if abs(bearing) < 0.55 else 0.10
+                    self._search_turn_accum = 0.0
+                    return np.array([lin, 0.0, ang], dtype=np.float32)
+
         hint = (perception_output or {}).get("ee_search_hint")
         if isinstance(hint, dict) and hint.get("bearing_only") and hint.get("yaw_rel") is not None:
             self._search_turn_accum = 0.0
@@ -2088,9 +2188,10 @@ class AlgSolution:
         unreliable, reason = self._perception_nav_unreliable(target, robot_pos_world)
         if unreliable:
             if self.static_two_step:
-                # 不用 GT 把目标拉到身后物体 (log: err=-2.8rad 转圈)
                 pr = self._safe_numpy(target.get("pos_robot"), np.zeros(3, dtype=np.float32))
-                if float(pr[0]) > 0.08:
+                if float(pr[0]) > 0.05:
+                    return target
+                if perception_output.get("nav_lock_stable") and len(perception_output.get("head_objects") or []) > 0:
                     return target
                 self._clear_fuse_nav_lock(f"perc unreliable in static mode: {reason}")
                 return None
@@ -2115,7 +2216,11 @@ class AlgSolution:
 
         phase = str(perception_output.get("phase", "approach"))
         active = perception_output.get("active_camera")
-        if active in ("head", "ee"):
+        if self.static_two_step and self._task_state in (
+            "APPROACH_OBJECT", "CROUCHING", "STATIC_PERCEIVE", "NAV_TO_BIN",
+        ):
+            preferred_camera = "head"
+        elif active in ("head", "ee"):
             preferred_camera = str(active)
         else:
             preferred_camera = "ee" if phase == "grasp" else "head"
@@ -2128,6 +2233,8 @@ class AlgSolution:
         fallback_candidates = self._normalize_camera_objects(fallback_raw, fallback_camera, robot_pos_world, robot_yaw)
 
         target = self._fuse_perception_target(perception_output, robot_pos_world, robot_yaw)
+        if target is None:
+            target = self._fallback_nav_target(perception_output, robot_pos_world, robot_yaw)
         ee_hint = perception_output.get("ee_search_hint")
         bearing_only = isinstance(ee_hint, dict) and bool(ee_hint.get("bearing_only"))
         if target is None and perception_output.get("nav_lock_id") is None and not bearing_only:
@@ -2709,6 +2816,9 @@ class AlgSolution:
         if not isinstance(target, dict):
             return False, ""
         cons_dist = self._conservative_target_dist(target, robot_pos_world)
+        # 两步走粗导航: 近距不拿 GT 否决, 避免锁错目标后一直转圈/罚站
+        if self.static_two_step and cons_dist <= self.coarse_approach_dist + 0.35:
+            return False, ""
         if cons_dist <= 1.15:
             return False, ""
         gt_err = self._gt_perc_xy_error(target)
@@ -3154,8 +3264,6 @@ class AlgSolution:
 
         return action_env
 
-        return True
-
     def _start_crouch_for_static_approach(
         self,
         target_nav: dict[str, Any],
@@ -3213,16 +3321,24 @@ class AlgSolution:
                 gt_robot_yaw=gt_yaw,
             )
             self._correct_ee_camera_objects(out, gt_pos, gt_yaw)
+            ee_stats = out.get("ee_ransac_stats") or {}
             tg = out.get("target_grasp")
             if isinstance(tg, dict):
                 self._log(
                     "[TaskB-STATIC] RANSAC hit "
                     f"id={tg.get('id')} class={tg.get('class')} "
                     f"pos_w={np.asarray(tg.get('pos_world'), dtype=np.float32).round(3).tolist()} "
-                    f"n_ee={len(out.get('ee_objects') or [])}"
+                    f"grasp_w={np.asarray(tg.get('grasp_pos_world'), dtype=np.float32).round(3).tolist()} "
+                    f"n_ee={len(out.get('ee_objects') or [])} "
+                    f"cloud={ee_stats.get('cloud_pts', 0)} clusters={ee_stats.get('clusters', 0)} "
+                    f"pose_source={tg.get('pose_source', 'ransac')}"
                 )
             else:
-                self._log(f"[TaskB-STATIC] RANSAC miss (ee_n={len(out.get('ee_objects') or [])})")
+                self._log(
+                    "[TaskB-STATIC] RANSAC miss "
+                    f"(ee_n={len(out.get('ee_objects') or [])} "
+                    f"cloud={ee_stats.get('cloud_pts', 0)} clusters={ee_stats.get('clusters', 0)})"
+                )
             return out
         except Exception as exc:
             self._log(f"[TaskB-STATIC] static perceive failed: {type(exc).__name__}: {exc}")
@@ -3307,6 +3423,8 @@ class AlgSolution:
                 robot_yaw,
             )
             nav_input, target_nav = self._adapt_perception_output(obs, local_nav, perception_output)
+            if target_nav is None:
+                target_nav = self._fallback_nav_target(perception_output, robot_pos_world, robot_yaw)
             if target_nav is not None:
                 self._search_turn_accum = 0.0
 
@@ -3636,24 +3754,33 @@ class AlgSolution:
                     )
                 perception_phase = None if perception_output is None else str(perception_output.get("phase", "approach"))
                 cons_dist = self._grasp_stage_dist(target_nav, robot_pos_world)
-                dist_ok = cons_dist <= self.coarse_approach_dist if self.static_two_step else self._grasp_range_ok(
+                dist_ok = cons_dist <= self.coarse_approach_dist + 0.18 if self.static_two_step else self._grasp_range_ok(
                     target_nav, robot_pos_world, cons_dist,
                 )
-                heading_ok = abs(float(nav_info.get("heading_error") or 999.0)) <= self.grasp_heading_tolerance
+                heading_ok = abs(float(nav_info.get("heading_error") or 999.0)) <= self.grasp_heading_tolerance * 1.35
                 lock_id = perception_output.get("nav_lock_id") if isinstance(perception_output, dict) else None
                 if self.static_two_step:
+                    nav_phase = str(nav_info.get("phase", ""))
+                    close_enough = cons_dist <= self.coarse_approach_dist + 0.12
                     approach_ready = (
                         target_nav is not None
-                        and lock_id is not None
+                        and (lock_id is not None or len(perception_output.get("head_objects") or []) > 0)
                         and dist_ok
                         and heading_ok
-                        and bool(nav_info.get("stopped"))
-                        and str(nav_info.get("phase", "")) in ("ready_to_grasp", "refine_hold")
+                        and close_enough
+                        and (
+                            bool(nav_info.get("stopped"))
+                            or nav_phase in ("refine_hold", "ready_to_grasp", "near_refine")
+                        )
                     )
                     if approach_ready:
                         base_cmd = np.zeros(3, dtype=np.float32)
                         nav_info["phase"] = "start_static_crouch"
                         nav_info["stopped"] = True
+                        self._log(
+                            "[TaskB-STATIC] coarse nav done → crouch "
+                            f"dist={cons_dist:.2f}m phase={nav_phase} lock={lock_id}"
+                        )
                         self._start_crouch_for_static_approach(target_nav, perception_output)
                 else:
                     matched_grasp_target = self._select_grasp_target(
