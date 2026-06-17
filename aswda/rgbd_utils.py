@@ -336,34 +336,49 @@ def _is_head_fallback_det(obj: dict) -> bool:
     )
 
 
+def is_valid_taskb_ground_det(obj: dict, *, img_h: int = IMG_H) -> bool:
+    """
+    Task B 平地垃圾: 用 robot 系 3D 高度判断是否在地面, 不用 bbox 上下位置.
+    head 俯拍时远距物体在画面上方 (小 v), 不能用 is_sky_phantom_bbox 误杀.
+    """
+    pr = obj.get("pos_robot")
+    if pr is None:
+        return False
+    try:
+        px, py, pz = float(pr[0]), float(pr[1]), float(pr[2])
+    except (TypeError, ValueError, IndexError):
+        return False
+    if px < 0.22 or px > 8.5:
+        return False
+    if pz < -0.82 or pz > -0.04:
+        return False
+    if float(np.hypot(px, py)) < 0.10:
+        return False
+
+    if obj.get("head_far_fallback") or obj.get("head_depth_fallback") or obj.get("head_neutral_fallback"):
+        return True
+
+    src = str(obj.get("source") or "")
+    if src == "ransac_cluster":
+        pixels = int(obj.get("cluster_pixels") or 0)
+        extent = obj.get("geom_extent")
+        max_ext = float(max(extent)) if isinstance(extent, (list, tuple)) and extent else 0.0
+        if pz > -0.10:
+            return False
+        if pixels > 520 or max_ext > 1.05:
+            return False
+        return True
+
+    if is_sky_phantom_bbox(obj, img_h=img_h) and pz > -0.30:
+        return False
+    return True
+
+
 def is_head_ransac_phantom(obj: dict, *, img_h: int = IMG_H, img_w: int = IMG_W) -> bool:
-    """RANSAC head 假检: 天空框 / 超大簇 / 非地面高度."""
+    """RANSAC head 假检: 仅杀悬空/超大簇 (不杀远距地面上方像素)."""
     if str(obj.get("source") or "") != "ransac_cluster":
         return False
-    if is_sky_phantom_bbox(obj, img_h=img_h):
-        return True
-    pixels = int(obj.get("cluster_pixels") or 0)
-    if pixels > 340:
-        return True
-    extent = obj.get("geom_extent")
-    if isinstance(extent, (list, tuple)) and len(extent) >= 3:
-        if float(max(extent)) > 0.62:
-            return True
-    pr = obj.get("pos_robot")
-    if pr is not None:
-        try:
-            pz = float(pr[2])
-        except (TypeError, ValueError, IndexError):
-            pz = 0.0
-        if pz > -0.18:
-            return True
-    bbox = obj.get("bbox")
-    if bbox and len(bbox) == 4:
-        cy = 0.5 * (float(bbox[1]) + float(bbox[3]))
-        depth = float(obj.get("depth_m") or obj.get("nav_depth_m") or 99.0)
-        if cy < img_h * 0.30 and depth > 2.0:
-            return True
-    return False
+    return not is_valid_taskb_ground_det(obj, img_h=img_h)
 
 
 def _filter_plausible_simple(objects: list, camera: str) -> list:
@@ -384,7 +399,7 @@ def _filter_plausible_simple(objects: list, camera: str) -> list:
         if float(px) < 0.12:
             continue
         if camera == "head":
-            if is_sky_phantom_bbox(o) or is_head_ransac_phantom(o):
+            if not is_valid_taskb_ground_det(o):
                 continue
             if is_head_floor_phantom(o) and int(o.get("cluster_pixels") or 0) > 2200:
                 continue

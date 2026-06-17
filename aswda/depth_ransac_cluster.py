@@ -29,7 +29,7 @@ from rgbd_utils import (
     sanitize_depth,
 )
 
-PERCEPTION_RANSAC_BUILD = "20260617-head-ransac-v5"
+PERCEPTION_RANSAC_BUILD = "20260617-taskb-head-v6"
 
 _CAM_CFG = {
     "head": {
@@ -44,8 +44,8 @@ _CAM_CFG = {
         "ransac_min_inl": 40,
         "cluster_eps": 0.038,
         "cluster_min_pts": 6,
-        "max_cluster_pts": 320,
-        "max_cluster_extent_m": 0.58,
+        "max_cluster_pts": 480,
+        "max_cluster_extent_m": 0.85,
         # 远距搜索: 物体在画面上半/下半都可能出现; robot_z 须含地面 (~-0.55)
         "roi_u": (0.02, 0.98),
         "roi_v": (0.02, 0.98),

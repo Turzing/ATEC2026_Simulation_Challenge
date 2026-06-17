@@ -1186,9 +1186,14 @@ class AlgSolution:
                 f"lock={perception_output.get('nav_lock_id')}:{perception_output.get('nav_lock_class')} "
                 f"build={build} pose_source={pose_source}"
             )
-            if "v5" not in str(build) and "v4" not in str(build):
+            if "v6" not in str(build) and "v5" not in str(build):
                 self._log(
-                    f"[PERC-WARN] 感知版本过旧 build={build} — 请同步 depth_ransac_cluster.py (期望 v5)"
+                    f"[PERC-WARN] 感知版本过旧 build={build} — 请同步 taskb_perception/ (期望 v6 taskb-head)"
+                )
+            elif head_n == 0 and int(hr.get("clusters") or 0) > 0:
+                self._log(
+                    "[PERC-WARN] RANSAC clusters>0 but head=0 — "
+                    "check is_valid_taskb_ground_det / relief merge in rgbd_pure_pipeline.py"
                 )
             if head_n == 0 and cloud > 80 and obj_pts > 12 and clusters == 0:
                 self._log(
