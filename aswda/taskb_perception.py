@@ -1,10 +1,10 @@
 """
-Task B 感知层
+Task B 感知 — 符合官网传感器定义
 
-  EE   → 3D 导航坐标 (点云反投影, 与当前臂姿外参一致)
-  head → 3D 抓取坐标 (点云顶面)
+  ee   (eye-in-hand)  → 远距导航 + 发现目标 (俯视视野远)
+  head (eye-to-hand)  → 近距确认 + 抓取 3D
 
-只改本文件 + rgbd_utils 外参; 不依赖 rgbd_pure_* 旧 pipeline.
+观测: Vision RGB-D (head+ee) + Proprio; 不改官方 env/action.
 """
 
 from __future__ import annotations
@@ -56,10 +56,10 @@ from rgbd_utils import (
     world_to_robot_frame,
 )
 
-PERCEPTION_BUILD = "20260618-fix-nav"
+PERCEPTION_BUILD = "official-sensors"
 
-# ── 分工距离 ────────────────────────────────────────────────────────────────
-FAR_EE_M = 1.30
+# ── 分工距离 (head depth_hi≈2.6m, ee depth_hi≈6.5m) ─────────────────────────
+FAR_NAV_M = 1.30          # 超过此距: 必须 EE 导航
 GRASP_HEAD_M = 1.20
 LOCK_MATCH_M = 0.50
 COAST_MAX = 12
@@ -72,7 +72,7 @@ CLOSER_THAN_BG_M = 0.014
 RELIEF_MAX = 0.35
 
 EE = {
-    "relief_min": 0.013,
+    "relief_min": 0.009,
     "relief_min_near": 0.009,
     "depth_lo": 0.35,
     "depth_hi": 6.5,
@@ -526,7 +526,7 @@ class TaskBPerception:
         self._lock_id: Optional[int] = None
         self._lock_world: Optional[List[float]] = None
         self._lock_miss = 0
-        print(f"[TaskBPerception] build={PERCEPTION_BUILD} | EE=3d-nav | head=3d-grasp")
+        print(f"[TaskBPerception] build={PERCEPTION_BUILD} | ee=远距导航 | head=近距抓取")
 
     def reset(self) -> None:
         self.frame_count = 0
@@ -597,12 +597,18 @@ class TaskBPerception:
         ee_live = [o for o in ee_objs if not o.get("track_coast")]
         head_live = [o for o in head_objs if not o.get("track_coast")]
 
-        # ── 锁目标: 优先 EE 最近 live ──
-        if self._lock_id is None and ee_live:
-            seed = min(ee_live, key=_dist)
-            self._lock_id = int(seed["id"])
-            self._lock_world = list(seed["pos_world"])
-            self._lock_miss = 0
+        # ── 锁目标: EE 远距先发现, head 近距接力 ──
+        if self._lock_id is None:
+            if ee_live:
+                seed = min(ee_live, key=_dist)
+            elif head_live:
+                seed = min(head_live, key=_dist)
+            else:
+                seed = None
+            if seed is not None:
+                self._lock_id = int(seed["id"])
+                self._lock_world = list(seed["pos_world"])
+                self._lock_miss = 0
         elif self._lock_id is not None:
             hit = _find_by_lock(ee_live + head_live, self._lock_id, self._lock_world)
             if hit is not None:
@@ -615,30 +621,57 @@ class TaskBPerception:
                     self._lock_world = None
                     if ee_live:
                         seed = min(ee_live, key=_dist)
+                    elif head_live:
+                        seed = min(head_live, key=_dist)
+                    else:
+                        seed = None
+                    if seed is not None:
                         self._lock_id = int(seed["id"])
                         self._lock_world = list(seed["pos_world"])
                         self._lock_miss = 0
 
-        # ── 导航: 只用 EE ──
+        # ── 导航: 远距 ee (看得远), 近距 head 确认 ──
         target_nav: Optional[dict] = None
-        if self._lock_id is not None:
-            target_nav = _find_by_lock(ee_live, self._lock_id, self._lock_world)
-        if target_nav is None and ee_live:
+        nav_cam = "ee"
+        head_hit = _find_by_lock(head_live, self._lock_id, self._lock_world) if self._lock_id else None
+        ee_hit = _find_by_lock(ee_live, self._lock_id, self._lock_world) if self._lock_id else None
+        ee_d = _dist(ee_hit)
+        head_d = _dist(head_hit)
+
+        if ee_hit is not None and ee_d > FAR_NAV_M * 0.85:
+            target_nav = ee_hit
+            nav_cam = "ee"
+        elif ee_hit is not None:
+            target_nav = ee_hit
+            nav_cam = "ee"
+        elif head_hit is not None and head_d <= FAR_NAV_M:
+            target_nav = head_hit
+            nav_cam = "head"
+        elif head_hit is not None:
+            target_nav = head_hit
+            nav_cam = "head"
+        elif ee_live:
             target_nav = min(ee_live, key=_dist)
-        elif target_nav is None and self._lock_world is not None and self._lock_miss <= COAST_MAX:
+            nav_cam = "ee"
+        elif head_live:
+            target_nav = min(head_live, key=_dist)
+            nav_cam = "head"
+        elif self._lock_world is not None and self._lock_miss <= COAST_MAX:
             pr = world_to_robot_frame(np.asarray(self._lock_world, dtype=np.float32), rp, ry)
+            lock_xy = float(np.linalg.norm(pr[:2]))
+            nav_cam = "ee" if lock_xy > FAR_NAV_M else "head"
             target_nav = {
                 "id": self._lock_id,
                 "pos_world": list(self._lock_world),
                 "pos_robot": pr.tolist(),
-                "dist_to_robot": float(np.linalg.norm(pr[:2])),
-                "depth_m": float(np.linalg.norm(pr[:2])),
+                "dist_to_robot": lock_xy,
+                "depth_m": lock_xy,
                 "yaw_rel": float(np.arctan2(pr[1], pr[0])),
-                "source_camera": "ee",
-                "camera": "ee",
+                "source_camera": nav_cam,
+                "camera": nav_cam,
                 "role": "nav",
                 "nav_coast": True,
-                "skip_camera_correction": False,
+                "skip_camera_correction": nav_cam == "ee",
                 "visible": False,
             }
 
@@ -656,7 +689,7 @@ class TaskBPerception:
             target_grasp = _grasp_from_head(head_hit, rp, ry)
 
         phase = "grasp" if want_grasp and target_grasp else "approach"
-        nav_stage = "grasp" if want_grasp else ("far_ee" if nav_d > FAR_EE_M else "near_head")
+        nav_stage = "grasp" if want_grasp else ("far_ee" if nav_d > FAR_NAV_M else "near_head")
 
         ee_hint = None
         if target_nav and not target_nav.get("nav_coast"):
@@ -664,7 +697,7 @@ class TaskBPerception:
                 "yaw_rel": float(target_nav.get("yaw_rel") or 0.0),
                 "class": target_nav.get("class"),
                 "id": target_nav.get("id"),
-                "bearing_only": nav_d > FAR_EE_M,
+                "bearing_only": nav_cam == "head" and nav_d > FAR_NAV_M * 0.92,
                 "depth_m": target_nav.get("depth_m"),
             }
 
@@ -678,19 +711,19 @@ class TaskBPerception:
                 )
 
         return {
-            "roles": {"ee": "nav_only", "head": "grasp_only"},
+            "roles": {"ee": "eye_in_hand_far_nav", "head": "eye_to_hand_near_grasp"},
             "nav_stage": nav_stage,
-            "nav_authority": "ee",
-            "nav_authority_mode": "ee_only",
+            "nav_authority": nav_cam,
+            "nav_authority_mode": "ee_far_head_near",
             "nav_lock_id": self._lock_id,
             "nav_lock_class": None if self._lock_id is None else (target_nav or {}).get("class"),
-            "nav_lock_ee_only": True,
+            "nav_lock_ee_only": False,
             "nav_lock_stable": self._lock_id is not None and self._lock_miss == 0,
             "nav_pos_confidence": None if target_nav is None else 0.75,
             "ee_search_hint": ee_hint,
-            "navigation": {"camera": "ee", "target": target_nav, "objects_detailed": ee_live or ee_objs},
+            "navigation": {"camera": nav_cam, "target": target_nav, "objects_detailed": (head_live if nav_cam == "head" else ee_live) or head_live or ee_live},
             "target_nav": target_nav,
-            "objects_nav": ee_live or ee_objs,
+            "objects_nav": (head_live if nav_cam == "head" else ee_live) or head_live or ee_live,
             "ee_objects": ee_live or ee_objs,
             "ee_objects_list": ee_objs,
             "grasp": {"camera": "head", "target": target_grasp, "objects_detailed": [target_grasp] if target_grasp else head_live},
@@ -700,7 +733,7 @@ class TaskBPerception:
             "head_objects_list": head_objs,
             "target": target_grasp if want_grasp and target_grasp else target_nav,
             "objects_remaining": ee_objs + head_objs,
-            "active_camera": "head" if want_grasp else "ee",
+            "active_camera": "head" if want_grasp else nav_cam,
             "phase": phase,
             "grasp_reliable": bool(target_grasp and target_grasp.get("grasp_reliable")),
             "grasp_locked": bool(target_grasp),

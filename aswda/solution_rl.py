@@ -19,8 +19,8 @@ PERCEPTION_DIR = os.path.join(REPO_ROOT, "taskb_perception")
 if os.path.isdir(PERCEPTION_DIR) and PERCEPTION_DIR not in sys.path:
     sys.path.insert(0, PERCEPTION_DIR)
 
-from config import BIN_CENTER, ROBOT_INIT_POS, ROBOT_INIT_YAW, DEFAULT_ARM_JOINTS, NAV_EE_ARM_JOINTS
-# 感知: taskb_perception.py — EE 导航 / head 抓取 (单文件, 无旧 pipeline)
+from config import BIN_CENTER, ROBOT_INIT_POS, ROBOT_INIT_YAW, DEFAULT_ARM_JOINTS
+# 感知: taskb_perception — 官网 eye-to-hand / eye-in-hand 分工
 from taskb_perception import TaskBPerception, PERCEPTION_BUILD
 from rgbd_utils import depth_to_vis, parse_ee_rgbd, parse_head_rgbd, depth_stats
 
@@ -137,7 +137,7 @@ class AlgSolution:
 
         # 强制初始化感知管道，不使用回退
         self.perception = TaskBPerception()
-        self._log(f"[TaskB-PERCEPTION] build={PERCEPTION_BUILD}")
+        self._log(f"[TaskB-PERCEPTION] build={PERCEPTION_BUILD} | official sensors head+ee")
 
         checkpoint = torch.load(self.checkpoint_path, map_location="cpu")
         state_dict = checkpoint["model_state_dict"]
@@ -240,12 +240,6 @@ class AlgSolution:
         self.default_bin_center = np.asarray(BIN_CENTER, dtype=np.float32)
         self.dt = 0.02
         self.arm_action_scale = 0.5
-        j2_act = (float(NAV_EE_ARM_JOINTS[1]) - float(DEFAULT_ARM_JOINTS[1])) / float(self.arm_action_scale)
-        self._log(
-            f"[TaskB-NAV] EE horizontal via solution_rl only (no env_cfg change): "
-            f"joint2 {DEFAULT_ARM_JOINTS[1]:.2f}->{NAV_EE_ARM_JOINTS[1]:.2f} "
-            f"arm_action={j2_act:.2f} get_action_spec clip=[-3,3]"
-        )
         self.arm_ik_joint_names = list(self.arm_joint_names[:6])
         self.gripper_joint_names = list(self.arm_joint_names[6:])
 
@@ -379,8 +373,7 @@ class AlgSolution:
             self.perception.reset()
 
     def get_action_spec(self) -> dict[str, dict[str, Any]] | None:
-        # arm clip 放宽: joint2 从 2.13→3.14 需 action≈2.0, 默认 ±1 会截断导致 EE 一直俯视
-        return {"arm": {"mode": "position", "scale": 0.5, "clip": [-3.0, 3.0]}}
+        return None
 
     def _get_scene(self):
         if self.env is None:
@@ -2020,9 +2013,9 @@ class AlgSolution:
         lock_class = perception_output.get("nav_lock_class")
 
         active = perception_output.get("active_camera")
-        nav_cam = str(raw_nav.get("source_camera") or active or "head")
+        nav_cam = str(raw_nav.get("source_camera") or active or "ee")
         if nav_cam in ("lock_coast", "none"):
-            nav_cam = "head" if active != "ee" else "ee"
+            nav_cam = "ee" if active != "head" else "head"
 
         target = self._prepare_pipeline_object(raw_nav, nav_cam, robot_pos_world, robot_yaw)
         if target is None:
@@ -2105,6 +2098,25 @@ class AlgSolution:
                 robot_pos_world,
                 robot_yaw,
             )
+        if target is None and int(perception_output.get("ee_count_raw") or 0) == 0:
+            head_fb = self._normalize_camera_objects(
+                perception_output.get("head_objects", []),
+                "head",
+                robot_pos_world,
+                robot_yaw,
+            )
+            if head_fb and float((perception_output.get("head_dist_m") or 999.0)) <= 1.35:
+                best = min(head_fb, key=lambda o: float(o.get("dist_to_robot") or 999.0))
+                target = self._prepare_pipeline_object(best, "head", robot_pos_world, robot_yaw)
+                if target is not None:
+                    target["nav_from_head_fallback"] = True
+                    target["source_camera"] = "head"
+                    target["camera"] = "head"
+                    if self._step_count % 25 == 0:
+                        self._log(
+                            f"[NAV] EE empty -> head fallback "
+                            f"{target.get('class')} dist={float(target.get('dist_to_robot') or 0):.2f}m"
+                        )
 
         bin_info = perception_output.get("bin") or {}
         bin_center = self._safe_numpy(bin_info.get("center_world"), self.default_bin_center)
@@ -2316,54 +2328,6 @@ class AlgSolution:
         policy_obs = torch.cat(components, dim=-1)
         return torch.nan_to_num(policy_obs, nan=0.0, posinf=0.0, neginf=0.0)
 
-    def _nav_arm_action(self) -> torch.Tensor:
-        """导航阶段: EE 水平广角 (joint2≈π)."""
-        arm = torch.zeros(self.arm_action_dim, device=self.device, dtype=torch.float32)
-        scale = float(self.arm_action_scale)
-        nav_q = list(NAV_EE_ARM_JOINTS[:6]) + [0.0, 0.0]
-        default_q = [float(self.arm_default_action[0, i]) for i in range(min(8, self.arm_action_dim))]
-        n = min(self.arm_action_dim, len(nav_q), len(default_q))
-        for i in range(n):
-            arm[i] = (float(nav_q[i]) - float(default_q[i])) / scale
-        return arm
-
-    def _ensure_arm_joint_ids(self, robot) -> list[int] | None:
-        if getattr(self, "_arm_joint_ids_cached", None) is not None:
-            return self._arm_joint_ids_cached
-        if robot is None:
-            return None
-        try:
-            arm_ids, _ = robot.find_joints(list(self.arm_joint_names))
-            self._arm_joint_ids_cached = list(arm_ids)
-            return self._arm_joint_ids_cached
-        except Exception as exc:
-            self._log(f"[TaskB-NAV] arm joint ids not found: {exc}")
-            return None
-
-    def _apply_nav_ee_arm_pose(self, action_env: torch.Tensor, robot) -> torch.Tensor:
-        """用 robot 关节索引写 arm action (与 ArmGraspController 同路径), 确保 EE 水平."""
-        if self._task_state not in ("APPROACH_OBJECT", "NAV_TO_BIN"):
-            return action_env
-        arm_ids = self._ensure_arm_joint_ids(robot)
-        if arm_ids is None:
-            nav_arm = self._nav_arm_action()
-            action_env[:, self.leg_action_dim : self.leg_action_dim + nav_arm.numel()] = nav_arm.unsqueeze(0)
-            return action_env
-
-        nav_q = torch.tensor(
-            [float(NAV_EE_ARM_JOINTS[i]) if i < 6 else 0.0 for i in range(len(arm_ids))],
-            device=action_env.device,
-            dtype=action_env.dtype,
-        ).view(1, -1)
-        baseline = torch.tensor(
-            [float(DEFAULT_ARM_JOINTS[i]) if i < 6 else 0.0 for i in range(len(arm_ids))],
-            device=action_env.device,
-            dtype=action_env.dtype,
-        ).view(1, -1)
-        scaled = (nav_q - baseline) / float(self.arm_action_scale)
-        action_env[:, arm_ids] = scaled.expand(action_env.shape[0], -1)
-        return action_env
-
     def _map_policy_action_to_env_action(self, action_train: torch.Tensor) -> torch.Tensor:
         if action_train.shape[-1] != self.leg_action_dim:
             raise ValueError(f"Policy output dim mismatch: got {action_train.shape[-1]}, expected {self.leg_action_dim}")
@@ -2371,12 +2335,8 @@ class AlgSolution:
         num_envs = action_train.shape[0]
         action_env = torch.zeros((num_envs, self.total_action_dim), device=self.device, dtype=torch.float32)
         action_env[:, :self.leg_action_dim] = action_train * self.leg_action_scale
-        # 寻物/接近/去桶: EE 保持水平广角 (joint2≈π); 蹲下/抓取/站起由 ArmGraspController 接管
-        if self._task_state in ("APPROACH_OBJECT", "NAV_TO_BIN"):
-            nav_arm = self._nav_arm_action()
-            action_env[:, self.leg_action_dim:] = nav_arm.unsqueeze(0).expand(num_envs, -1)
-        else:
-            action_env[:, self.leg_action_dim:] = 0.0
+        # 官网默认: 导航阶段 arm action=0 (use_default_offset → 官方 default 姿态)
+        action_env[:, self.leg_action_dim:] = 0.0
         return torch.nan_to_num(action_env, nan=0.0, posinf=0.0, neginf=0.0)
 
     def _format_rgb_overlay(self, rgb: np.ndarray, nav_info: dict[str, Any], camera_name: str, detected_objects: list = None) -> np.ndarray:
@@ -2490,9 +2450,15 @@ class AlgSolution:
                             q = np.asarray(p, dtype=np.float32).reshape(-1)
                             j2_rel = float(q[PROPRIO_ARM_START + 1])
                             j2_abs = j2_rel + float(DEFAULT_ARM_JOINTS[1])
-                            ee_nav["overlay_extra"] = [
-                                f"arm_j2={j2_abs:.2f} rel={j2_rel:.2f} (tgt~3.14)",
-                            ]
+                            extra = [f"arm_j2={j2_abs:.2f} rel={j2_rel:.2f} def={float(DEFAULT_ARM_JOINTS[1]):.2f}"]
+                            gt_pose = self._get_ground_truth_robot_pose()
+                            if gt_pose is not None:
+                                ee_pose = self._get_ground_truth_camera_pose("ee_camera", gt_pose[0], gt_pose[1])
+                                if ee_pose is not None:
+                                    _, rot = ee_pose
+                                    fwd = rot @ np.array([0.0, 0.0, 1.0], dtype=np.float32)
+                                    extra.append(f"ee_fwd_z={float(fwd[2]):+.2f} (horiz~0)")
+                            ee_nav["overlay_extra"] = extra
                     except Exception:
                         pass
                     ee_bgr = self._format_rgb_overlay(ee_rgb.astype(np.uint8), ee_nav, "ee", ee_objects)
@@ -3359,10 +3325,6 @@ class AlgSolution:
 
         if action_env is None:
             action_env = self._policy_action_from_base_cmd(obs, base_cmd)
-
-        robot = self._get_robot()
-        if robot is not None and self._task_state in ("APPROACH_OBJECT", "NAV_TO_BIN"):
-            action_env = self._apply_nav_ee_arm_pose(action_env, robot)
 
         self._last_base_cmd = base_cmd
         self._last_nav_info = nav_info
