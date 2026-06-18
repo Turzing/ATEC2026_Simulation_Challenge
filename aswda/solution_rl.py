@@ -3222,20 +3222,45 @@ class AlgSolution:
                             self._pending_grasp_target = None
                             self._clear_locked_target()
             else:
-                base_cmd = self._compute_search_cmd(perception_output)
-                search_phase = "search"
-                if perception_output.get("nav_lock_id") is not None:
-                    search_phase = "search_coast"
-                elif self._fuse_lock_key is not None:
-                    search_phase = "searching_lost_target"
-                nav_info = self._make_pipeline_nav_info(
-                    perception_output,
-                    pose_source,
-                    None,
-                    phase=search_phase,
-                    stopped=False,
-                    extra={"goal_dist": 0.0, "heading_error": 0.0, "target_dist": 0.0},
-                )
+                raw_nav = perception_output.get("target_nav") if isinstance(perception_output, dict) else None
+                lock_id = perception_output.get("nav_lock_id") if isinstance(perception_output, dict) else None
+                if (
+                    target_nav is None
+                    and isinstance(raw_nav, dict)
+                    and raw_nav.get("pos_world") is not None
+                    and lock_id is not None
+                ):
+                    target_nav = self._fuse_perception_target(
+                        perception_output, robot_pos_world, robot_yaw,
+                    )
+                if target_nav is not None:
+                    base_cmd, nav_info = self._compute_nav_cmd_from_target_nav(target_nav)
+                    if nav_input is not None:
+                        nav_info = self._attach_nav_debug_context(nav_info, nav_input, target_nav)
+                    else:
+                        nav_info = self._make_pipeline_nav_info(
+                            perception_output,
+                            pose_source,
+                            target_nav,
+                            phase=str(nav_info.get("phase", "approach")),
+                            stopped=bool(nav_info.get("stopped", False)),
+                            extra=nav_info,
+                        )
+                else:
+                    base_cmd = self._compute_search_cmd(perception_output)
+                    search_phase = "search"
+                    if isinstance(perception_output, dict) and perception_output.get("nav_lock_id") is not None:
+                        search_phase = "search_coast"
+                    elif self._fuse_lock_key is not None:
+                        search_phase = "searching_lost_target"
+                    nav_info = self._make_pipeline_nav_info(
+                        perception_output,
+                        pose_source,
+                        None,
+                        phase=search_phase,
+                        stopped=False,
+                        extra={"goal_dist": 0.0, "heading_error": 0.0, "target_dist": 0.0},
+                    )
 
         if action_env is None:
             action_env = self._policy_action_from_base_cmd(obs, base_cmd)

@@ -270,6 +270,9 @@ def is_ee_floor_gripper_phantom(obj: dict, *, img_h: int = IMG_H) -> bool:
     pz = float(pr[2]) if pr is not None else 0.0
     if pz < -0.12 and depth < 2.5:
         return True
+    # 远距地面真实目标: EE 低头时黄瓶仍在画面下方, depth>1.2m 应保留
+    if depth >= 1.25:
+        return False
     if y2 > img_h * 0.56 and depth < 1.40:
         return True
     if cy > img_h * 0.50 and depth < 0.90:

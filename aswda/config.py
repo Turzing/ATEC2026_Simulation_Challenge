@@ -286,6 +286,11 @@ DEFAULT_ARM_JOINTS = np.array(
     [0.0, 2.13, -1.20, 0.0, -0.8, 0.0], dtype=np.float32,
 )
 
+# 远距 EE 导航反投影用臂姿: arm_joint2≈π 使 EE 广角近似水平朝前 (solution_gt 同款)
+NAV_EE_ARM_JOINTS = np.array(
+    [0.0, 3.14, -1.20, 0.0, -0.8, 0.0], dtype=np.float32,
+)
+
 PROPRIO_BASE_LIN_VEL = slice(0, 3)
 PROPRIO_BASE_ANG_VEL = slice(3, 6)
 PROPRIO_PROJECTED_GRAVITY = slice(9, 12)

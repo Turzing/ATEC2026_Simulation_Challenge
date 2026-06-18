@@ -1,13 +1,11 @@
 """
-Task B RGBD 感知 v5
+Task B RGBD 感知 v7
 
-相机分工 (与官方一致):
-  EE   = eye-in-hand 广角 → 远距导航 (>1.4m), 输出 anchor 供 GT 相机校正
-  head = eye-to-hand 俯视 → 近距导航 + 抓取 (<1.4m)
+EE   = 远距导航: 必须识别到 (检出率优先, 坐标 ~0.3m 误差可接受)
+head = 近距抓取: 最严格精度 (grasp_pos |err| < 0.10m)
 
-检测: 自适应 HSV + depth, 参考 rgbd_pure_pipeline 阈值
-稳定: track coast (丢检仍输出) + EMA 平滑
-精度: head 目标 skip_camera_correction, 避免 solution_rl HEAD CORR 二次拉偏
+检测: 自适应 HSV + depth
+稳定: EE coast 长时保持 / head 严跳变拒绝 + EMA
 """
 
 from __future__ import annotations
@@ -23,6 +21,7 @@ from config import (
     BIN_CENTER,
     BIN_RADIUS,
     DEFAULT_ARM_JOINTS,
+    NAV_EE_ARM_JOINTS,
     GRASP_DEPTH_OFFSET,
     HEAD_CAM,
     HEAD_CAM_POS_ROBOT,
@@ -58,18 +57,25 @@ from rgbd_utils import (
     _to_numpy,
 )
 
-PERCEPTION_BUILD = "20260618-taskb-rgbd-v5"
+PERCEPTION_BUILD = "20260618-taskb-rgbd-v7"
 CLASS_NAME = "mustard_bottle"
 
 FAR_NAV_M = 1.40
 GRASP_DIST_M = 1.25
-POS_EMA_ALPHA = 0.38
-JUMP_REJECT_FAR_M = 0.42
-JUMP_REJECT_NEAR_M = 0.16
+# EE 导航: 检出优先, 平滑略松
+EE_EMA_ALPHA = 0.42
+EE_JUMP_REJECT_M = 0.58
+EE_COAST_MAX_MISS = 120
+# head 抓取: 精度优先, 平滑更严
+HEAD_EMA_ALPHA = 0.28
+HEAD_JUMP_REJECT_M = 0.12
+HEAD_JUMP_REJECT_FAR_M = 0.22
+HEAD_GRASP_STABLE_FRAMES = 3
 NEAR_M = 1.35
-COAST_MAX_MISS = 36
-MATCH_RADIUS_M = 0.62
+COAST_MAX_MISS = 100
+MATCH_RADIUS_M = 0.45
 LOCK_MATCH_M = 0.72
+LOCK_REID_MISS = 8
 ROBOT_Z_MIN, ROBOT_Z_MAX = -0.82, 0.22
 
 CAM_DETECT = {
@@ -81,11 +87,11 @@ CAM_DETECT = {
         "min_blob": 8, "min_side": 3,
     },
     "ee": {
-        "hue_lo": 12, "hue_hi": 50,
-        "sat_min": 12, "sat_relax": 24, "val_min": 22, "val_relax": 20,
-        "v_min": 0.02, "v_max": 0.98,
-        "depth_min": 0.22, "depth_max": 8.5,
-        "min_blob": 6, "min_side": 3,
+        "hue_lo": 10, "hue_hi": 52,
+        "sat_min": 8, "sat_relax": 28, "val_min": 18, "val_relax": 24,
+        "v_min": 0.01, "v_max": 0.99,
+        "depth_min": 0.18, "depth_max": 9.0,
+        "min_blob": 4, "min_side": 2,
     },
 }
 
@@ -127,39 +133,68 @@ def _head_nav_anchor_v(y1: int, y2: int) -> float:
 
 
 def _apply_correction_hints(obj: dict) -> dict:
-    """head 外参已与仿真一致时, 跳过 solution_rl 的 HEAD GT 重投影."""
+    """head 抓取坐标跳过 CORR; EE 导航允许 solution_rl 用 GT 相机校正."""
     out = dict(obj)
     cam = str(out.get("source_camera") or out.get("camera") or "")
     depth = float(out.get("depth_m") or out.get("nav_depth_m") or 99.0)
-    if "head" in cam and out.get("world_reliable") and depth < 2.5:
+    role = str(out.get("role") or "")
+    if "head" in cam or role == "grasp":
         out["skip_camera_correction"] = True
-        out["correction_policy"] = "perception_trusted"
+        out["correction_policy"] = "head_grasp_trusted"
+        out["pos_confidence"] = float(out.get("pos_confidence") or 0.88)
+    elif cam == "ee" or role == "nav":
+        out["skip_camera_correction"] = False
+        out["correction_policy"] = "ee_nav_gt_corr"
+        out["nav_detect_priority"] = True
+        out["pos_tolerance_m"] = 0.35
+        out["pos_confidence"] = float(out.get("pos_confidence") or (0.72 if depth > FAR_NAV_M else 0.78))
     return out
 
 
-def _plausible_obj(obj: dict, camera: str) -> bool:
+def _plausible_ee_nav(obj: dict) -> bool:
+    """EE 导航: 必须尽量保留检出, 只剔除明显假目标."""
+    pr = obj.get("pos_robot")
+    bbox = obj.get("bbox")
+    if pr is None or not bbox:
+        return False
+    depth = float(obj.get("depth_m") or 99.0)
+    horiz = float(np.hypot(float(pr[0]), float(pr[1])))
+    if horiz < 0.05:
+        return False
+    if depth >= 1.0:
+        return True
+    if is_ee_floor_gripper_phantom(obj) and depth < 0.85:
+        return False
+    if is_ee_sky_blob(obj) and depth < 1.8:
+        return False
+    pz = float(pr[2])
+    if pz < -0.95 or pz > 0.35:
+        return False
+    return True
+
+
+def _plausible_head_grasp(obj: dict) -> bool:
+    """head 抓取: 最严, 坐标不可靠的直接丢弃."""
     pr = obj.get("pos_robot")
     bbox = obj.get("bbox")
     if pr is None or not bbox:
         return False
     pz = float(pr[2])
-    if pz < ROBOT_Z_MIN or pz > ROBOT_Z_MAX:
+    if pz < -0.35 or pz > 0.18:
         return False
     horiz = float(np.hypot(float(pr[0]), float(pr[1])))
-    if horiz < 0.07 and abs(float(pr[1])) < 0.10:
+    if horiz < 0.08 and abs(float(pr[1])) < 0.10:
         return False
     x1, y1, x2, y2 = bbox
     cy = 0.5 * (y1 + y2)
     depth = float(obj.get("depth_m") or 99.0)
-    if camera == "head":
-        # 俯视: 远处物体在画面上方，不能按 y2 下限过滤
-        if cy < IMG_H * 0.06:
-            return False
-    else:
-        if is_ee_floor_gripper_phantom(obj):
-            return False
-        if is_ee_sky_blob(obj):
-            return False
+    if cy < IMG_H * 0.06:
+        return False
+    if depth > 2.8:
+        return False
+    bh = max(y2 - y1, 1)
+    if bh < 4 and depth < 0.35:
+        return False
     return True
 
 
@@ -235,8 +270,8 @@ def _detect_yellow_rgbd(rgb: np.ndarray, depth: np.ndarray, camera: str) -> List
             "source": "rgbd_hsv",
             "class": CLASS_NAME,
             "conf": 0.80,
-            "world_reliable": nav_depth < 2.5,
-            "pos_confidence": 0.84 if nav_depth < 1.6 else 0.70,
+            "world_reliable": nav_depth < (1.6 if camera == "head" else 3.5),
+            "pos_confidence": (0.86 if nav_depth < 1.2 else 0.78) if camera == "head" else (0.74 if nav_depth < 2.5 else 0.68),
             "visible": True,
             "role": "nav_grasp" if camera == "head" else "nav",
             "blob_sat_mean": float(np.median(hsv[:, :, 1][ys, xs])),
@@ -256,25 +291,37 @@ def _enrich_world(obj: dict, robot_pos: np.ndarray, robot_yaw: float) -> dict:
     return out
 
 
-def _smooth_with_prev(obj: dict, prev: Optional[dict], robot_pos: np.ndarray, robot_yaw: float) -> dict:
+def _smooth_with_prev(
+    obj: dict,
+    prev: Optional[dict],
+    robot_pos: np.ndarray,
+    robot_yaw: float,
+    *,
+    camera: str,
+) -> dict:
     out = dict(obj)
     pw = np.asarray(out["pos_world"], dtype=np.float32)
     if prev is None:
         out["pos_smooth_world"] = pw.tolist()
         out["_miss"] = 0
+        out["head_stable_count"] = 1 if camera == "head" else 0
         return out
 
     prev_sw = np.asarray(prev.get("pos_smooth_world") or prev["pos_world"], dtype=np.float32)
     jump = float(np.linalg.norm(pw[:2] - prev_sw[:2]))
     dist = float(out.get("dist_to_robot") or 99.0)
-    limit = JUMP_REJECT_NEAR_M if dist < NEAR_M else JUMP_REJECT_FAR_M
+    if camera == "head":
+        limit = HEAD_JUMP_REJECT_M if dist < NEAR_M else HEAD_JUMP_REJECT_FAR_M
+        alpha = HEAD_EMA_ALPHA
+    else:
+        limit = EE_JUMP_REJECT_M
+        alpha = EE_EMA_ALPHA
     if jump > limit and not out.get("track_coast"):
         sw = prev_sw.copy()
         out["pos_jump_rejected"] = True
     else:
-        a = POS_EMA_ALPHA
-        sw = (1.0 - a) * prev_sw + a * pw
-        sw[2] = (1.0 - a) * prev_sw[2] + a * pw[2]
+        sw = (1.0 - alpha) * prev_sw + alpha * pw
+        sw[2] = (1.0 - alpha) * prev_sw[2] + alpha * pw[2]
 
     out["pos_smooth_world"] = sw.tolist()
     out["pos_world"] = sw.tolist()
@@ -284,6 +331,9 @@ def _smooth_with_prev(obj: dict, prev: Optional[dict], robot_pos: np.ndarray, ro
     out["yaw_rel"] = float(np.arctan2(float(pr[1]), float(pr[0])))
     out["nav_yaw_rel"] = out["yaw_rel"]
     out["_miss"] = 0
+    if camera == "head":
+        prev_stable = int(prev.get("head_stable_count") or 0) if prev else 0
+        out["head_stable_count"] = prev_stable + 1 if not out.get("pos_jump_rejected") else max(1, prev_stable)
     return out
 
 
@@ -293,6 +343,9 @@ def _match_tracks(
     robot_pos: np.ndarray,
     robot_yaw: float,
     next_id: int,
+    *,
+    camera: str,
+    coast_max_miss: int,
 ) -> Tuple[List[dict], Dict[int, dict], int]:
     enriched = [_enrich_world(d, robot_pos, robot_yaw) for d in dets]
     used: set[int] = set()
@@ -315,7 +368,9 @@ def _match_tracks(
         used.add(best_id)
         prev = tracks.get(best_id)
         obj["id"] = int(best_id)
-        smoothed = _apply_correction_hints(_smooth_with_prev(obj, prev, robot_pos, robot_yaw))
+        smoothed = _apply_correction_hints(
+            _smooth_with_prev(obj, prev, robot_pos, robot_yaw, camera=camera),
+        )
         if prev is not None:
             for k in ("nav_anchor_uv", "nav_anchor_depth", "grasp_anchor_uv", "grasp_anchor_depth"):
                 if k in prev and smoothed.get(k) is None:
@@ -327,7 +382,7 @@ def _match_tracks(
         if tid in used:
             continue
         miss = int(tr.get("_miss", 0)) + 1
-        if miss > COAST_MAX_MISS:
+        if miss > coast_max_miss:
             continue
         coast = dict(tr)
         coast["_miss"] = miss
@@ -348,20 +403,32 @@ def _match_tracks(
 
 def _finalize_ee(obj: dict, robot_pos: np.ndarray, robot_yaw: float, arm_joints) -> dict:
     out = stabilize_ee_nav_pose(dict(obj))
-    cam_pos = compute_dynamic_ee_cam_pos(arm_joints if arm_joints is not None else DEFAULT_ARM_JOINTS)
+    depth = float(out.get("depth_m") or out.get("nav_depth_m") or 99.0)
+    # 远距反投影用水平导航臂姿; 近距/抓取仍跟实际关节
+    if depth >= FAR_NAV_M * 0.85:
+        cam_q = NAV_EE_ARM_JOINTS
+    else:
+        cam_q = arm_joints if arm_joints is not None else DEFAULT_ARM_JOINTS
+    cam_pos = compute_dynamic_ee_cam_pos(cam_q)
     out = refresh_ee_object_pose(out, robot_pos, robot_yaw, cam_pos)
+    out["ee_reproj_arm"] = "nav_horiz" if depth >= FAR_NAV_M * 0.85 else "live"
     out["source_camera"] = "ee"
     out["camera"] = "ee"
     out["role"] = "nav"
     return out
 
 
+def _head_grasp_anchor_v(y1: int, y2: int) -> float:
+    """抓取点: bbox 中部偏下, 比 nav 更保守."""
+    return float(y1 + 0.55 * (y2 - y1 + 1))
+
+
 def _grasp_from_head(head_obj: dict, robot_pos: np.ndarray, robot_yaw: float) -> dict:
     out = dict(head_obj)
     bbox = out.get("bbox") or [0, 0, 0, 0]
-    x1, _, x2, y2 = bbox
-    gu = float(out.get("grasp_anchor_uv", [0.5 * (x1 + x2), y2])[0])
-    gv = float(out.get("grasp_anchor_uv", [gu, y2])[1])
+    x1, y1, x2, y2 = bbox
+    gu = float(0.5 * (x1 + x2))
+    gv = _head_grasp_anchor_v(int(y1), int(y2))
     gdepth = float(out.get("grasp_anchor_depth") or out.get("nav_anchor_depth") or out.get("depth_m") or 0.0)
     p_cam = pixel_depth_to_cam(gu, gv, gdepth, HEAD_CAM)
     grasp_r = (HEAD_CAM_POS_ROBOT + HEAD_CAM_ROT_MATRIX @ p_cam).astype(np.float32)
@@ -372,8 +439,15 @@ def _grasp_from_head(head_obj: dict, robot_pos: np.ndarray, robot_yaw: float) ->
     out["grasp_pos_world"] = robot_to_world(grasp_r, robot_pos, robot_yaw).tolist()
     out["source_camera"] = "head"
     out["camera"] = "head"
-    out["grasp_reliable"] = gdepth < 1.20
+    stable = int(out.get("head_stable_count") or 0)
+    out["grasp_reliable"] = (
+        gdepth < 1.15
+        and stable >= HEAD_GRASP_STABLE_FRAMES
+        and not out.get("track_coast")
+        and not out.get("pos_jump_rejected")
+    )
     out["role"] = "grasp"
+    out["grasp_precision"] = "strict"
     return out
 
 
@@ -404,11 +478,18 @@ def _pick_nav(ee_objs: List[dict], head_objs: List[dict]) -> Tuple[Optional[dict
     head_vis = [o for o in head_objs if not o.get("track_coast")]
     ee_nav = ee_vis[0] if ee_vis else (ee_objs[0] if ee_objs else None)
     head_nav = head_vis[0] if head_vis else (head_objs[0] if head_objs else None)
+    ee_dist = float(ee_nav.get("dist_to_robot") or 999.0) if ee_nav else 999.0
+    head_dist = float(head_nav.get("dist_to_robot") or 999.0) if head_nav else 999.0
 
-    if head_nav is not None and float(head_nav.get("dist_to_robot") or 999.0) <= FAR_NAV_M:
-        return head_nav, ee_nav, "head"
+    # 远距 (>1.4m) 必须 EE 主导; head 仅近距导航/抓取
+    if ee_nav is not None and ee_dist > FAR_NAV_M * 0.85:
+        return ee_nav, head_nav, "ee"
     if ee_nav is not None:
         return ee_nav, head_nav, "ee"
+    if head_nav is not None and head_dist <= FAR_NAV_M:
+        out = dict(head_nav)
+        out["far_nav_from_head"] = head_dist > FAR_NAV_M * 0.92
+        return out, ee_nav, "head"
     if head_nav is not None:
         return head_nav, ee_nav, "head"
     return None, ee_nav, "none"
@@ -424,8 +505,10 @@ class TaskBPerceptionClean:
         self._lock_id: Optional[int] = None
         self._lock_world: Optional[List[float]] = None
         self._lock_miss = 0
+        self._lock_depth: Optional[float] = None
+        self._lock_source: str = "ee"
         self._nav_authority = "ee"
-        print(f"[TaskBPerceptionClean] build={PERCEPTION_BUILD} ee-far-nav | head-near-grasp")
+        print(f"[TaskBPerceptionClean] build={PERCEPTION_BUILD} ee-detect-nav | head-strict-grasp")
 
     def reset(self) -> None:
         self.frame_count = 0
@@ -436,6 +519,8 @@ class TaskBPerceptionClean:
         self._lock_id = None
         self._lock_world = None
         self._lock_miss = 0
+        self._lock_depth = None
+        self._lock_source = "ee"
         self._nav_authority = "ee"
 
     def get_debug(self, camera: str, name: str):
@@ -461,42 +546,84 @@ class TaskBPerceptionClean:
 
         ee_objs, self._ee_tracks, self._next_id = _match_tracks(
             ee_raw, self._ee_tracks, rp, ry, self._next_id,
+            camera="ee", coast_max_miss=EE_COAST_MAX_MISS,
         )
         head_objs, self._head_tracks, self._next_id = _match_tracks(
             head_raw, self._head_tracks, rp, ry, self._next_id,
+            camera="head", coast_max_miss=COAST_MAX_MISS,
         )
-        ee_objs = [_finalize_ee(o, rp, ry, arm_q) for o in ee_objs if _plausible_obj(o, "ee")]
+        ee_objs = [_finalize_ee(o, rp, ry, arm_q) for o in ee_objs if _plausible_ee_nav(o)]
+        head_objs = [o for o in head_objs if _plausible_head_grasp(o)]
 
         primary_nav, secondary_nav, authority = _pick_nav(ee_objs, head_objs)
         self._nav_authority = authority
 
+        lock_dist_hint = float(
+            (primary_nav or {}).get("dist_to_robot") or self._lock_depth or 999.0,
+        )
         if self._lock_id is None and primary_nav is not None:
             self._lock_id = int(primary_nav["id"])
             self._lock_world = list(primary_nav.get("pos_smooth_world") or primary_nav["pos_world"])
+            self._lock_depth = float(primary_nav.get("depth_m") or primary_nav.get("nav_depth_m") or 0.0) or None
             self._lock_miss = 0
+            self._lock_source = str(primary_nav.get("source_camera") or authority)
         elif self._lock_id is not None:
-            pool = ee_objs + head_objs
+            if lock_dist_hint > FAR_NAV_M:
+                pool = ee_objs if ee_objs else head_objs
+            else:
+                pool = head_objs + ee_objs
+            if not pool:
+                pool = ee_objs + head_objs
             hit = next((o for o in pool if int(o["id"]) == int(self._lock_id)), None)
+            spatial = None
             if hit is None and self._lock_world is not None:
                 lw = np.asarray(self._lock_world, dtype=np.float32)
+                best_d = MATCH_RADIUS_M
                 for o in pool:
+                    if o.get("track_coast"):
+                        continue
                     ow = np.asarray(o.get("pos_smooth_world") or o["pos_world"], dtype=np.float32)
-                    if float(np.linalg.norm(ow[:2] - lw[:2])) < MATCH_RADIUS_M:
-                        hit = o
-                        break
+                    d = float(np.linalg.norm(ow[:2] - lw[:2]))
+                    if d < best_d:
+                        best_d = d
+                        spatial = o
             if hit is not None:
-                self._lock_id = int(hit["id"])
                 self._lock_world = list(hit.get("pos_smooth_world") or hit["pos_world"])
+                ld = float(hit.get("depth_m") or hit.get("nav_depth_m") or 0.0)
+                if ld > 0.05:
+                    self._lock_depth = ld
                 self._lock_miss = 0
+            elif spatial is not None:
+                # 只更新坐标, 不随便换 track id (log 里 0→3 导致转错目标)
+                self._lock_world = list(spatial.get("pos_smooth_world") or spatial["pos_world"])
+                ld = float(spatial.get("depth_m") or spatial.get("nav_depth_m") or 0.0)
+                if ld > 0.05:
+                    self._lock_depth = ld
+                if int(spatial["id"]) != int(self._lock_id):
+                    self._lock_miss += 1
+                else:
+                    self._lock_miss = 0
             else:
                 self._lock_miss += 1
                 if self._lock_miss > COAST_MAX_MISS:
                     self._lock_id = None
                     self._lock_world = None
+                    self._lock_depth = None
                     if primary_nav is not None:
                         self._lock_id = int(primary_nav["id"])
                         self._lock_world = list(primary_nav.get("pos_smooth_world") or primary_nav["pos_world"])
+                        self._lock_depth = float(primary_nav.get("depth_m") or 0.0) or None
                         self._lock_miss = 0
+                elif self._lock_miss >= LOCK_REID_MISS and spatial is None and primary_nav is not None:
+                    pid = int(primary_nav["id"])
+                    if pid != int(self._lock_id):
+                        pw = np.asarray(primary_nav.get("pos_smooth_world") or primary_nav["pos_world"], dtype=np.float32)
+                        lw = np.asarray(self._lock_world, dtype=np.float32)
+                        if float(np.linalg.norm(pw[:2] - lw[:2])) > 0.55:
+                            self._lock_id = pid
+                            self._lock_world = pw.tolist()
+                            self._lock_depth = float(primary_nav.get("depth_m") or 0.0) or None
+                            self._lock_miss = 0
 
         target_nav: Optional[dict] = None
         if self._lock_id is not None and self._lock_world is not None:
@@ -509,6 +636,7 @@ class TaskBPerceptionClean:
                 target_nav["camera"] = src
             elif self._lock_miss <= COAST_MAX_MISS:
                 pr = world_to_robot_frame(np.asarray(self._lock_world, dtype=np.float32), rp, ry)
+                coast_depth = self._lock_depth if self._lock_depth and self._lock_depth > 0.05 else float(np.linalg.norm(pr[:2]))
                 target_nav = {
                     "id": int(self._lock_id),
                     "class": CLASS_NAME,
@@ -516,10 +644,13 @@ class TaskBPerceptionClean:
                     "pos_smooth_world": list(self._lock_world),
                     "pos_robot": pr.tolist(),
                     "dist_to_robot": float(np.linalg.norm(pr[:2])),
+                    "depth_m": coast_depth,
+                    "nav_depth_m": coast_depth,
                     "source_camera": "lock_coast",
                     "nav_coast": True,
                     "camera": self._nav_authority,
                     "world_reliable": True,
+                    "skip_camera_correction": True,
                     "yaw_rel": float(np.arctan2(pr[1], pr[0])),
                     "nav_yaw_rel": float(np.arctan2(pr[1], pr[0])),
                 }
@@ -546,6 +677,8 @@ class TaskBPerceptionClean:
             and head_hit is not None
             and self._lock_miss == 0
             and not head_hit.get("track_coast")
+            and int(head_hit.get("head_stable_count") or 0) >= HEAD_GRASP_STABLE_FRAMES
+            and not head_hit.get("pos_jump_rejected")
         )
         phase = "grasp" if want_grasp else "approach"
         target_grasp = (
@@ -554,7 +687,8 @@ class TaskBPerceptionClean:
             else None
         )
 
-        ee_export = [_apply_correction_hints(o) for o in ee_objs if not o.get("track_coast")][:3]
+        # EE 导航: coast 也导出, 保证 ee≥1; head 抓取: 仅 fresh 检测
+        ee_export = [_apply_correction_hints(o) for o in ee_objs][:4]
         head_export = [_apply_correction_hints(o) for o in head_objs if not o.get("track_coast")][:3]
         nav_cam = str((target_nav or {}).get("source_camera") or self._nav_authority)
         active_cam = "head" if (want_grasp or lock_dist <= FAR_NAV_M) else "ee"
@@ -591,7 +725,12 @@ class TaskBPerceptionClean:
         ee_for_nav = [target_nav] if target_nav and nav_cam == "ee" else ee_export
 
         return {
-            "roles": {"ee": "nav_far", "head": "nav_near_grasp"},
+            "roles": {
+                "ee": "nav_detect",
+                "head": "grasp_strict",
+                "ee_policy": "must_detect_tolerance_0.35m",
+                "head_policy": "strict_grasp_0.10m",
+            },
             "nav_stage": nav_stage,
             "nav_authority": self._nav_authority,
             "nav_authority_mode": "primary",
