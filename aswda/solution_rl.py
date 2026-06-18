@@ -245,12 +245,6 @@ class AlgSolution:
         self.arm_action_scale = 0.5
         self.arm_ik_joint_names = list(self.arm_joint_names[:6])
         self.gripper_joint_names = list(self.arm_joint_names[6:])
-        j2_act = (float(NAV_EE_ARM_JOINTS[1]) - float(DEFAULT_ARM_JOINTS[1])) / float(self.arm_action_scale)
-        self._log(
-            f"[TaskB-NAV] approach/search EE arm joint2 "
-            f"{DEFAULT_ARM_JOINTS[1]:.2f}->{NAV_EE_ARM_JOINTS[1]:.2f} "
-            f"(arm_action[arm_joint2]={j2_act:.2f})"
-        )
         self._log(
             f"[TaskB] GT guidance={'ON' if self.gt_guidance_enabled else 'OFF'} "
             f"(robot pose=odometry+perception; GT-CMP debug={'ON' if self.gt_cmp_debug else 'OFF'})"
@@ -386,8 +380,7 @@ class AlgSolution:
             self.perception.reset()
 
     def get_action_spec(self) -> dict[str, dict[str, Any]] | None:
-        # joint2: 2.13→3.14 需 arm_action≈2.0; 若被 ±1 截断则 EE 永远俯视
-        return {"arm": {"mode": "position", "scale": 0.5, "clip": [-3.0, 3.0]}}
+        return None
 
     def _get_scene(self):
         if self.env is None:
@@ -2061,8 +2054,22 @@ class AlgSolution:
         pr = self._safe_numpy(target.get("pos_robot"), np.zeros(3, dtype=np.float32))
         pw = self._safe_numpy(target.get("pos_world"), np.zeros(3, dtype=np.float32))
         if float(pr[2]) < -0.30 or float(pw[2]) < 0.02 or float(pw[2]) > 0.45:
-            self._clear_fuse_nav_lock(f"bad_z robot_z={pr[2]:.2f} world_z={pw[2]:.2f}")
-            return None
+            depth_m = float(target.get("nav_depth_m") or target.get("depth_m") or 0.0)
+            yaw_r = target.get("nav_yaw_rel")
+            if yaw_r is None:
+                yaw_r = target.get("yaw_rel")
+            if nav_cam == "ee" and depth_m > 0.15 and yaw_r is not None:
+                yr = float(yaw_r)
+                pr = np.array(
+                    [depth_m * math.cos(yr), depth_m * math.sin(yr), 0.08],
+                    dtype=np.float32,
+                )
+                pw = self._robot_to_world_frame(pr, robot_pos_world, robot_yaw)
+                target["pos_robot"] = pr.tolist()
+                target["pos_world"] = pw.tolist()
+            else:
+                self._clear_fuse_nav_lock(f"bad_z robot_z={pr[2]:.2f} world_z={pw[2]:.2f}")
+                return None
 
         if self.gt_guidance_enabled:
             gt_match = self._match_gt_for_target(target)
@@ -2372,12 +2379,7 @@ class AlgSolution:
         return torch.nan_to_num(policy_obs, nan=0.0, posinf=0.0, neginf=0.0)
 
     def _should_hold_nav_ee_arm(self) -> bool:
-        if self._task_state != "APPROACH_OBJECT":
-            return False
-        ctrl = self._arm_grasp_controller
-        if ctrl is not None and getattr(ctrl, "state", "IDLE") != "IDLE":
-            return False
-        return True
+        return False
 
     def _nav_ee_arm_action(self, num_envs: int) -> torch.Tensor:
         """导航/搜索阶段把 EE 抬到水平 (不改 env_cfg, 只写 arm action)."""

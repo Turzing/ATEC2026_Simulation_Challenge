@@ -632,11 +632,7 @@ class RgbdPureCamera:
         return fused
 
     def _cam_rot_robot(self) -> np.ndarray:
-        rot = self._cfg["rot"]
-        if self.camera_name == "ee" and self._arm_joints is not None:
-            from rgbd_utils import compute_ee_cam_rot_matrix
-            rot = compute_ee_cam_rot_matrix(self._arm_joints)
-        return rot
+        return self._cfg["rot"]
 
     def _uv_depth_to_robot(self, u: float, v: float, z: float) -> np.ndarray:
         cam = self._cfg["cam"]

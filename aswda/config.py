@@ -287,10 +287,8 @@ DEFAULT_ARM_JOINTS = np.array(
     [0.0, 2.13, -1.20, 0.0, -0.8, 0.0], dtype=np.float32,
 )
 
-# 导航阶段 EE 水平广角 (仅 solution_rl 写 arm action, 不改 env_cfg)
-NAV_EE_ARM_JOINTS = np.array(
-    [0.0, 3.14, -1.20, 0.0, -0.8, 0.0], dtype=np.float32,
-)
+# 导航阶段 EE 臂姿：与官方默认一致 (抬 joint2 会破坏 EE 外参/3D)
+NAV_EE_ARM_JOINTS = DEFAULT_ARM_JOINTS.copy()
 
 PROPRIO_BASE_LIN_VEL = slice(0, 3)
 PROPRIO_BASE_ANG_VEL = slice(3, 6)

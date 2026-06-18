@@ -4,9 +4,12 @@ Task B 感知层单独验证 — 不跑 solution_rl / 操作层
 
 默认: 手动模式 (WASD 移动 + P 拍照 + OpenCV 预览)
 
-    cd ATEC2026_Simulation_Challenge
+    cd ATEC2026_Simulation_Challenge_RIL-myq
     conda activate isaaclab
     python scripts/play_taskb_perception_eval.py --task ATEC-TaskB-B2Piper --enable_cameras
+
+与 solution_rl 同条件 (无 GT 位姿):
+    python scripts/play_taskb_perception_eval.py --task ATEC-TaskB-B2Piper --enable_cameras --no-gt-pose
 
 操作 (先点 Isaac Sim 窗口获焦):
     W/S     前进 / 后退
@@ -60,6 +63,19 @@ parser.add_argument("--warmup", type=int, default=15)
 parser.add_argument("--save-every", type=int, default=25, help="Auto mode save interval")
 parser.add_argument("--match-radius", type=float, default=0.55)
 parser.add_argument("--max-gt-dist", type=float, default=6.0)
+parser.add_argument(
+    "--no-gt-pose",
+    action="store_true",
+    default=False,
+    help="感知位姿用里程计 (与 solution_rl GT guidance=OFF 一致); 默认传 GT 便于看检测误差",
+)
+parser.add_argument(
+    "--simulate-fuse",
+    action="store_true",
+    default=True,
+    help="预览 solution_rl 融合层是否会拒 target_nav (默认开)",
+)
+parser.add_argument("--no-simulate-fuse", action="store_false", dest="simulate_fuse")
 parser.add_argument("--disable_fabric", action="store_true", default=False)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -81,7 +97,7 @@ import atec_rl_lab.tasks  # noqa: F401, E402
 from config import BIN_CENTER, BIN_RADIUS  # noqa: E402
 from rgbd_utils import depth_to_vis, parse_ee_rgbd, parse_head_rgbd  # noqa: E402
 from sim_test_common import ManualKeyboard, resolve_policy  # noqa: E402
-from taskb_perception import PERCEPTION_BUILD, TaskBPerception  # noqa: E402
+from taskb_perception import PERCEPTION_BUILD, TaskBPerception  # RgbdPureDualPipeline
 
 try:
     from rl_utils import camera_follow
@@ -248,20 +264,25 @@ def build_vis(
     obs,
     out: dict,
     gt_vis: list[dict],
+    perception,
     *,
     step: int,
     match_radius: float,
+    fuse_msg: str = "",
+    layer_verdict: str = "",
 ) -> np.ndarray:
     head_rgb, head_depth = parse_head_rgbd(obs)
     ee_rgb, _ = parse_ee_rgbd(obs)
     ee_objs = list(out.get("ee_objects") or [])
     head_objs = list(out.get("head_objects") or [])
     target_nav = out.get("target_nav") or {}
-    nav_dist = float(target_nav.get("dist_to_robot") or 0.0)
+    nav_dist = float(target_nav.get("dist_to_robot") or target_nav.get("depth_m") or 0.0)
     ee_errs, head_errs, matched = _compute_errors(ee_objs, head_objs, gt_vis, match_radius)
     recall = len(matched) / max(len(gt_vis), 1)
     ee_mean = float(np.mean(ee_errs)) if ee_errs else float("nan")
     head_mean = float(np.mean(head_errs)) if head_errs else float("nan")
+    phase = out.get("phase", "approach")
+    nav_cam = out.get("nav_authority") or (out.get("navigation") or {}).get("camera") or "?"
 
     head_bgr = _draw_cam(head_rgb, head_objs, gt_vis, match_radius=match_radius, prefix="H")
     h, w = head_bgr.shape[:2]
@@ -269,40 +290,56 @@ def build_vis(
     if ee_rgb is not None:
         ew, eh = w // 3, h // 3
         ee_bgr = cv2.resize(_draw_cam(ee_rgb, ee_objs, gt_vis, match_radius=match_radius, prefix="E"), (ew, eh))
-        sx, sy = ew / ee_rgb.shape[1], eh / ee_rgb.shape[0]
-        for obj in ee_objs:
-            x1, y1, x2, y2 = obj.get("bbox") or [0, 0, 0, 0]
-            x1, x2 = int(x1 * sx), int(x2 * sx)
-            y1, y2 = int(y1 * sy), int(y2 * sy)
-            cv2.rectangle(ee_bgr, (x1, y1), (x2, y2), (0, 255, 255), 1)
         cv2.putText(ee_bgr, f"EE nav ({len(ee_objs)})", (4, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
         head_bgr[8 : 8 + eh, w - ew - 8 : w - 8] = ee_bgr
 
     pw, ph = w // 4, h // 4
-    mini = np.zeros((ph, pw, 3), dtype=np.uint8)
-    mini[:] = depth_to_vis(head_depth)[:ph, :pw]
+    mini = np.zeros((ph, pw * 4, 3), dtype=np.uint8)
+    mini[:, :pw] = depth_to_vis(head_depth)[:ph, :pw]
+    if hasattr(perception, "get_debug"):
+        for i, key in enumerate(["relief", "rgb_fg", "fusion"], start=1):
+            m = perception.get_debug("head", key)
+            if m is not None:
+                if key == "relief":
+                    c = cv2.applyColorMap(cv2.resize(m, (pw, ph)), cv2.COLORMAP_TURBO)
+                else:
+                    c = cv2.cvtColor(cv2.resize(m, (pw, ph)), cv2.COLOR_GRAY2BGR)
+                mini[:, i * pw : (i + 1) * pw] = c
     head_bgr = np.vstack([head_bgr, mini])
 
     lines = [
-        f"step={step} build={PERCEPTION_BUILD} | Isaac窗: WASD  P=拍照  Q=退出",
-        f"ee={len(ee_objs)} head={len(head_objs)} auth={out.get('nav_authority')} "
-        f"nav_d={nav_dist:.2f} phase={out.get('phase')} grasp={out.get('grasp_reliable')}",
-        f"gt_in_range={len(gt_vis)} recall={recall:.0%} ee_err={ee_mean:.2f}m head_err={head_mean:.2f}m",
-        "green=match GT  orange=NO_GT",
+        f"RGBD-dual step={step} phase={phase} NAV({nav_cam}) build={PERCEPTION_BUILD}",
+        f"ee={len(ee_objs)} head={len(head_objs)} gt={len(gt_vis)} recall={recall:.0%}",
+        f"ee_err={ee_mean:.2f}m head_err={head_mean:.2f}m | Isaac: WASD P=拍照 Q=退出",
     ]
+    if layer_verdict:
+        lines.append(layer_verdict[:90])
+    elif fuse_msg:
+        lines.append(fuse_msg[:90])
     y = 22
     for line in lines:
-        cv2.putText(head_bgr, line, (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(head_bgr, line, (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1, cv2.LINE_AA)
         y += 18
-    tn = out.get("target_nav")
-    if tn:
+    if target_nav:
         cv2.putText(
             head_bgr,
-            f"NAV {tn.get('class')} [{tn.get('source_camera')}]",
+            f"NAV {target_nav.get('class')} z={nav_dist:.2f}m [{nav_cam}]",
             (8, y + 4),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.42,
             (0, 255, 0),
+            1,
+        )
+    tg = out.get("target_grasp")
+    if tg and tg.get("grasp_pos_world"):
+        gp = tg["grasp_pos_world"]
+        cv2.putText(
+            head_bgr,
+            f"GRASP ({gp[0]:.2f},{gp[1]:.2f},{gp[2]:.2f})",
+            (8, y + 22),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.4,
+            (0, 220, 255),
             1,
         )
     return head_bgr
@@ -315,16 +352,24 @@ def _print_snapshot(
     ee_errs: list[float],
     head_errs: list[float],
     matched: set[str],
+    *,
+    fuse_msg: str = "",
+    layer_verdict: str = "",
+    pose_mode: str = "gt",
 ) -> None:
     ee_objs = out.get("ee_objects") or []
     head_objs = out.get("head_objects") or []
     tn = out.get("target_nav") or {}
     print(
-        f"\n[SNAP step={step}] ee={len(ee_objs)} head={len(head_objs)} "
+        f"\n[SNAP step={step} pose={pose_mode}] ee={len(ee_objs)} head={len(head_objs)} "
         f"auth={out.get('nav_authority')} nav_d={tn.get('dist_to_robot', 0):.2f} "
         f"phase={out.get('phase')} grasp_rel={out.get('grasp_reliable')}",
         flush=True,
     )
+    if layer_verdict:
+        print(f"  >>> {layer_verdict}", flush=True)
+    elif fuse_msg:
+        print(f"  >>> {fuse_msg}", flush=True)
     print(f"  GT in range={len(gt_vis)} matched={len(matched)} recall={len(matched)/max(len(gt_vis),1):.0%}", flush=True)
     if ee_errs:
         print(f"  EE errors: min={min(ee_errs):.2f} mean={np.mean(ee_errs):.2f} max={max(ee_errs):.2f} m", flush=True)
@@ -356,6 +401,40 @@ def _episode_done(terminated, truncated) -> bool:
     return False
 
 
+def simulate_fuse_nav(target_nav: dict | None) -> str:
+    """复现 solution_rl._fuse_perception_target 的 Z 门控 (含 EE 平面兜底)."""
+    if not isinstance(target_nav, dict) or target_nav.get("pos_world") is None:
+        return "FUSE: no target_nav"
+    nav_cam = str(target_nav.get("source_camera") or "ee")
+    pr = np.asarray(target_nav.get("pos_robot") or [0, 0, 0], dtype=np.float32)
+    pw = np.asarray(target_nav.get("pos_world") or [0, 0, 0], dtype=np.float32)
+    if float(pr[2]) < -0.30 or float(pw[2]) < 0.02 or float(pw[2]) > 0.45:
+        depth_m = float(target_nav.get("nav_depth_m") or target_nav.get("depth_m") or 0.0)
+        yaw_r = target_nav.get("nav_yaw_rel")
+        if yaw_r is None:
+            yaw_r = target_nav.get("yaw_rel")
+        if nav_cam == "ee" and depth_m > 0.15 and yaw_r is not None:
+            return "FUSE: OK (EE planar fallback)"
+        return f"FUSE: REJECT bad_z robot_z={pr[2]:.2f} world_z={pw[2]:.2f}"
+    return "FUSE: OK"
+
+
+def _layer_verdict(out: dict, fuse_msg: str) -> str:
+    ee_n = len(out.get("ee_objects") or [])
+    head_n = len(out.get("head_objects") or [])
+    tn = out.get("target_nav")
+    has_nav = isinstance(tn, dict) and tn.get("pos_world") is not None
+    if ee_n == 0 and head_n == 0:
+        return "感知层: 未检出 (ee=0 head=0)"
+    if not has_nav:
+        return f"感知层: 有框但未出 target_nav (ee={ee_n} head={head_n})"
+    if fuse_msg.startswith("FUSE: REJECT"):
+        return f"操作层: 感知有目标但融合拒掉 — {fuse_msg}"
+    if ee_n > 0 or head_n > 0:
+        return f"感知层 OK (ee={ee_n} head={head_n}) | {fuse_msg}"
+    return fuse_msg
+
+
 def _make_env():
     env_cfg = parse_env_cfg(
         args_cli.task,
@@ -375,6 +454,8 @@ def run_manual() -> int:
     policy_path = resolve_policy(REPO_ROOT, args_cli.policy)
 
     print(f"[PERC-EVAL] build={PERCEPTION_BUILD}  mode=MANUAL")
+    print(f"[PERC-EVAL] pose={'odometry (--no-gt-pose)' if args_cli.no_gt_pose else 'GT (debug only, not control)'}")
+    print(f"[PERC-EVAL] fuse_sim={'ON' if args_cli.simulate_fuse else 'OFF'}")
     print(f"[PERC-EVAL] output -> {out_dir}")
     if policy_path:
         print(f"[PERC-EVAL] policy -> {policy_path}")
@@ -392,11 +473,14 @@ def run_manual() -> int:
         live = False
 
     print(
-        "\n=== 感知验证 (仅感知层) ===\n"
+        "\n=== 感知验证 (绕过 solution_rl) ===\n"
+        "  绿框=检测与 GT 对齐  橙框=检测但 GT 对不上\n"
         "  1. 点击 Isaac Sim 窗口\n"
         "  2. WASD 移动找垃圾\n"
-        "  3. P 拍照 (存图 + 打印 GT 误差)\n"
-        "  4. Q 退出\n",
+        "  3. P 拍照 (存图 + 打印 感知/融合 诊断)\n"
+        "  4. Q 退出\n"
+        "\n  判责: ee/head>0 且 target_nav 有 → 感知 OK\n"
+        "        显示 FUSE: REJECT → 操作层 solution_rl 拒目标\n",
         flush=True,
     )
 
@@ -440,7 +524,7 @@ def run_manual() -> int:
 
                 if not gt_printed and gt_vis:
                     gt_printed = True
-                    print("\n[PERC-EVAL] ===== GT (in range) =====", flush=True)
+                    print("\n[PERC-EVAL] ===== GT (in range, 仅误差对比) =====", flush=True)
                     for g in sorted(gt_vis, key=lambda x: x["dist_to_robot"])[:12]:
                         pw = g["pos_world"]
                         print(
@@ -450,8 +534,21 @@ def run_manual() -> int:
                         )
                     print("[PERC-EVAL] ========================\n", flush=True)
 
-                out = perception.process(obs, gt_robot_pos=robot_pos, gt_robot_yaw=robot_yaw)
-                vis = build_vis(obs, out, gt_vis, step=step, match_radius=args_cli.match_radius)
+                if args_cli.no_gt_pose:
+                    out = perception.process(obs)
+                    pose_mode = "odom"
+                else:
+                    out = perception.process(obs, gt_robot_pos=robot_pos, gt_robot_yaw=robot_yaw)
+                    pose_mode = "gt"
+
+                fuse_msg = simulate_fuse_nav(out.get("target_nav")) if args_cli.simulate_fuse else ""
+                layer_verdict = _layer_verdict(out, fuse_msg) if args_cli.simulate_fuse else ""
+
+                vis = build_vis(
+                    obs, out, gt_vis, perception,
+                    step=step, match_radius=args_cli.match_radius,
+                    fuse_msg=fuse_msg, layer_verdict=layer_verdict,
+                )
                 ee_errs, head_errs, matched = _compute_errors(
                     list(out.get("ee_objects") or []),
                     list(out.get("head_objects") or []),
@@ -462,7 +559,10 @@ def run_manual() -> int:
                 if kb.snap:
                     path = os.path.join(out_dir, f"snap_{saved:04d}.jpg")
                     cv2.imwrite(path, vis)
-                    _print_snapshot(step, out, gt_vis, ee_errs, head_errs, matched)
+                    _print_snapshot(
+                        step, out, gt_vis, ee_errs, head_errs, matched,
+                        fuse_msg=fuse_msg, layer_verdict=layer_verdict, pose_mode=pose_mode,
+                    )
                     print(f"  -> saved {path}\n", flush=True)
                     saved += 1
                     kb.snap = False
@@ -566,7 +666,7 @@ def run_auto() -> int:
             ])
 
             if step % max(1, args_cli.save_every) == 0:
-                vis = build_vis(obs, out, gt_vis, step=step, match_radius=args_cli.match_radius)
+                vis = build_vis(obs, out, gt_vis, perception, step=step, match_radius=args_cli.match_radius)
                 cv2.imwrite(os.path.join(out_dir, f"frame_{step:06d}.jpg"), vis)
 
             obs, _, term, trunc, _ = env.step(zero_action)
