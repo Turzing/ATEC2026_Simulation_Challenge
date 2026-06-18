@@ -56,7 +56,7 @@ from rgbd_utils import (
     world_to_robot_frame,
 )
 
-PERCEPTION_BUILD = "20260618-ee-horiz"
+PERCEPTION_BUILD = "20260618-fix-nav"
 
 # ── 分工距离 ────────────────────────────────────────────────────────────────
 FAR_EE_M = 1.30
@@ -276,7 +276,7 @@ def _detect_objects(
         pz = float(pr[2])
         rm = float(np.median(relief[ys, xs]))
         if not is_head:
-            if pz > cfg["robot_z_max"]:
+            if pz < -0.12 or pz > cfg["robot_z_max"]:
                 continue
             if rm < cfg["relief_min"] * 0.75 and depth_m < 2.0:
                 continue
@@ -534,6 +534,9 @@ class TaskBPerception:
         self._ee_tracks.clear()
         self._head_tracks.clear()
         self._next_id = 0
+        self.clear_nav_lock()
+
+    def clear_nav_lock(self) -> None:
         self._lock_id = None
         self._lock_world = None
         self._lock_miss = 0

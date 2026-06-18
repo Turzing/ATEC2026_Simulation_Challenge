@@ -634,7 +634,7 @@ class AlgSolution:
             from taskb_perception.rgbd_utils import (
                 compute_dynamic_ee_cam_pos,
                 compute_dynamic_head_cam_pos,
-                EE_CAM_ROT_MATRIX,
+                compute_ee_cam_rot_matrix,
                 HEAD_CAM_ROT_MATRIX,
                 robot_to_world,
             )
@@ -668,7 +668,12 @@ class AlgSolution:
 
         if "ee" in camera_name:
             cam_pos_robot = compute_dynamic_ee_cam_pos(arm_joints)
-            cam_rot_w = rot_world @ EE_CAM_ROT_MATRIX
+            cam_rot_robot = (
+                compute_ee_cam_rot_matrix(arm_joints)
+                if arm_joints is not None
+                else compute_ee_cam_rot_matrix(DEFAULT_ARM_JOINTS)
+            )
+            cam_rot_w = rot_world @ cam_rot_robot
         else:
             cam_pos_robot = compute_dynamic_head_cam_pos(gravity)
             cam_rot_w = rot_world @ HEAD_CAM_ROT_MATRIX
@@ -883,7 +888,7 @@ class AlgSolution:
         return perception_output, robot_pos_world, robot_yaw, pose_source
 
     def _correct_ee_camera_objects(self, perception_output: dict, robot_pos: np.ndarray, robot_yaw: float) -> None:
-        """使用相机真实位姿校正物体位置 (EE + head)"""
+        """GT 相机校正。EE 3D 感知默认跳过 (会改坏 target); head 抓取仍校正."""
         if perception_output is None:
             return
 
@@ -892,6 +897,7 @@ class AlgSolution:
         HEAD_INTR = (733.27, 733.27, 320.0, 240.0)
 
         corrected_any = False
+        ee_gt_corr = os.getenv("ATEC_TASKB_EE_GT_CORR", "0").lower() in ("1", "true", "yes")
 
         def _is_head_sourced(obj: dict) -> bool:
             if not isinstance(obj, dict):
@@ -901,35 +907,35 @@ class AlgSolution:
             src = str(obj.get("source_camera") or obj.get("source") or "")
             return "head" in src.lower()
 
-        # 获取 EE 相机真实位姿并校正 (跳过 head mirror，由 head 相机校正)
-        ee_cam_pose = self._get_ground_truth_camera_pose("ee_camera", robot_pos, robot_yaw)
-        if ee_cam_pose is not None:
-            ee_cam_pos_w, ee_cam_rot_w = ee_cam_pose
-            ee_objects = perception_output.get("ee_objects", [])
-            n_before = len(ee_objects)
-            for obj in ee_objects:
-                if obj.get("skip_camera_correction") or _is_head_sourced(obj):
-                    continue
-                self._correct_object_with_camera_pose(
-                    obj, ee_cam_pos_w, ee_cam_rot_w, *EE_INTR, robot_pos, robot_yaw,
-                )
-            target_nav = perception_output.get("target_nav")
-            if isinstance(target_nav, dict) and not target_nav.get("skip_camera_correction"):
-                if not _is_head_sourced(target_nav) and perception_output.get("nav_lock_id") is None:
+        if ee_gt_corr:
+            ee_cam_pose = self._get_ground_truth_camera_pose("ee_camera", robot_pos, robot_yaw)
+            if ee_cam_pose is not None:
+                ee_cam_pos_w, ee_cam_rot_w = ee_cam_pose
+                ee_objects = perception_output.get("ee_objects", [])
+                n_before = len(ee_objects)
+                for obj in ee_objects:
+                    if obj.get("skip_camera_correction") or _is_head_sourced(obj):
+                        continue
                     self._correct_object_with_camera_pose(
-                        target_nav, ee_cam_pos_w, ee_cam_rot_w, *EE_INTR, robot_pos, robot_yaw,
+                        obj, ee_cam_pos_w, ee_cam_rot_w, *EE_INTR, robot_pos, robot_yaw,
                     )
-            target_grasp = perception_output.get("target_grasp")
-            if isinstance(target_grasp, dict):
-                src = str(target_grasp.get("source") or target_grasp.get("camera") or "")
-                head_objs = perception_output.get("head_objects", [])
-                is_from_head = "head" in src.lower() or target_grasp in head_objs
-                if not is_from_head:
-                    self._correct_object_with_camera_pose(target_grasp, ee_cam_pos_w, ee_cam_rot_w, *EE_INTR, robot_pos, robot_yaw)
-            corrected_any = True
-            if self._step_count % 60 == 0:
-                pw = ee_cam_pos_w
-                self._log(f"[CORR] EE camera correction applied, {n_before} objects at pos=[{pw[0]:.2f}, {pw[1]:.2f}, {pw[2]:.2f}]")
+                target_nav = perception_output.get("target_nav")
+                if isinstance(target_nav, dict) and not target_nav.get("skip_camera_correction"):
+                    if not _is_head_sourced(target_nav) and perception_output.get("nav_lock_id") is None:
+                        self._correct_object_with_camera_pose(
+                            target_nav, ee_cam_pos_w, ee_cam_rot_w, *EE_INTR, robot_pos, robot_yaw,
+                        )
+                target_grasp = perception_output.get("target_grasp")
+                if isinstance(target_grasp, dict):
+                    src = str(target_grasp.get("source") or target_grasp.get("camera") or "")
+                    head_objs = perception_output.get("head_objects", [])
+                    is_from_head = "head" in src.lower() or target_grasp in head_objs
+                    if not is_from_head:
+                        self._correct_object_with_camera_pose(target_grasp, ee_cam_pos_w, ee_cam_rot_w, *EE_INTR, robot_pos, robot_yaw)
+                corrected_any = True
+                if self._step_count % 60 == 0:
+                    pw = ee_cam_pos_w
+                    self._log(f"[CORR] EE camera correction applied, {n_before} objects at pos=[{pw[0]:.2f}, {pw[1]:.2f}, {pw[2]:.2f}]")
 
         # 获取 head 相机真实位姿并校正 head 检测 + head mirror (ee_objects)
         head_cam_pose = self._get_ground_truth_camera_pose("head_camera", robot_pos, robot_yaw)
@@ -1970,6 +1976,8 @@ class AlgSolution:
             self._log(f"[NAV] fuse unlock: {reason}")
         self._fuse_lock_key = None
         self._fuse_pos_world = None
+        if self.perception is not None and hasattr(self.perception, "clear_nav_lock"):
+            self.perception.clear_nav_lock()
         self._ee_only_no_head_frames = 0
         self._nav_stall_turn_rad = 0.0
         self._nav_stall_dist_start = None
@@ -2019,6 +2027,20 @@ class AlgSolution:
         target = self._prepare_pipeline_object(raw_nav, nav_cam, robot_pos_world, robot_yaw)
         if target is None:
             return None
+
+        pr = self._safe_numpy(target.get("pos_robot"), np.zeros(3, dtype=np.float32))
+        pw = self._safe_numpy(target.get("pos_world"), np.zeros(3, dtype=np.float32))
+        if float(pr[2]) < -0.30 or float(pw[2]) < 0.02 or float(pw[2]) > 0.45:
+            self._clear_fuse_nav_lock(f"bad_z robot_z={pr[2]:.2f} world_z={pw[2]:.2f}")
+            return None
+
+        gt_match = self._match_gt_for_target(target)
+        if gt_match is not None:
+            gt_pw = self._safe_numpy(gt_match.get("pos_world"), pw)
+            gt_err = float(np.linalg.norm(gt_pw[:2] - pw[:2]))
+            if gt_err > 0.55:
+                self._clear_fuse_nav_lock(f"gt_reject err={gt_err:.2f}m")
+                return None
 
         lock_key = (lock_id, lock_class)
         pw = self._safe_numpy(target.get("pos_world"), np.zeros(3, dtype=np.float32))
@@ -2070,6 +2092,9 @@ class AlgSolution:
         fallback_candidates = self._normalize_camera_objects(fallback_raw, fallback_camera, robot_pos_world, robot_yaw)
 
         target = self._fuse_perception_target(perception_output, robot_pos_world, robot_yaw)
+        if target is None and perception_output.get("nav_lock_id") is None:
+            if perception_output.get("target_nav") is None and self._fuse_lock_key is not None:
+                self._clear_fuse_nav_lock("target_nav_lost")
         ee_hint = perception_output.get("ee_search_hint")
         bearing_only = isinstance(ee_hint, dict) and bool(ee_hint.get("bearing_only"))
         if target is None and perception_output.get("nav_lock_id") is None and not bearing_only:
@@ -2459,12 +2484,15 @@ class AlgSolution:
                 if ee_rgb.ndim == 3 and ee_rgb.shape[-1] >= 3:
                     ee_nav = dict(nav_info)
                     try:
-                        from config import PROPRIO_ARM_START, PROPRIO_ARM_LEN
+                        from config import PROPRIO_ARM_START, DEFAULT_ARM_JOINTS
                         p = self._tensor_to_numpy(obs.get("proprio"))
                         if p is not None:
                             q = np.asarray(p, dtype=np.float32).reshape(-1)
-                            j2 = float(q[PROPRIO_ARM_START + 1])
-                            ee_nav["overlay_extra"] = [f"arm_j2={j2:.2f} (want~3.14)"]
+                            j2_rel = float(q[PROPRIO_ARM_START + 1])
+                            j2_abs = j2_rel + float(DEFAULT_ARM_JOINTS[1])
+                            ee_nav["overlay_extra"] = [
+                                f"arm_j2={j2_abs:.2f} rel={j2_rel:.2f} (tgt~3.14)",
+                            ]
                     except Exception:
                         pass
                     ee_bgr = self._format_rgb_overlay(ee_rgb.astype(np.uint8), ee_nav, "ee", ee_objects)
