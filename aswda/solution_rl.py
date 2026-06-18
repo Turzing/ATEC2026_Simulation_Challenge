@@ -19,13 +19,9 @@ PERCEPTION_DIR = os.path.join(REPO_ROOT, "taskb_perception")
 if os.path.isdir(PERCEPTION_DIR) and PERCEPTION_DIR not in sys.path:
     sys.path.insert(0, PERCEPTION_DIR)
 
-from config import BIN_CENTER, ROBOT_INIT_POS, ROBOT_INIT_YAW
-# 感知: 默认全新精简版; ATEC_TASKB_PIPELINE=legacy 才用旧 dual_pipeline
-_taskb_pipeline = os.getenv("ATEC_TASKB_PIPELINE", "clean").strip().lower()
-if _taskb_pipeline in ("legacy", "dual", "old"):
-    from rgbd_pure_dual_pipeline import RgbdPureDualPipeline as TaskBPerception
-else:
-    from taskb_perception_clean import TaskBPerceptionClean as TaskBPerception
+from config import BIN_CENTER, ROBOT_INIT_POS, ROBOT_INIT_YAW, DEFAULT_ARM_JOINTS, NAV_EE_ARM_JOINTS
+# 感知: taskb_perception.py — EE 导航 / head 抓取 (单文件, 无旧 pipeline)
+from taskb_perception import TaskBPerception, PERCEPTION_BUILD
 from rgbd_utils import depth_to_vis, parse_ee_rgbd, parse_head_rgbd, depth_stats
 
 try:
@@ -141,7 +137,7 @@ class AlgSolution:
 
         # 强制初始化感知管道，不使用回退
         self.perception = TaskBPerception()
-        self._log(f"[TaskB-PERCEPTION] pipeline={_taskb_pipeline}")
+        self._log(f"[TaskB-PERCEPTION] build={PERCEPTION_BUILD}")
 
         checkpoint = torch.load(self.checkpoint_path, map_location="cpu")
         state_dict = checkpoint["model_state_dict"]
@@ -2288,6 +2284,15 @@ class AlgSolution:
         policy_obs = torch.cat(components, dim=-1)
         return torch.nan_to_num(policy_obs, nan=0.0, posinf=0.0, neginf=0.0)
 
+    def _nav_arm_action(self) -> torch.Tensor:
+        """Approach 阶段: 臂抬到水平广角位 (joint2≈π), EE 朝前看而非俯视."""
+        arm = torch.zeros(self.arm_action_dim, device=self.device, dtype=torch.float32)
+        scale = float(self.arm_action_scale)
+        n = min(6, self.arm_action_dim, len(NAV_EE_ARM_JOINTS))
+        for i in range(n):
+            arm[i] = (float(NAV_EE_ARM_JOINTS[i]) - float(DEFAULT_ARM_JOINTS[i])) / scale
+        return arm
+
     def _map_policy_action_to_env_action(self, action_train: torch.Tensor) -> torch.Tensor:
         if action_train.shape[-1] != self.leg_action_dim:
             raise ValueError(f"Policy output dim mismatch: got {action_train.shape[-1]}, expected {self.leg_action_dim}")
@@ -2295,9 +2300,12 @@ class AlgSolution:
         num_envs = action_train.shape[0]
         action_env = torch.zeros((num_envs, self.total_action_dim), device=self.device, dtype=torch.float32)
         action_env[:, :self.leg_action_dim] = action_train * self.leg_action_scale
-        # 机械臂动作空间使用相对默认位置的偏差（use_default_offset=True）
-        # 当动作值为 0 时，机械臂会保持在环境配置中设置的默认位置
-        action_env[:, self.leg_action_dim:] = 0.0
+        # 寻物/接近/去桶: EE 保持水平广角 (joint2≈π); 蹲下/抓取/站起由 ArmGraspController 接管
+        if self._task_state in ("APPROACH_OBJECT", "NAV_TO_BIN"):
+            nav_arm = self._nav_arm_action()
+            action_env[:, self.leg_action_dim:] = nav_arm.unsqueeze(0).expand(num_envs, -1)
+        else:
+            action_env[:, self.leg_action_dim:] = 0.0
         return torch.nan_to_num(action_env, nan=0.0, posinf=0.0, neginf=0.0)
 
     def _format_rgb_overlay(self, rgb: np.ndarray, nav_info: dict[str, Any], camera_name: str, detected_objects: list = None) -> np.ndarray:

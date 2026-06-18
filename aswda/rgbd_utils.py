@@ -366,6 +366,22 @@ def compute_dynamic_ee_cam_pos(arm_joints) -> np.ndarray:
     return (EE_CAM_POS_ROBOT + delta).astype(np.float32)
 
 
+def compute_ee_cam_rot_matrix(arm_joints) -> np.ndarray:
+    """
+    EE 相机旋转: 固定夹爪安装角 + 臂关节 (尤其 joint2/3) 带来的俯仰.
+    必须与当前帧实际臂姿一致, 否则 3D 反投影与 EE 画面不匹配.
+    """
+    q = np.asarray(arm_joints, dtype=np.float32).reshape(-1)[:6]
+    dq = q - DEFAULT_ARM_JOINTS
+    pitch_y = float(dq[1]) + 0.42 * float(dq[2])
+    cy, sy = float(np.cos(pitch_y)), float(np.sin(pitch_y))
+    r_y = np.array([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]], dtype=np.float32)
+    roll_x = 0.30 * float(dq[0]) + 0.18 * float(dq[4])
+    cx, sx = float(np.cos(roll_x)), float(np.sin(roll_x))
+    r_x = np.array([[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]], dtype=np.float32)
+    return (r_y @ r_x @ EE_CAM_ROT_MATRIX).astype(np.float32)
+
+
 def compute_dynamic_head_cam_pos(projected_gravity) -> np.ndarray:
     """蹲下/倾身时修正 head 外参 (projected_gravity 偏离 [0,0,-1])"""
     pos = HEAD_CAM_POS_ROBOT.copy()
