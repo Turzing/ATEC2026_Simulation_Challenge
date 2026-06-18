@@ -255,6 +255,28 @@ def is_sky_phantom_bbox(obj: dict, *, img_h: int = IMG_H) -> bool:
     return False
 
 
+def is_ee_floor_gripper_phantom(obj: dict, *, img_h: int = IMG_H) -> bool:
+    """
+    EE 为 eye-in-hand，臂低头时相机直视地面/夹爪，固定外参反投影会得到 z<0 假目标。
+    典型特征: bbox 在画面下方 + 深度很近 (见 turn_to_target 截图)。
+    """
+    bbox = obj.get("bbox")
+    if not bbox or len(bbox) != 4:
+        return False
+    y1, y2 = float(bbox[1]), float(bbox[3])
+    cy = 0.5 * (y1 + y2)
+    depth = float(obj.get("depth_m") or obj.get("nav_depth_m") or 99.0)
+    pr = obj.get("pos_robot")
+    pz = float(pr[2]) if pr is not None else 0.0
+    if pz < -0.12 and depth < 2.5:
+        return True
+    if y2 > img_h * 0.56 and depth < 1.40:
+        return True
+    if cy > img_h * 0.50 and depth < 0.90:
+        return True
+    return False
+
+
 def is_ee_sky_blob(obj: dict, *, img_h: int = IMG_H, img_w: int = IMG_W) -> bool:
     """EE 框在画面上方 + 深度假近 → 地平线 phantom (log 里 conf 0.86 天空 mustard)."""
     if is_sky_phantom_bbox(obj, img_h=img_h):

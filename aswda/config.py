@@ -281,9 +281,9 @@ PROPRIO_ARM_LEN = 6            # arm_joint1..6 (不含手指)
 PROPRIO_FINGER_LEFT = 30       # arm_joint7 (=12+18)
 PROPRIO_FINGER_RIGHT = 31      # arm_joint8 (=12+19)
 
-# 仿真默认臂姿 (与 task_b / solution 一致) — 用于 EE 动态外参基准
+# 仿真默认臂姿 — 与官方 b2.py init_state.arm_joint1..6 一致
 DEFAULT_ARM_JOINTS = np.array(
-    [-0.5, 0.8, -1.5, 0.3, -0.2, 0.1], dtype=np.float32,
+    [0.0, 2.13, -1.20, 0.0, -0.8, 0.0], dtype=np.float32,
 )
 
 PROPRIO_BASE_LIN_VEL = slice(0, 3)

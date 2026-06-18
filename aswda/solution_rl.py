@@ -19,9 +19,13 @@ PERCEPTION_DIR = os.path.join(REPO_ROOT, "taskb_perception")
 if os.path.isdir(PERCEPTION_DIR) and PERCEPTION_DIR not in sys.path:
     sys.path.insert(0, PERCEPTION_DIR)
 
-# 强制导入 taskb_perception 模块，不使用回退
 from config import BIN_CENTER, ROBOT_INIT_POS, ROBOT_INIT_YAW
-from rgbd_pure_dual_pipeline import RgbdPureDualPipeline
+# 感知: 默认全新精简版; ATEC_TASKB_PIPELINE=legacy 才用旧 dual_pipeline
+_taskb_pipeline = os.getenv("ATEC_TASKB_PIPELINE", "clean").strip().lower()
+if _taskb_pipeline in ("legacy", "dual", "old"):
+    from rgbd_pure_dual_pipeline import RgbdPureDualPipeline as TaskBPerception
+else:
+    from taskb_perception_clean import TaskBPerceptionClean as TaskBPerception
 from rgbd_utils import depth_to_vis, parse_ee_rgbd, parse_head_rgbd, depth_stats
 
 try:
@@ -134,7 +138,8 @@ class AlgSolution:
             raise FileNotFoundError(f"Missing checkpoint: {self.checkpoint_path}")
 
         # 强制初始化感知管道，不使用回退
-        self.perception = RgbdPureDualPipeline()
+        self.perception = TaskBPerception()
+        self._log(f"[TaskB-PERCEPTION] pipeline={_taskb_pipeline}")
 
         checkpoint = torch.load(self.checkpoint_path, map_location="cpu")
         state_dict = checkpoint["model_state_dict"]
