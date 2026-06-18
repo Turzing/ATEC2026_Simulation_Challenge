@@ -213,7 +213,8 @@ DEFAULT_GRASP_FIXED_QUAT = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
 # 抓取深度: 从物体顶面向下偏移量 (m), 确保夹爪啮合物体
 GRASP_DEPTH_OFFSET = 0.03
 
-# IK 末端为 gripper_base，指尖沿夹爪 local +Z 延伸 (~12cm)
+# IK 末端为 gripper_base，指尖沿夹爪 local +Z 延伸 (~12cm，与 solution_gt ATEC_TASKB_FINGER_OFFSET 默认一致)
+# 感知先算指尖接触点，再回退为传给 start_grasp 的 trash_pos_w（DISABLE_FINGER_COMP=1 时 motion 不再补偿）
 GRIPPER_TIP_OFFSET_M = 0.12
 GRIPPER_TIP_OFFSET_ENABLE = True
 # solution_gt.start_grasp 会对 trash_pos_w 再 +world Z 此值，感知预扣以免双重抬高
@@ -229,7 +230,7 @@ MIN_NAV_POS_CONF = 0.35         # world_reliable 参考
 MIN_NAV_LOCK_CONF = 0.38        # 新锁目标最低置信
 EE_PHANTOM_NEAR_M = 1.85        # EE 假近距阈值
 EE_PHANTOM_HEAD_GAP_M = 0.35    # head 最近比 EE 远此值 → 判 EE 假近
-DETECTION_COAST_FRAMES = 14     # 漏检时保持上一帧目标帧数
+DETECTION_COAST_FRAMES = 14     # YOLO 漏检时保持上一帧目标帧数
 HEAD_NAV_BOTTOM_FRAC = 0.72     # bbox 底边分位用于 horizontal 定位
 HEAD_NAV_Z_PERCENTILE = 42      # 点云 robot-Z 分位 (近表面)
 EE_SKY_CY_FRAC = 0.38           # EE bbox 中心高于此 → 天空假检
@@ -281,14 +282,9 @@ PROPRIO_ARM_LEN = 6            # arm_joint1..6 (不含手指)
 PROPRIO_FINGER_LEFT = 30       # arm_joint7 (=12+18)
 PROPRIO_FINGER_RIGHT = 31      # arm_joint8 (=12+19)
 
-# 仿真默认臂姿 — 与官方 env_cfg / b2.py init_state 一致 (不可改 env_cfg)
+# 仿真默认臂姿 (与 task_b / solution 一致) — 用于 EE 动态外参基准
 DEFAULT_ARM_JOINTS = np.array(
-    [0.0, 2.13, -1.20, 0.0, -0.8, 0.0], dtype=np.float32,
-)
-
-# 导航 EE 目标臂姿: joint2≈π 水平广角 (solution_rl 每帧下发, 不改官方 env)
-NAV_EE_ARM_JOINTS = np.array(
-    [0.0, 3.14, -1.20, 0.0, -0.8, 0.0], dtype=np.float32,
+    [-0.5, 0.8, -1.5, 0.3, -0.2, 0.1], dtype=np.float32,
 )
 
 PROPRIO_BASE_LIN_VEL = slice(0, 3)

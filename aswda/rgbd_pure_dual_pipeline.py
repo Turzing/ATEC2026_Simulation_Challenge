@@ -11,7 +11,6 @@ ee_objects: 给 solution_rl approach 读 EE 导航; grasp 由 head lock 合成
 
 from __future__ import annotations
 
-import os
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -88,8 +87,6 @@ MOTION_FREEZE_THRESH = 0.35
 NAV_AUTHORITY = {"far_ee": "ee", "near_head": "ee", "grasp": "head"}
 NAV_FALLBACK = {"far_ee": "head", "near_head": "head", "grasp": None}
 EE_BEARING_ONLY_MAX_M = 4.2   # EE 3D 导航可用到更远距离
-PERC_DEBUG = os.getenv("ATEC_TASKB_PERC_DEBUG", "0").strip().lower() in ("1", "true", "yes", "on")
-PERC_DEBUG_EVERY = max(1, int(os.getenv("ATEC_TASKB_PERC_DEBUG_EVERY", "25")))
 
 
 def _obj_dist(obj: Optional[dict]) -> float:
@@ -300,7 +297,7 @@ class _TemporalMedian:
         depths = [x["depth_m"] for x in h if x.get("depth_m") is not None]
         if depths:
             m["depth_m"] = float(np.median(depths))
-            m["nav_depth_m"] = m["depth_m"]
+        m["nav_depth_m"] = m["depth_m"]
 
         uvs = [x.get("centroid_uv") for x in h if x.get("centroid_uv") is not None]
         if uvs:
@@ -487,8 +484,7 @@ def _is_ee_phantom_near(ee_o: dict, head_objs: List[dict]) -> bool:
             return True
         if ee_d < 2.0 and min_head_d > ee_d + 0.20:
             return True
-    # head=0 时 EE 独导航: 只杀天空框, 不因 world_reliable 误杀真目标
-    return False
+    return ee_d < 1.50 and not bool(ee_o.get("world_reliable"))
 
 
 def _filter_phantom_ee(ee_objs: List[dict], head_objs: List[dict]) -> List[dict]:
@@ -620,7 +616,7 @@ def _find_in_pool_by_id(pool: List[dict], lock_id: Optional[int]) -> Optional[di
         return None
     for o in pool:
         if int(o.get("id", -1)) == int(lock_id):
-            return o
+                return o
     return None
 
 
@@ -1184,9 +1180,8 @@ class RgbdPureDualPipeline:
         self._last_ee_motion: List[dict] = []
         self._last_head_objs: List[dict] = []
         print(
-            "[RgbdPureDual] ee-nav | head-grasp | "
-            f"coast={DETECTION_COAST_FRAMES}f | "
-            f"perc_debug={'on' if PERC_DEBUG else 'off'}"
+            "[RgbdPureDual] simple-dual | head-nav | ee-sky-only | "
+            f"coast={DETECTION_COAST_FRAMES}f"
         )
 
     def reset(self):
@@ -1302,18 +1297,17 @@ class RgbdPureDualPipeline:
         self.ee.set_projected_gravity(grav)
 
         h_rgb, h_depth = parse_head_rgbd(obs)
-        head_objs_raw, _, head_meta = self.head.process_frame(h_rgb, h_depth, rp, ry)
+        head_objs, _, head_meta = self.head.process_frame(h_rgb, h_depth, rp, ry)
 
-        ee_objs_raw: List[dict] = []
+        ee_objs: List[dict] = []
         ee_meta: dict = {}
         ee_stats: dict = {}
         e_rgb, e_depth = parse_ee_rgbd(obs)
         if e_rgb is not None and e_depth is not None:
-            ee_objs_raw, _, ee_meta = self.ee.process_frame(e_rgb, e_depth, rp, ry)
+            ee_objs, _, ee_meta = self.ee.process_frame(e_rgb, e_depth, rp, ry)
             ee_stats = ee_meta.get("depth_stats") or depth_stats(e_depth)
 
-        head_objs = [_as_head_nav(o) for o in head_objs_raw]
-        ee_objs = list(ee_objs_raw)
+        head_objs = [_as_head_nav(o) for o in head_objs]
         ee_objs = self._class_stable.apply(ee_objs, "ee")
         head_objs = self._class_stable.apply(head_objs, "head")
         head_objs = self._temporal.apply(head_objs, "head", rp, ry, motion)
@@ -1324,18 +1318,10 @@ class RgbdPureDualPipeline:
         ee_objs = [self._pos_gate.apply(o, "ee", rp, ry) for o in ee_objs]
 
         ee_objs = filter_plausible_objects(ee_objs, "ee")
-        ee_after_phantom = _filter_phantom_ee(ee_objs, head_objs)
-        ee_near = _obj_dist(_best_nav_target(ee_after_phantom) or _best_ee_grasp(ee_after_phantom))
+        ee_objs = _filter_phantom_ee(ee_objs, head_objs)
+        ee_near = _obj_dist(_best_nav_target(ee_objs) or _best_ee_grasp(ee_objs))
         head_objs = filter_plausible_objects(head_objs, "head", ee_near_m=ee_near)
-        ee_objs = _drop_ee_class_conflict(ee_after_phantom, head_objs)
-
-        if PERC_DEBUG and self.frame_count % PERC_DEBUG_EVERY == 0:
-            print(
-                f"[PERC-DBG] f={self.frame_count} "
-                f"raw ee={len(ee_objs_raw)} head={len(head_objs_raw)} "
-                f"filt ee={len(ee_objs)} head={len(head_objs)} "
-                f"lock={self._nav_lock_id}"
-            )
+        ee_objs = _drop_ee_class_conflict(ee_objs, head_objs)
 
         if not head_objs and self._last_head_objs:
             head_objs = [
@@ -1429,16 +1415,10 @@ class RgbdPureDualPipeline:
         )
         head_close = (
             head_lock_hit is not None
-            and (
-                _head_confirms_lock(
-                    head_objs, head_lock_hit.get("id"), head_lock_hit.get("class"),
-                )
-                or (
-                    self._nav_lock_id is not None
-                    and int(head_lock_hit.get("id", -1)) == int(self._nav_lock_id)
-                )
+            and _head_confirms_lock(
+                head_objs, head_lock_hit.get("id"), head_lock_hit.get("class"),
             )
-            and _nav_dist_conservative(head_lock_hit) < GRASP_APPROACH_DIST_M + 0.06
+            and _nav_dist_conservative(head_lock_hit) < GRASP_APPROACH_DIST_M
         )
         lock_dist = _nav_dist_conservative(locked or lock_ref_obj)
         want_grasp = (

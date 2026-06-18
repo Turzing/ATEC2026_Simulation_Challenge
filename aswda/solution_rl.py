@@ -20,7 +20,7 @@ if os.path.isdir(PERCEPTION_DIR) and PERCEPTION_DIR not in sys.path:
     sys.path.insert(0, PERCEPTION_DIR)
 
 from config import BIN_CENTER, ROBOT_INIT_POS, ROBOT_INIT_YAW, DEFAULT_ARM_JOINTS
-# 感知: taskb_perception — 官网 eye-to-hand / eye-in-hand 分工
+# 感知: rgbd_pure_dual (已验证 HSV+depth 双摄)
 from taskb_perception import TaskBPerception, PERCEPTION_BUILD
 from rgbd_utils import depth_to_vis, parse_ee_rgbd, parse_head_rgbd, depth_stats
 
@@ -137,7 +137,7 @@ class AlgSolution:
 
         # 强制初始化感知管道，不使用回退
         self.perception = TaskBPerception()
-        self._log(f"[TaskB-PERCEPTION] build={PERCEPTION_BUILD} | official sensors head+ee")
+        self._log(f"[TaskB-PERCEPTION] build={PERCEPTION_BUILD} | ee=nav head=grasp (rgbd_pure_dual)")
 
         checkpoint = torch.load(self.checkpoint_path, map_location="cpu")
         state_dict = checkpoint["model_state_dict"]

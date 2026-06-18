@@ -255,31 +255,6 @@ def is_sky_phantom_bbox(obj: dict, *, img_h: int = IMG_H) -> bool:
     return False
 
 
-def is_ee_floor_gripper_phantom(obj: dict, *, img_h: int = IMG_H) -> bool:
-    """
-    EE 为 eye-in-hand，臂低头时相机直视地面/夹爪，固定外参反投影会得到 z<0 假目标。
-    典型特征: bbox 在画面下方 + 深度很近 (见 turn_to_target 截图)。
-    """
-    bbox = obj.get("bbox")
-    if not bbox or len(bbox) != 4:
-        return False
-    y1, y2 = float(bbox[1]), float(bbox[3])
-    cy = 0.5 * (y1 + y2)
-    depth = float(obj.get("depth_m") or obj.get("nav_depth_m") or 99.0)
-    pr = obj.get("pos_robot")
-    pz = float(pr[2]) if pr is not None else 0.0
-    if pz < -0.12 and depth < 2.5:
-        return True
-    # 远距地面真实目标: EE 低头时黄瓶仍在画面下方, depth>1.2m 应保留
-    if depth >= 1.25:
-        return False
-    if y2 > img_h * 0.56 and depth < 1.40:
-        return True
-    if cy > img_h * 0.50 and depth < 0.90:
-        return True
-    return False
-
-
 def is_ee_sky_blob(obj: dict, *, img_h: int = IMG_H, img_w: int = IMG_W) -> bool:
     """EE 框在画面上方 + 深度假近 → 地平线 phantom (log 里 conf 0.86 天空 mustard)."""
     if is_sky_phantom_bbox(obj, img_h=img_h):
@@ -334,7 +309,7 @@ def filter_plausible_objects(
                 continue
             if depth < 2.5 and not bbox_lateral_consistent(o):
                 continue
-            if depth < 1.05 and sm < 38:
+            if depth < 1.05 and sm < 46:
                 continue
             if depth < 0.80 and sm < 54:
                 continue
@@ -364,22 +339,6 @@ def compute_dynamic_ee_cam_pos(arm_joints) -> np.ndarray:
         0.12 * (np.cos(dq[1]) - 1.0) + 0.09 * np.sin(dq[3]) + 0.06 * dq[4] + 0.05 * dq[2],
     ], dtype=np.float32)
     return (EE_CAM_POS_ROBOT + delta).astype(np.float32)
-
-
-def compute_ee_cam_rot_matrix(arm_joints) -> np.ndarray:
-    """
-    EE 相机旋转: 固定夹爪安装角 + 臂关节 (尤其 joint2/3) 带来的俯仰.
-    必须与当前帧实际臂姿一致, 否则 3D 反投影与 EE 画面不匹配.
-    """
-    q = np.asarray(arm_joints, dtype=np.float32).reshape(-1)[:6]
-    dq = q - DEFAULT_ARM_JOINTS
-    pitch_y = float(dq[1]) + 0.42 * float(dq[2])
-    cy, sy = float(np.cos(pitch_y)), float(np.sin(pitch_y))
-    r_y = np.array([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]], dtype=np.float32)
-    roll_x = 0.30 * float(dq[0]) + 0.18 * float(dq[4])
-    cx, sx = float(np.cos(roll_x)), float(np.sin(roll_x))
-    r_x = np.array([[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]], dtype=np.float32)
-    return (r_y @ r_x @ EE_CAM_ROT_MATRIX).astype(np.float32)
 
 
 def compute_dynamic_head_cam_pos(projected_gravity) -> np.ndarray:

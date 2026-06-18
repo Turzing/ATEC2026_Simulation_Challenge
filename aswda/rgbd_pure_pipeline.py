@@ -59,7 +59,7 @@ CAMERA_CFG = {
         "pos": HEAD_CAM_POS_ROBOT,
         "rot": HEAD_CAM_ROT_MATRIX,
         "roi_v_min": 0.08,
-        "roi_v_max": 0.88,
+        "roi_v_max": 0.78,
         "roi_v_max_near": 0.96,
         "roi_u_margin": 0.04,
         "bottom_strip_v0": 0.66,
