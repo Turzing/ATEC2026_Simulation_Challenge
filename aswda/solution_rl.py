@@ -19,7 +19,7 @@ PERCEPTION_DIR = os.path.join(REPO_ROOT, "taskb_perception")
 if os.path.isdir(PERCEPTION_DIR) and PERCEPTION_DIR not in sys.path:
     sys.path.insert(0, PERCEPTION_DIR)
 
-from config import BIN_CENTER, ROBOT_INIT_POS, ROBOT_INIT_YAW, DEFAULT_ARM_JOINTS
+from config import BIN_CENTER, ROBOT_INIT_POS, ROBOT_INIT_YAW, DEFAULT_ARM_JOINTS, NAV_EE_ARM_JOINTS
 # 感知: rgbd_pure_dual (已验证 HSV+depth 双摄)
 from taskb_perception import TaskBPerception, PERCEPTION_BUILD
 from rgbd_utils import depth_to_vis, parse_ee_rgbd, parse_head_rgbd, depth_stats
@@ -61,6 +61,9 @@ class AlgSolution:
         self.camera_follow_enabled = os.getenv("ATEC_TASKB_CAMERA_FOLLOW", "1").lower() in {"1", "true", "yes", "on"}
         self.nav_debug = os.getenv("ATEC_TASKB_NAV_DEBUG", "1").lower() in {"1", "true", "yes", "on"}
         self.nav_debug_every = max(1, int(os.getenv("ATEC_TASKB_NAV_DEBUG_EVERY", "25")))
+        # GT 只用于可选误差对比日志，不得参与导航/感知/抓取决策
+        self.gt_guidance_enabled = os.getenv("ATEC_TASKB_GT_GUIDANCE", "0").lower() in {"1", "true", "yes", "on"}
+        self.gt_cmp_debug = os.getenv("ATEC_TASKB_GT_CMP_DEBUG", "0").lower() in {"1", "true", "yes", "on"}
         self.target_mode = os.getenv("ATEC_TASKB_TARGET_MODE", "object").lower()
         self._nav_debug_step = 0
         self._step_count = 0
@@ -242,6 +245,16 @@ class AlgSolution:
         self.arm_action_scale = 0.5
         self.arm_ik_joint_names = list(self.arm_joint_names[:6])
         self.gripper_joint_names = list(self.arm_joint_names[6:])
+        j2_act = (float(NAV_EE_ARM_JOINTS[1]) - float(DEFAULT_ARM_JOINTS[1])) / float(self.arm_action_scale)
+        self._log(
+            f"[TaskB-NAV] approach/search EE arm joint2 "
+            f"{DEFAULT_ARM_JOINTS[1]:.2f}->{NAV_EE_ARM_JOINTS[1]:.2f} "
+            f"(arm_action[arm_joint2]={j2_act:.2f})"
+        )
+        self._log(
+            f"[TaskB] GT guidance={'ON' if self.gt_guidance_enabled else 'OFF'} "
+            f"(robot pose=odometry+perception; GT-CMP debug={'ON' if self.gt_cmp_debug else 'OFF'})"
+        )
 
         self.show_rgb = os.getenv("ATEC_SHOW_RGB", "1").lower() in {"1", "true", "yes", "on"}
         self.rgb_debug_every = max(1, int(os.getenv("ATEC_SHOW_RGB_EVERY", "50")))
@@ -373,7 +386,8 @@ class AlgSolution:
             self.perception.reset()
 
     def get_action_spec(self) -> dict[str, dict[str, Any]] | None:
-        return None
+        # joint2: 2.13→3.14 需 arm_action≈2.0; 若被 ±1 截断则 EE 永远俯视
+        return {"arm": {"mode": "position", "scale": 0.5, "clip": [-3.0, 3.0]}}
 
     def _get_scene(self):
         if self.env is None:
@@ -535,13 +549,33 @@ class AlgSolution:
         local_nav: dict[str, Any],
         perception_output: dict[str, Any] | None,
     ) -> tuple[np.ndarray, float, str]:
-        # 直接使用环境中的 ground truth 机器人位姿，不回退
-        gt_pose = self._get_ground_truth_robot_pose()
-        if gt_pose is not None:
-            return gt_pose
-        
-        # 如果获取失败，返回初始位置（不应该发生）
-        self._log("[WARNING] Failed to get ground truth robot pose, using initial position")
+        if self.gt_guidance_enabled:
+            gt_pose = self._get_ground_truth_robot_pose()
+            if gt_pose is not None:
+                return gt_pose
+            self._log("[WARNING] GT guidance on but robot pose unavailable, fallback to odometry")
+
+        if isinstance(perception_output, dict):
+            robot = perception_output.get("robot") or {}
+            pos_w = robot.get("pos_world")
+            yaw = robot.get("yaw")
+            if pos_w is not None and yaw is not None:
+                return (
+                    np.asarray(pos_w, dtype=np.float32).reshape(3),
+                    float(yaw),
+                    str(robot.get("pose_source") or "perception_odometry"),
+                )
+
+        robot = (local_nav or {}).get("robot") or {}
+        pos_w = robot.get("pos_world")
+        yaw = robot.get("yaw")
+        if pos_w is not None:
+            return (
+                np.asarray(pos_w, dtype=np.float32).reshape(3),
+                float(yaw if yaw is not None else 0.0),
+                str(robot.get("pose_source") or "local_odometry"),
+            )
+
         return np.asarray(ROBOT_INIT_POS, dtype=np.float32).copy(), float(ROBOT_INIT_YAW), "robot_init"
 
     def _get_ground_truth_robot_pose(self) -> tuple[np.ndarray, float, str] | None:
@@ -863,15 +897,18 @@ class AlgSolution:
         #         else:
         #             print(f"[SolutionRL] Raw ee_depth type: {type(ee_depth_raw)}", flush=True)
         
-        gt_pose = self._get_ground_truth_robot_pose()
-        gt_pos = gt_pose[0] if gt_pose is not None else None
-        gt_yaw = gt_pose[1] if gt_pose is not None else None
         try:
-            perception_output = self.perception.process(obs, dt=self.dt, gt_robot_pos=gt_pos, gt_robot_yaw=gt_yaw)
-            
-            # 使用相机真实位姿校正 EE 相机物体位置
-            self._correct_ee_camera_objects(perception_output, gt_pos, gt_yaw)
-            
+            if self.gt_guidance_enabled:
+                gt_pose = self._get_ground_truth_robot_pose()
+                gt_pos = gt_pose[0] if gt_pose is not None else None
+                gt_yaw = gt_pose[1] if gt_pose is not None else None
+                perception_output = self.perception.process(
+                    obs, dt=self.dt, gt_robot_pos=gt_pos, gt_robot_yaw=gt_yaw,
+                )
+                if gt_pos is not None and gt_yaw is not None:
+                    self._correct_ee_camera_objects(perception_output, gt_pos, gt_yaw)
+            else:
+                perception_output = self.perception.process(obs, dt=self.dt)
         except Exception as exc:
             if not self._perception_error_printed:
                 self._log(f"[TaskB-PERCEPTION] disabled after error: {type(exc).__name__}: {exc}")
@@ -2027,13 +2064,14 @@ class AlgSolution:
             self._clear_fuse_nav_lock(f"bad_z robot_z={pr[2]:.2f} world_z={pw[2]:.2f}")
             return None
 
-        gt_match = self._match_gt_for_target(target)
-        if gt_match is not None:
-            gt_pw = self._safe_numpy(gt_match.get("pos_world"), pw)
-            gt_err = float(np.linalg.norm(gt_pw[:2] - pw[:2]))
-            if gt_err > 0.55:
-                self._clear_fuse_nav_lock(f"gt_reject err={gt_err:.2f}m")
-                return None
+        if self.gt_guidance_enabled:
+            gt_match = self._match_gt_for_target(target)
+            if gt_match is not None:
+                gt_pw = self._safe_numpy(gt_match.get("pos_world"), pw)
+                gt_err = float(np.linalg.norm(gt_pw[:2] - pw[:2]))
+                if gt_err > 0.55:
+                    self._clear_fuse_nav_lock(f"gt_reject err={gt_err:.2f}m")
+                    return None
 
         lock_key = (lock_id, lock_class)
         pw = self._safe_numpy(target.get("pos_world"), np.zeros(3, dtype=np.float32))
@@ -2199,11 +2237,16 @@ class AlgSolution:
     def _get_navigation_input(self, obs: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None]:
         local_nav = self._update_local_odometry(obs)
 
-        gt_pose = self._get_ground_truth_robot_pose()
-        gt_pos = gt_pose[0] if gt_pose is not None else None
-        gt_yaw = gt_pose[1] if gt_pose is not None else None
         try:
-            perception_output = self.perception.process(obs, dt=self.dt, gt_robot_pos=gt_pos, gt_robot_yaw=gt_yaw)
+            if self.gt_guidance_enabled:
+                gt_pose = self._get_ground_truth_robot_pose()
+                gt_pos = gt_pose[0] if gt_pose is not None else None
+                gt_yaw = gt_pose[1] if gt_pose is not None else None
+                perception_output = self.perception.process(
+                    obs, dt=self.dt, gt_robot_pos=gt_pos, gt_robot_yaw=gt_yaw,
+                )
+            else:
+                perception_output = self.perception.process(obs, dt=self.dt)
             return self._adapt_perception_output(obs, local_nav, perception_output)
         except Exception as exc:
             if not self._perception_error_printed:
@@ -2327,6 +2370,95 @@ class AlgSolution:
 
         policy_obs = torch.cat(components, dim=-1)
         return torch.nan_to_num(policy_obs, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _should_hold_nav_ee_arm(self) -> bool:
+        if self._task_state != "APPROACH_OBJECT":
+            return False
+        ctrl = self._arm_grasp_controller
+        if ctrl is not None and getattr(ctrl, "state", "IDLE") != "IDLE":
+            return False
+        return True
+
+    def _nav_ee_arm_action(self, num_envs: int) -> torch.Tensor:
+        """导航/搜索阶段把 EE 抬到水平 (不改 env_cfg, 只写 arm action)."""
+        defaults = {
+            "arm_joint1": float(DEFAULT_ARM_JOINTS[0]),
+            "arm_joint2": float(DEFAULT_ARM_JOINTS[1]),
+            "arm_joint3": float(DEFAULT_ARM_JOINTS[2]),
+            "arm_joint4": float(DEFAULT_ARM_JOINTS[3]),
+            "arm_joint5": float(DEFAULT_ARM_JOINTS[4]),
+            "arm_joint6": float(DEFAULT_ARM_JOINTS[5]),
+            "arm_joint7": 0.0,
+            "arm_joint8": 0.0,
+        }
+        targets = {
+            "arm_joint1": float(NAV_EE_ARM_JOINTS[0]),
+            "arm_joint2": float(NAV_EE_ARM_JOINTS[1]),
+            "arm_joint3": float(NAV_EE_ARM_JOINTS[2]),
+            "arm_joint4": float(NAV_EE_ARM_JOINTS[3]),
+            "arm_joint5": float(NAV_EE_ARM_JOINTS[4]),
+            "arm_joint6": float(NAV_EE_ARM_JOINTS[5]),
+            "arm_joint7": 0.0,
+            "arm_joint8": 0.0,
+        }
+        scale = float(self.arm_action_scale)
+        actions = [
+            (targets.get(name, defaults.get(name, 0.0)) - defaults.get(name, 0.0)) / scale
+            for name in self.arm_joint_names
+        ]
+        row = torch.tensor(actions, device=self.device, dtype=torch.float32).view(1, -1)
+        if num_envs <= 1:
+            return row
+        return row.repeat(num_envs, 1)
+
+    def _ensure_arm_joint_ids(self, robot) -> list[int] | None:
+        if getattr(self, "_arm_joint_ids_cached", None) is not None:
+            return self._arm_joint_ids_cached
+        if robot is None:
+            return None
+        try:
+            arm_joint_ids, _ = robot.find_joints(list(self.arm_joint_names))
+            self._arm_joint_ids_cached = list(arm_joint_ids)
+            return self._arm_joint_ids_cached
+        except Exception as exc:
+            self._log(f"[TaskB-NAV] arm joint ids not found: {exc}")
+            return None
+
+    def _apply_nav_ee_arm_if_needed(self, action_env: torch.Tensor) -> torch.Tensor:
+        """导航/搜索: 把 arm 抬到 NAV_EE 水平位 (与 ArmGraspController 同一套 action 公式)."""
+        if not self._should_hold_nav_ee_arm():
+            return action_env
+
+        action_env = action_env.clone()
+        robot = self._get_robot()
+        scale = float(self.arm_action_scale)
+        nav_targets = list(NAV_EE_ARM_JOINTS[:6]) + [0.0, 0.0]
+
+        if robot is not None:
+            arm_ids = self._ensure_arm_joint_ids(robot)
+            if arm_ids is not None and len(arm_ids) == len(self.arm_joint_names):
+                default = robot.data.default_joint_pos.to(device=action_env.device, dtype=action_env.dtype)
+                for i, jid in enumerate(arm_ids):
+                    base = float(default[0, jid])
+                    tgt = float(nav_targets[i])
+                    action_env[:, jid] = (tgt - base) / scale
+                if self._step_count % 120 == 0:
+                    try:
+                        j2_id = arm_ids[1]
+                        j2_now = float(robot.data.joint_pos[0, j2_id].item())
+                        j2_act = float(action_env[0, j2_id].item())
+                        self._log(
+                            f"[TaskB-NAV] EE arm hold: joint2={j2_now:.2f} "
+                            f"target={nav_targets[1]:.2f} action={j2_act:.2f}"
+                        )
+                    except Exception:
+                        pass
+                return action_env
+
+        # fallback: 无 robot 引用时按 action 向量顺序写
+        arm = self._nav_ee_arm_action(action_env.shape[0])
+        action_env[:, self.leg_action_dim:] = arm
+        return action_env
 
     def _map_policy_action_to_env_action(self, action_train: torch.Tensor) -> torch.Tensor:
         if action_train.shape[-1] != self.leg_action_dim:
@@ -2624,6 +2756,8 @@ class AlgSolution:
         return best
 
     def _maybe_print_locked_target_gt_debug(self, nav_info: dict[str, Any]) -> None:
+        if not self.gt_cmp_debug:
+            return
         target = nav_info.get("target")
         if not isinstance(target, dict):
             target = self._locked_target
@@ -2657,8 +2791,11 @@ class AlgSolution:
         )
 
     def _enrich_grasp_target_with_gt(self, target: dict[str, Any] | None) -> dict[str, Any] | None:
+        """默认不注入 GT 坐标；仅保留透传 (抓取完全用感知输出)."""
         if not isinstance(target, dict):
             return None
+        if not self.gt_guidance_enabled:
+            return dict(target)
         enriched = dict(target)
         gt = self._match_gt_for_target(target)
         if gt is not None:
@@ -3325,6 +3462,8 @@ class AlgSolution:
 
         if action_env is None:
             action_env = self._policy_action_from_base_cmd(obs, base_cmd)
+
+        action_env = self._apply_nav_ee_arm_if_needed(action_env)
 
         self._last_base_cmd = base_cmd
         self._last_nav_info = nav_info

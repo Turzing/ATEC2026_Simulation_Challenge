@@ -631,10 +631,17 @@ class RgbdPureCamera:
         }
         return fused
 
+    def _cam_rot_robot(self) -> np.ndarray:
+        rot = self._cfg["rot"]
+        if self.camera_name == "ee" and self._arm_joints is not None:
+            from rgbd_utils import compute_ee_cam_rot_matrix
+            rot = compute_ee_cam_rot_matrix(self._arm_joints)
+        return rot
+
     def _uv_depth_to_robot(self, u: float, v: float, z: float) -> np.ndarray:
         cam = self._cfg["cam"]
         p_cam = pixel_depth_to_cam(u, v, z, cam)
-        return (self._cam_pos_robot() + self._cfg["rot"] @ p_cam).astype(np.float32)
+        return (self._cam_pos_robot() + self._cam_rot_robot() @ p_cam).astype(np.float32)
 
     def _filter_depth_outliers(
         self, ys: np.ndarray, xs: np.ndarray, depth: np.ndarray, depth_m: float,
@@ -1078,7 +1085,8 @@ class RgbdPureCamera:
         is_head = self.camera_name == "head"
         is_ee = self.camera_name == "ee"
         x1, y1, x2, y2 = bbox
-        if y2 < h * 0.52:
+        # 仅 EE 水平导航: 远距黄物在画面下半; head 中远距 fallback 不能误杀
+        if is_ee and y2 < h * 0.52:
             return None
 
         # ── head: 点云 + 底边 anchor 导航 (近端 depth, 避免 bbox 底边打到地面) ──

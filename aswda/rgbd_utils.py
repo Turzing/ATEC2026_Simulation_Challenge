@@ -329,6 +329,19 @@ def filter_plausible_objects(
     return out
 
 
+def compute_ee_cam_rot_matrix(arm_joints) -> np.ndarray:
+    """EE 相机旋转: 固定夹爪安装角 + 臂关节 (尤其 joint2) 俯仰."""
+    q = np.asarray(arm_joints, dtype=np.float32).reshape(-1)[:6]
+    dq = q - DEFAULT_ARM_JOINTS
+    pitch = 0.85 * float(dq[1]) + 0.32 * float(dq[2]) + 0.14 * float(dq[3])
+    roll = 0.18 * float(dq[0]) + 0.10 * float(dq[4])
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    cr, sr = np.cos(roll), np.sin(roll)
+    ry = np.array([[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]], dtype=np.float32)
+    rx = np.array([[1.0, 0.0, 0.0], [0.0, cr, -sr], [0.0, sr, cr]], dtype=np.float32)
+    return (EE_CAM_ROT_MATRIX @ ry @ rx).astype(np.float32)
+
+
 def compute_dynamic_ee_cam_pos(arm_joints) -> np.ndarray:
     """臂关节相对默认姿 → EE 相机在 robot 系下的偏移 (无 GT, 蹲下/伸臂时修正)"""
     q = np.asarray(arm_joints, dtype=np.float32).reshape(-1)[:6]
