@@ -1,5 +1,5 @@
 """
-Task B RGBD 感知 v4
+Task B RGBD 感知 v5
 
 相机分工 (与官方一致):
   EE   = eye-in-hand 广角 → 远距导航 (>1.4m), 输出 anchor 供 GT 相机校正
@@ -7,6 +7,7 @@ Task B RGBD 感知 v4
 
 检测: 自适应 HSV + depth, 参考 rgbd_pure_pipeline 阈值
 稳定: track coast (丢检仍输出) + EMA 平滑
+精度: head 目标 skip_camera_correction, 避免 solution_rl HEAD CORR 二次拉偏
 """
 
 from __future__ import annotations
@@ -57,7 +58,7 @@ from rgbd_utils import (
     _to_numpy,
 )
 
-PERCEPTION_BUILD = "20260618-taskb-rgbd-v4"
+PERCEPTION_BUILD = "20260618-taskb-rgbd-v5"
 CLASS_NAME = "mustard_bottle"
 
 FAR_NAV_M = 1.40
@@ -118,6 +119,22 @@ def _robust_depth(depth, ys, xs, *, anchor_v: float, band_frac: float = 0.20) ->
     if dvals.size < 3:
         return None
     return float(np.median(dvals))
+
+
+def _head_nav_anchor_v(y1: int, y2: int) -> float:
+    """俯视 head: 略低于 bbox 中心取深度, 避免 y2 贴地采到地板."""
+    return float(y1 + 0.68 * (y2 - y1 + 1))
+
+
+def _apply_correction_hints(obj: dict) -> dict:
+    """head 外参已与仿真一致时, 跳过 solution_rl 的 HEAD GT 重投影."""
+    out = dict(obj)
+    cam = str(out.get("source_camera") or out.get("camera") or "")
+    depth = float(out.get("depth_m") or out.get("nav_depth_m") or 99.0)
+    if "head" in cam and out.get("world_reliable") and depth < 2.5:
+        out["skip_camera_correction"] = True
+        out["correction_policy"] = "perception_trusted"
+    return out
 
 
 def _plausible_obj(obj: dict, camera: str) -> bool:
@@ -192,16 +209,12 @@ def _detect_yellow_rgbd(rgb: np.ndarray, depth: np.ndarray, camera: str) -> List
             continue
 
         nav_u = float(0.5 * (x1 + x2))
-        nav_v = float(y2)
+        nav_v = _head_nav_anchor_v(y1, y2) if camera == "head" else float(y2)
         nav_depth = _robust_depth(depth, ys, xs, anchor_v=nav_v)
         if nav_depth is None:
             continue
 
-        if camera == "ee":
-            pr = pixel_to_robot(nav_u, nav_v, nav_depth, cam_cfg, cam_pos, cam_rot)
-        else:
-            p_cam = pixel_depth_to_cam(nav_u, nav_v, nav_depth, cam_cfg)
-            pr = (cam_pos + cam_rot @ p_cam).astype(np.float32)
+        pr = pixel_to_robot(nav_u, nav_v, nav_depth, cam_cfg, cam_pos, cam_rot)
 
         obj = {
             "bbox": [x1, y1, x2, y2],
@@ -214,6 +227,7 @@ def _detect_yellow_rgbd(rgb: np.ndarray, depth: np.ndarray, camera: str) -> List
             "nav_depth_m": nav_depth,
             "pos_robot": pr.tolist(),
             "dist_to_robot": float(np.linalg.norm(pr[:2])),
+            "horiz_dist_m": float(np.linalg.norm(pr[:2])),
             "yaw_rel": float(np.arctan2(float(pr[1]), float(pr[0]))),
             "nav_yaw_rel": float(np.arctan2(float(pr[1]), float(pr[0]))),
             "source_camera": camera,
@@ -229,7 +243,7 @@ def _detect_yellow_rgbd(rgb: np.ndarray, depth: np.ndarray, camera: str) -> List
             "blob_val_mean": float(np.median(hsv[:, :, 2][ys, xs])),
         }
         if _plausible_obj(obj, camera):
-            out.append(obj)
+            out.append(_apply_correction_hints(obj))
 
     out.sort(key=lambda o: float(o.get("depth_m") or 999.0))
     return out
@@ -301,7 +315,7 @@ def _match_tracks(
         used.add(best_id)
         prev = tracks.get(best_id)
         obj["id"] = int(best_id)
-        smoothed = _smooth_with_prev(obj, prev, robot_pos, robot_yaw)
+        smoothed = _apply_correction_hints(_smooth_with_prev(obj, prev, robot_pos, robot_yaw))
         if prev is not None:
             for k in ("nav_anchor_uv", "nav_anchor_depth", "grasp_anchor_uv", "grasp_anchor_depth"):
                 if k in prev and smoothed.get(k) is None:
@@ -511,6 +525,8 @@ class TaskBPerceptionClean:
                 }
         if target_nav is None and primary_nav is not None:
             target_nav = dict(primary_nav)
+        if target_nav is not None:
+            target_nav = _apply_correction_hints(target_nav)
 
         lock_dist = float(target_nav.get("dist_to_robot") or 999.0) if target_nav else 999.0
         head_hit = None
@@ -532,10 +548,14 @@ class TaskBPerceptionClean:
             and not head_hit.get("track_coast")
         )
         phase = "grasp" if want_grasp else "approach"
-        target_grasp = _grasp_from_head(head_hit, rp, ry) if want_grasp and head_hit else None
+        target_grasp = (
+            _apply_correction_hints(_grasp_from_head(head_hit, rp, ry))
+            if want_grasp and head_hit
+            else None
+        )
 
-        ee_export = [o for o in ee_objs if not o.get("track_coast")][:3]
-        head_export = [o for o in head_objs if not o.get("track_coast")][:3]
+        ee_export = [_apply_correction_hints(o) for o in ee_objs if not o.get("track_coast")][:3]
+        head_export = [_apply_correction_hints(o) for o in head_objs if not o.get("track_coast")][:3]
         nav_cam = str((target_nav or {}).get("source_camera") or self._nav_authority)
         active_cam = "head" if (want_grasp or lock_dist <= FAR_NAV_M) else "ee"
 

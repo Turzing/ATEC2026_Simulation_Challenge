@@ -87,6 +87,8 @@ class AlgSolution:
         self._locked_target_world: list[float] | None = None
         self._pregrasp_stall_steps = 0
         self._pregrasp_last_robot_xy: np.ndarray | None = None
+        self._approach_stall_steps = 0
+        self._approach_last_robot_xy: np.ndarray | None = None
         self._nav_heading_error_f: float | None = None
         self._nav_turn_sign: int = 0
         self._nav_turn_sign_hold = 0
@@ -226,6 +228,10 @@ class AlgSolution:
         self.nav_heading_ema_alpha = float(os.getenv("ATEC_TASKB_NAV_HEADING_EMA", "0.28"))
         self.nav_turn_sign_hold_steps = max(3, int(os.getenv("ATEC_TASKB_TURN_SIGN_HOLD_STEPS", "8")))
         self.pregrasp_stall_steps = max(10, int(os.getenv("ATEC_TASKB_PREGRASP_STALL_STEPS", "35")))
+        self.approach_stall_steps = max(8, int(os.getenv("ATEC_TASKB_APPROACH_STALL_STEPS", "22")))
+        self.approach_stall_boost_lin = float(os.getenv("ATEC_TASKB_APPROACH_STALL_BOOST_LIN", "0.58"))
+        self.approach_min_lin_vel = float(os.getenv("ATEC_TASKB_APPROACH_MIN_LIN_VEL", "0.45"))
+        self.head_correction_max_delta = float(os.getenv("ATEC_TASKB_HEAD_CORR_MAX_DELTA", "0.22"))
         self.turn_then_go_yaw_threshold = float(os.getenv("ATEC_TASKB_TURN_THEN_GO_YAW_THRESHOLD", "0.30"))
         self.turn_then_go_heading_hold = float(os.getenv("ATEC_TASKB_TURN_THEN_GO_HEADING_HOLD", "0.18"))
         self.dynamic_stop_distance_far = float(os.getenv("ATEC_TASKB_DYNAMIC_STOP_DISTANCE_FAR", "1.15"))
@@ -356,6 +362,10 @@ class AlgSolution:
         self._locked_goal_yaw = None
         self._locked_goal_target_id = None
         self._locked_target_world = None
+        self._pregrasp_stall_steps = 0
+        self._pregrasp_last_robot_xy = None
+        self._approach_stall_steps = 0
+        self._approach_last_robot_xy = None
         self._release_step_count = 0
         self._pending_grasp_status = None
         self._reset_sit_down_tracking()
@@ -1044,6 +1054,8 @@ class AlgSolution:
         robot_yaw: float,
     ) -> None:
         """使用相机真实位姿校正单个物体位置"""
+        if obj.get("skip_camera_correction"):
+            return
         picked = self._pick_reproject_uv_depth(obj)
         if picked is None:
             return
@@ -1080,6 +1092,22 @@ class AlgSolution:
         if reproj is None:
             return
         p_world, p_robot = reproj
+
+        if old_pos_w is not None:
+            try:
+                old_pw = np.asarray(old_pos_w, dtype=np.float32)
+                shift_xy = float(np.linalg.norm(p_world[:2] - old_pw[:2]))
+                src = str(obj.get("source_camera") or obj.get("source") or "")
+                is_head = "head" in src.lower() or bool(obj.get("nav_from_head"))
+                if is_head and shift_xy > self.head_correction_max_delta:
+                    if self._step_count % 60 == 0:
+                        self._log(
+                            f"[CORR] skip head reproject shift={shift_xy:.2f}m "
+                            f"(keep perc pos_w=[{old_pw[0]:.2f},{old_pw[1]:.2f}])"
+                        )
+                    return
+            except Exception:
+                pass
 
         obj["pos_world"] = [float(p_world[0]), float(p_world[1]), float(p_world[2])]
         obj["pose_source"] = "gt_camera"
@@ -1265,8 +1293,10 @@ class AlgSolution:
         heading_scale = max(self.min_heading_lin_scale, abs(math.cos(heading_error)))
 
         lin_x = float(np.clip(remaining * approach_scale * heading_scale, 0.0, self.max_lin_vel))
-        if remaining > 0.35 and lin_x < 0.45:
-            lin_x = 0.45 * approach_scale
+        if remaining > 0.35 and lin_x < self.approach_min_lin_vel:
+            lin_x = self.approach_min_lin_vel * approach_scale
+        if remaining > 0.55 and lin_x < 0.55:
+            lin_x = 0.55 * max(approach_scale, 0.55)
         lin_y = 0.0
         ang_z = float(np.clip(heading_error * self.heading_kp, -self.max_ang_vel, self.max_ang_vel))
         if remaining > 2.0:
@@ -1425,11 +1455,45 @@ class AlgSolution:
                     "unlocking frozen goal"
                 )
                 self._clear_frozen_pregrasp()
-                return self._compute_dynamic_visual_cmd(target_nav, target_pos_robot)
+                base_cmd, nav_info = self._compute_dynamic_visual_cmd(target_nav, target_pos_robot)
+                return self._maybe_boost_approach_cmd(base_cmd, nav_info, robot_pos_world)
             return base_cmd, nav_info
         self._pregrasp_stall_steps = 0
         self._pregrasp_last_robot_xy = None
         base_cmd, nav_info = self._compute_dynamic_visual_cmd(target_nav, target_pos_robot)
+        return self._maybe_boost_approach_cmd(base_cmd, nav_info, robot_pos_world)
+
+    def _maybe_boost_approach_cmd(
+        self,
+        base_cmd: np.ndarray,
+        nav_info: dict[str, Any],
+        robot_pos_world: np.ndarray,
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        """底盘长时间不动且仍有剩余距离时, 提高前进速度."""
+        if bool(nav_info.get("stopped")):
+            self._approach_stall_steps = 0
+            self._approach_last_robot_xy = None
+            return base_cmd, nav_info
+        robot_xy = self._safe_numpy(robot_pos_world, np.zeros(3, dtype=np.float32))[:2]
+        goal_dist = float(nav_info.get("goal_dist") or nav_info.get("forward_error") or 0.0)
+        if self._approach_last_robot_xy is not None:
+            moved = float(np.linalg.norm(robot_xy - self._approach_last_robot_xy))
+            if moved < 0.012 and goal_dist > 0.32 and 0.04 < abs(float(base_cmd[0])) < 0.42:
+                self._approach_stall_steps += 1
+            else:
+                self._approach_stall_steps = max(0, self._approach_stall_steps - 1)
+        self._approach_last_robot_xy = robot_xy.copy()
+        if self._approach_stall_steps >= self.approach_stall_steps and goal_dist > 0.28:
+            boosted = base_cmd.copy()
+            boosted[0] = max(float(boosted[0]), self.approach_stall_boost_lin)
+            nav_info = dict(nav_info)
+            nav_info["phase"] = "approach_stall_boost"
+            if self._approach_stall_steps == self.approach_stall_steps:
+                self._log(
+                    f"[NAV] approach stall boost: goal={goal_dist:.2f}m "
+                    f"cmd={boosted[0]:.2f}"
+                )
+            return boosted, nav_info
         return base_cmd, nav_info
 
     @staticmethod
@@ -1960,7 +2024,7 @@ class AlgSolution:
             self._fuse_pos_world = pw.copy()
             self._nav_heading_error_f = None
         else:
-            alpha = 0.62
+            alpha = 0.38 if raw_nav.get("skip_camera_correction") else 0.62
             self._fuse_pos_world = (1.0 - alpha) * self._fuse_pos_world + alpha * pw
             pw = self._fuse_pos_world.copy()
         self._fuse_pos_world = pw.copy()
