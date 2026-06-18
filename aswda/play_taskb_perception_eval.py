@@ -11,13 +11,17 @@ Task B 感知层单独验证 — 不跑 solution_rl / 操作层
 与 solution_rl 同条件 (无 GT 位姿):
     python scripts/play_taskb_perception_eval.py --task ATEC-TaskB-B2Piper --enable_cameras --no-gt-pose
 
+两个窗口:
+    Isaac Sim  = 3D 场景 (默认机器人 head 视角, 在此按 WASD)
+    OpenCV     = 感知预览 (head+检测框, 不要在此按 WASD)
+
 操作 (先点 Isaac Sim 窗口获焦):
     W/S     前进 / 后退
     A/D     左转 / 右转
     P       拍照存图 + 终端打印检测/GT 误差
     Q       退出
 
-建议带 policy.pt 站立更稳:
+必须带 policy.pt 才能稳定站立行走:
     python scripts/play_taskb_perception_eval.py --task ATEC-TaskB-B2Piper --enable_cameras \\
         --policy demo/policy.pt
 
@@ -76,6 +80,13 @@ parser.add_argument(
     help="预览 solution_rl 融合层是否会拒 target_nav (默认开)",
 )
 parser.add_argument("--no-simulate-fuse", action="store_false", dest="simulate_fuse")
+parser.add_argument(
+    "--view",
+    type=str,
+    default="follow",
+    choices=("follow", "head", "ee"),
+    help="Isaac 主视口: follow=机器人后方第三人称 head/ee=传感器第一人称",
+)
 parser.add_argument("--disable_fabric", action="store_true", default=False)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -93,6 +104,7 @@ from isaaclab.envs import DirectMARLEnv, multi_agent_to_single_agent  # noqa: E4
 from isaaclab_tasks.utils import parse_env_cfg  # noqa: E402
 
 import atec_rl_lab.tasks  # noqa: F401, E402
+from atec_rl_lab.tasks.task_base.action_base import apply_safe_action_spec  # noqa: E402
 
 from config import BIN_CENTER, BIN_RADIUS  # noqa: E402
 from rgbd_utils import depth_to_vis, parse_ee_rgbd, parse_head_rgbd  # noqa: E402
@@ -100,9 +112,11 @@ from sim_test_common import ManualKeyboard, resolve_policy  # noqa: E402
 from taskb_perception import PERCEPTION_BUILD, TaskBPerception  # RgbdPureDualPipeline
 
 try:
-    from rl_utils import camera_follow
+    from rl_utils import camera_follow, camera_follow_behind, camera_robot_sensor_view
 except ImportError:
     camera_follow = None
+    camera_follow_behind = None
+    camera_robot_sensor_view = None
 
 
 def _object_index(name: str) -> int | None:
@@ -435,6 +449,34 @@ def _layer_verdict(out: dict, fuse_msg: str) -> str:
     return fuse_msg
 
 
+def _update_viewport(env) -> bool:
+    view = str(getattr(args_cli, "view", "follow") or "follow")
+    ok = False
+    if view == "follow":
+        if camera_follow_behind:
+            ok = bool(camera_follow_behind(env))
+        elif camera_follow:
+            camera_follow(env)
+            ok = True
+    else:
+        cam_name = "ee_camera" if view == "ee" else "head_camera"
+        if camera_robot_sensor_view:
+            ok = bool(camera_robot_sensor_view(env, cam_name))
+        if not ok:
+            if camera_follow_behind:
+                ok = bool(camera_follow_behind(env))
+            elif camera_follow:
+                camera_follow(env)
+                ok = True
+    if not getattr(_update_viewport, "_logged", False):
+        _update_viewport._logged = True
+        print(
+            f"[viewport] mode={view} applied={'OK' if ok else 'FAILED (仍可能是 Isaac 默认俯视)'}",
+            flush=True,
+        )
+    return ok
+
+
 def _make_env():
     env_cfg = parse_env_cfg(
         args_cli.task,
@@ -442,6 +484,7 @@ def _make_env():
         num_envs=args_cli.num_envs,
         use_fabric=not args_cli.disable_fabric,
     )
+    env_cfg = apply_safe_action_spec(env_cfg, "{}")
     env = gym.make(args_cli.task, cfg=env_cfg)
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
@@ -460,22 +503,25 @@ def run_manual() -> int:
     if policy_path:
         print(f"[PERC-EVAL] policy -> {policy_path}")
     else:
-        print("[PERC-EVAL] tip: add --policy demo/policy.pt for stable stand/walk")
+        print("[PERC-EVAL] *** 未找到 demo/policy.pt — 狗站不稳, WASD 可能无效 ***")
+        print("[PERC-EVAL] 请加: --policy demo/policy.pt")
 
     env = _make_env()
     device = env.unwrapped.device
+    action_dim = int(np.prod(env.action_space.shape))
     perception = TaskBPerception()
-    kb = ManualKeyboard(str(device), policy_path)
+    kb = ManualKeyboard(str(device), policy_path, action_dim=action_dim)
+    print(f"[PERC-EVAL] action_dim={action_dim} keyboard={'OK' if kb.keyboard_ok else 'FAILED'}")
 
     live = args_cli.live
-    if live and not os.environ.get("DISPLAY"):
-        print("[PERC-EVAL] no DISPLAY, using --no-live (P still saves)", flush=True)
-        live = False
+    print(f"[PERC-EVAL] Isaac viewport --view={args_cli.view} (follow=后方第三人称, head/ee=传感器视角)")
 
     print(
         "\n=== 感知验证 (绕过 solution_rl) ===\n"
+        "  Isaac Sim = 默认机器人后方视角 + WASD\n"
+        "  OpenCV 窗 = head 相机 + 检测框 (TaskB-Perception-Eval)\n"
         "  绿框=检测与 GT 对齐  橙框=检测但 GT 对不上\n"
-        "  1. 点击 Isaac Sim 窗口\n"
+        "  1. 点击 Isaac Sim 窗口 (不是 OpenCV)\n"
         "  2. WASD 移动找垃圾\n"
         "  3. P 拍照 (存图 + 打印 感知/融合 诊断)\n"
         "  4. Q 退出\n"
@@ -486,12 +532,11 @@ def run_manual() -> int:
 
     obs, _ = env.reset()
     obs = _obs_dict(obs)
-    for _ in range(20):
-        act = kb.get_action(obs, 0)
+    for warm in range(20):
+        act = kb.get_action(obs, warm)
         obs, _, term, trunc, _ = env.step(act)
         obs = _obs_dict(obs)
-        if camera_follow:
-            camera_follow(env)
+        _update_viewport(env)
         if _episode_done(term, trunc):
             obs, _ = env.reset()
             obs = _obs_dict(obs)
@@ -507,8 +552,12 @@ def run_manual() -> int:
                 obs, _, term, trunc, _ = env.step(act)
                 obs = _obs_dict(obs)
                 step += 1
-                if camera_follow:
-                    camera_follow(env)
+                _update_viewport(env)
+
+                if step % 120 == 0 and kb.keyboard_ok:
+                    vx, wz = kb.walk.last_cmd
+                    if vx != 0.0 or wz != 0.0:
+                        print(f"[PERC-EVAL] cmd vx={vx:.2f} wz={wz:.2f} (Isaac 窗 WASD)", flush=True)
 
                 need_perceive = live or kb.snap or (step % max(1, args_cli.preview_every) == 0)
                 if not need_perceive:
