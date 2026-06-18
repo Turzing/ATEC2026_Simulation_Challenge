@@ -281,12 +281,12 @@ PROPRIO_ARM_LEN = 6            # arm_joint1..6 (不含手指)
 PROPRIO_FINGER_LEFT = 30       # arm_joint7 (=12+18)
 PROPRIO_FINGER_RIGHT = 31      # arm_joint8 (=12+19)
 
-# 仿真默认臂姿 — 与官方 b2.py init_state.arm_joint1..6 一致
+# 仿真默认臂姿 — 与官方 env_cfg / b2.py init_state 一致 (不可改 env_cfg)
 DEFAULT_ARM_JOINTS = np.array(
     [0.0, 2.13, -1.20, 0.0, -0.8, 0.0], dtype=np.float32,
 )
 
-# 远距 EE 导航反投影用臂姿: arm_joint2≈π 使 EE 广角近似水平朝前 (solution_gt 同款)
+# 导航 EE 目标臂姿: joint2≈π 水平广角 (solution_rl 每帧下发, 不改官方 env)
 NAV_EE_ARM_JOINTS = np.array(
     [0.0, 3.14, -1.20, 0.0, -0.8, 0.0], dtype=np.float32,
 )

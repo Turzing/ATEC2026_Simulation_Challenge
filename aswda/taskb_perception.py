@@ -56,7 +56,7 @@ from rgbd_utils import (
     world_to_robot_frame,
 )
 
-PERCEPTION_BUILD = "20260618-3d-dual"
+PERCEPTION_BUILD = "20260618-ee-horiz"
 
 # ── 分工距离 ────────────────────────────────────────────────────────────────
 FAR_EE_M = 1.30
