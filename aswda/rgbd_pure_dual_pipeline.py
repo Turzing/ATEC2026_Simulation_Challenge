@@ -2,11 +2,11 @@
 RGB-D 双摄像头感知 — 三段式 + 优先权
 
 阶段 (距离迟滞):
-    far_ee   (>= ~1.28m) → head 主导导航
-    near_head(< ~1.28m)  → head 主导导航
-    grasp    (< 1.10m)    → EE 独占抓取
+    far_ee   (>= ~1.28m) → EE 主导导航
+    near_head(< ~1.28m)  → EE 主导导航
+    grasp    (< 1.22m)    → head 提供抓取点
 
-ee_objects: 给 solution_rl (approach 固定读 ee); head 目标 mirror 写入
+ee_objects: 给 solution_rl approach 读 EE 导航; grasp 由 head lock 合成
 """
 
 from __future__ import annotations
@@ -41,90 +41,30 @@ from config import (
     TOTAL_OBJECTS,
 )
 from rgbd_pure_pipeline import RgbdPureCamera, _robot_to_world, _yaw_from_gravity
-try:
-    from rgbd_utils import (
-        GRASP_RELIABLE_DEPTH_M,
-        MIN_NAV_POS_CONF,
-        RGBD_SIMPLE,
-        STATIC_TWO_STEP,
-        _is_head_fallback_det,
-        _to_numpy,
-        bbox_lateral_consistent,
-        compensate_grasp_for_gripper_base,
-        compute_dynamic_ee_cam_pos,
-        compute_dynamic_head_cam_pos,
-        depth_stats,
-        filter_plausible_objects,
-        head_nav_pos_confidence,
-        is_ee_floor_phantom,
-        is_ee_sky_blob,
-        is_head_edge_phantom,
-        is_head_sky_phantom,
-        is_sky_phantom_bbox,
-        is_blob_nav_det,
-        is_ransac_supplement,
-        blob_nav_pool,
-        TASKB_PIPELINE,
-        RANSAC_SUPPLEMENT_MAX_PX,
-        CLASS_AGNOSTIC,
-        apply_class_agnostic,
-        parse_ee_rgbd,
-        parse_head_rgbd,
-        refresh_ee_object_pose,
-        refresh_head_object_pose,
-        align_nav_pos_to_bbox_ray,
-        refresh_locked_grasp,
-        reject_pos_world_jump,
-        stabilize_ee_nav_pose,
-        world_to_robot_frame,
-    )
-except ImportError:
-    from rgbd_utils import (
-        GRASP_RELIABLE_DEPTH_M,
-        MIN_NAV_POS_CONF,
-        _is_head_fallback_det,
-        _to_numpy,
-        bbox_lateral_consistent,
-        compensate_grasp_for_gripper_base,
-        compute_dynamic_ee_cam_pos,
-        compute_dynamic_head_cam_pos,
-        depth_stats,
-        filter_plausible_objects,
-        head_nav_pos_confidence,
-        is_ee_floor_phantom,
-        is_ee_sky_blob,
-        is_head_edge_phantom,
-        is_head_sky_phantom,
-        is_sky_phantom_bbox,
-        is_blob_nav_det,
-        is_ransac_supplement,
-        blob_nav_pool,
-        TASKB_PIPELINE,
-        RANSAC_SUPPLEMENT_MAX_PX,
-        CLASS_AGNOSTIC,
-        apply_class_agnostic,
-        parse_ee_rgbd,
-        parse_head_rgbd,
-        refresh_ee_object_pose,
-        refresh_head_object_pose,
-        align_nav_pos_to_bbox_ray,
-        refresh_locked_grasp,
-        reject_pos_world_jump,
-        stabilize_ee_nav_pose,
-        world_to_robot_frame,
-    )
-    RGBD_SIMPLE = os.getenv("ATEC_RGBD_SIMPLE", "1").strip().lower() not in ("0", "false", "no")
-    STATIC_TWO_STEP = os.getenv("ATEC_TASKB_STATIC_TWO_STEP", "1").strip().lower() not in ("0", "false", "no")
-
-try:
-    from depth_ransac_cluster import RansacClusterDetector
-except ImportError:
-    RansacClusterDetector = None  # type: ignore[misc, assignment]
-
-try:
-    from rgbd_depth_cluster import PERCEPTION_BUILD_ID as _DEPTH_CLUSTER_BUILD
-except ImportError:
-    _DEPTH_CLUSTER_BUILD = "missing-rgbd_depth_cluster"
+from rgbd_utils import (
+    GRASP_RELIABLE_DEPTH_M,
+    MIN_NAV_POS_CONF,
+    _to_numpy,
+    bbox_lateral_consistent,
+    compensate_grasp_for_gripper_base,
+    compute_dynamic_ee_cam_pos,
+    compute_dynamic_head_cam_pos,
+    depth_stats,
+    filter_plausible_objects,
+    head_nav_pos_confidence,
+    is_ee_sky_blob,
+    is_head_edge_phantom,
+    is_sky_phantom_bbox,
+    parse_ee_rgbd,
+    parse_head_rgbd,
+    refresh_ee_object_pose,
+    refresh_head_object_pose,
+    align_nav_pos_to_bbox_ray,
+    refresh_locked_grasp,
+    reject_pos_world_jump,
+    stabilize_ee_nav_pose,
+    world_to_robot_frame,
+)
 
 GRASP_PHASE_DIST_M = 1.10
 GRASP_APPROACH_DIST_M = 1.22   # head/lock 近距即请求 grasp 阶段
@@ -132,27 +72,24 @@ GRASP_LOCK_DIST_M = 1.22
 GRASP_UNLOCK_DIST_M = 1.50
 HEAD_DISABLE_DIST_M = 1.05
 NAV_EE_FAR_MIN_M = 1.35          # >= 远距 EE 导航
-NAV_EE_TO_HEAD_M = float(os.getenv("ATEC_TASKB_NAV_EE_TO_HEAD_M", "1.85"))  # 迟滞: 远→近 head 主导
-NAV_HEAD_TO_EE_M = float(os.getenv("ATEC_TASKB_NAV_HEAD_TO_EE_M", "2.05"))  # 迟滞: 近→远 EE 主导
+NAV_EE_TO_HEAD_M = 1.28          # 迟滞: 远→近
+NAV_HEAD_TO_EE_M = 1.42          # 迟滞: 近→远
 NAV_LOCK_MISS_MAX = 45           # 丢失多少帧后解锁重选 (~0.9s)
-NAV_LOCK_MISS_MAX_STATIC = 120   # 两步走 EE 主导: 允许更长的 lock coast
 EE_NAV_LOCK_MAX_DEPTH_M = 2.05   # EE 独锁最大深度 (log: 2.36m 偏 1.55m)
 EE_ONLY_HEAD_CONFIRM_MAX = 30    # EE-only 锁无 head 确认则解锁 (~0.6s)
 NAV_RELOCK_MAX_XY_M = 1.25       # 重锁不得离上一 lock_world 超过此距
-NAV_LOCK_WORLD_STICK_M = 0.48    # class_agnostic: 同 id 但超此距视为 tracker 复用 → 拒
-NAV_LOCK_CLOSE_STICK_M = 0.32    # <1.55m 时更紧, 防 lock 2→11 近距转圈
-NAV_LOCK_CLOSE_DIST_M = 1.55
-EE_HEAD_SPATIAL_CONFIRM_M = 0.32  # EE↔head 同类确认最大 XY 偏差 (log: 0.46m 误确认地板 phantom)
 TARGET_MATCH_RADIUS = 0.55       # 判定同一导航目标
 HEAD_MIRROR_EE_MIN_M = 0.85
 TEMPORAL_MEDIAN_N = 6
 GRASP_TEMPORAL_N = 10
 MOTION_FREEZE_THRESH = 0.35
 
-# 远/近距导航: STATIC_TWO_STEP 时 EE 主导 (head 远距看不见)
-NAV_AUTHORITY = {"far_ee": "ee", "near_head": "head", "grasp": "ee"}
-NAV_FALLBACK = {"far_ee": "head", "near_head": "ee", "grasp": None}
-EE_BEARING_ONLY_MAX_M = 4.2   # STATIC_TWO_STEP 允许 EE 3D 导航到更远距离
+# EE 负责导航; head 负责近距抓取点 (不再用 EE grasp)
+NAV_AUTHORITY = {"far_ee": "ee", "near_head": "ee", "grasp": "head"}
+NAV_FALLBACK = {"far_ee": "head", "near_head": "head", "grasp": None}
+EE_BEARING_ONLY_MAX_M = 4.2   # EE 3D 导航可用到更远距离
+PERC_DEBUG = os.getenv("ATEC_TASKB_PERC_DEBUG", "0").strip().lower() in ("1", "true", "yes", "on")
+PERC_DEBUG_EVERY = max(1, int(os.getenv("ATEC_TASKB_PERC_DEBUG_EVERY", "25")))
 
 
 def _obj_dist(obj: Optional[dict]) -> float:
@@ -173,15 +110,6 @@ def _nav_dist_conservative(obj: Optional[dict]) -> float:
     if d_robot > 0.08:
         return max(d_depth, d_robot)
     return d_depth
-
-
-def _stage_dist(obj: Optional[dict]) -> float:
-    """阶段切换/抓取门控: depth-cluster 只用 depth (静态外参 world XY 常偏 1m+)."""
-    if not obj:
-        return 999.0
-    if RGBD_SIMPLE or obj.get("source") == "depth_cluster":
-        return _obj_dist(obj)
-    return _nav_dist_conservative(obj)
 
 
 def _synthesize_grasp_from_head(obj: dict, robot_pos, robot_yaw, arm_q) -> dict:
@@ -207,8 +135,8 @@ def _synthesize_grasp_from_head(obj: dict, robot_pos, robot_yaw, arm_q) -> dict:
 
 
 def _close_dist(obj: Optional[dict]) -> float:
-    """grasp 门控距离; simple 模式 trust depth."""
-    return _stage_dist(obj)
+    """grasp 门控用保守距离: depth 与 dist 取较大值, 防假近 depth 提前蹲下."""
+    return _nav_dist_conservative(obj)
 
 
 def _motion_level(obs) -> float:
@@ -265,16 +193,6 @@ def _as_head_nav(o: dict) -> dict:
 
 
 def _finalize_ee(o: dict, robot_pos, robot_yaw, arm_joints) -> dict:
-    src = str(o.get("source") or "")
-    px = int(o.get("cluster_pixels") or 0)
-    if src == "ransac_cluster" and o.get("pos_from_pointcloud"):
-        out = dict(o)
-        out["camera"] = "ee"
-        out["role"] = "nav_grasp"
-        # 静态抓取帧允许 GT 相机校正以提升 grasp 精度
-        if not out.get("static_snapshot"):
-            out["skip_camera_correction"] = px > 120
-        return _enrich_nav(out) or out
     cam_pos = compute_dynamic_ee_cam_pos(arm_joints) if arm_joints is not None else None
     if cam_pos is None:
         from config import EE_CAM_POS_ROBOT
@@ -287,45 +205,13 @@ def _finalize_ee(o: dict, robot_pos, robot_yaw, arm_joints) -> dict:
 
 
 def _finalize_head(o: dict, robot_pos, robot_yaw, grav) -> dict:
-    src = str(o.get("source") or "")
-    px = int(o.get("cluster_pixels") or 0)
-    if src == "ransac_cluster" and o.get("pos_from_pointcloud") and px > 48:
-        out = dict(o)
-        out["camera"] = "head"
-        out["role"] = "nav"
-        out["skip_camera_correction"] = True
-        return _enrich_nav(out) or out
     cam_pos = compute_dynamic_head_cam_pos(grav)
     out = refresh_head_object_pose(o, robot_pos, robot_yaw, cam_pos)
     if not out.get("pos_from_pointcloud"):
         out = align_nav_pos_to_bbox_ray(out, robot_pos, robot_yaw, cam_pos, HEAD_CAM, HEAD_CAM_ROT_MATRIX)
     out["camera"] = "head"
     out["role"] = "nav"
-    if is_blob_nav_det(out):
-        out["pipeline_tier"] = 1
-        out["gt_correctable"] = True
-        out.pop("skip_camera_correction", None)
-    elif is_ransac_supplement(out):
-        out["pipeline_tier"] = 3
     return _enrich_nav(out) or out
-
-
-def _smooth_lock_world(
-    prev: Optional[List[float]],
-    new_w: List[float],
-    *,
-    alpha: float = 0.42,
-    jump_m: float = 0.48,
-) -> List[float]:
-    """nav lock 世界坐标 EMA, 拒大跳变."""
-    if prev is None:
-        return list(new_w)
-    old = np.asarray(prev, dtype=np.float32).reshape(3)
-    new = np.asarray(new_w, dtype=np.float32).reshape(3)
-    if float(np.linalg.norm(new[:2] - old[:2])) > jump_m:
-        return list(new_w)
-    blended = alpha * new + (1.0 - alpha) * old
-    return blended.tolist()
 
 
 def _object_summary(o: dict, cam: str) -> dict:
@@ -575,8 +461,8 @@ def _nav_quality(obj: dict) -> float:
 
 
 def _is_ee_phantom_near(ee_o: dict, head_objs: List[dict]) -> bool:
-    """EE 侧视假近距：天空框 / 地板 phantom / 同 id 异类 / head 明显更远."""
-    if is_ee_sky_blob(ee_o) or is_ee_floor_phantom(ee_o):
+    """EE 侧视假近距：仅天空框 / 同 id 异类 / head 明显更远."""
+    if is_ee_sky_blob(ee_o):
         return True
     ee_d = _obj_dist(ee_o)
     if ee_d > EE_PHANTOM_NEAR_M:
@@ -588,7 +474,7 @@ def _is_ee_phantom_near(ee_o: dict, head_objs: List[dict]) -> bool:
         if ee_id is not None and hid is not None and int(ee_id) == int(hid):
             if ho.get("class") != ee_cls:
                 return True
-        if _world_xy_dist(ee_o, ho) >= EE_HEAD_SPATIAL_CONFIRM_M:
+        if _world_xy_dist(ee_o, ho) >= 0.55:
             continue
         if ho.get("class") == ee_cls:
             return False
@@ -601,19 +487,11 @@ def _is_ee_phantom_near(ee_o: dict, head_objs: List[dict]) -> bool:
             return True
         if ee_d < 2.0 and min_head_d > ee_d + 0.20:
             return True
-    return ee_d < 1.50 and not bool(ee_o.get("world_reliable"))
+    # head=0 时 EE 独导航: 只杀天空框, 不因 world_reliable 误杀真目标
+    return False
 
 
 def _filter_phantom_ee(ee_objs: List[dict], head_objs: List[dict]) -> List[dict]:
-    if RGBD_SIMPLE:
-        from rgbd_utils import is_upper_corner_phantom, is_ee_gripper_phantom
-        return [
-            eo for eo in ee_objs
-            if not is_upper_corner_phantom(eo)
-            and not is_ee_sky_blob(eo)
-            and not is_ee_floor_phantom(eo)
-            and not is_ee_gripper_phantom(eo)
-        ]
     kept = []
     for eo in ee_objs:
         if _is_ee_phantom_near(eo, head_objs):
@@ -622,30 +500,13 @@ def _filter_phantom_ee(ee_objs: List[dict], head_objs: List[dict]) -> List[dict]
     return kept
 
 
-def _nav_det_source_rank(o: dict) -> int:
-    if o.get("head_far_fallback") or o.get("head_depth_fallback") or o.get("head_neutral_fallback"):
-        return 0
-    src = str(o.get("source") or "")
-    if src == "rgbd_nav_head":
-        return 1
-    if src == "ransac_cluster":
-        px = int(o.get("cluster_pixels") or 0)
-        return 3 if px > 80 else 2
-    return 4
-
-
 def _nav_lock_rank(o: dict, prefer_head: bool = True) -> tuple:
     d = _obj_dist(o)
     is_head = o.get("camera") == "head"
     cam_pen = 0 if (prefer_head and is_head) else 1
     ee_pen = 1.2 if (not is_head and d < 2.0) else 0.0
     conf = float(o.get("pos_confidence") or head_nav_pos_confidence(o))
-    sky_pen = 500.0 if is_head_sky_phantom(o) else 0.0
-    y2_pen = 0.0
-    bbox = o.get("bbox")
-    if bbox and len(bbox) == 4:
-        y2_pen = -float(bbox[3]) * 0.002
-    return (cam_pen, _nav_det_source_rank(o), d + ee_pen + sky_pen, y2_pen, -conf)
+    return (cam_pen, d + ee_pen, -conf)
 
 
 def _best_nav_target(
@@ -659,8 +520,6 @@ def _best_nav_target(
     if lock_id is not None:
         locked = _find_in_pool(objs, lock_id, lock_class, lock_world)
         return _enrich_nav(locked) if locked is not None else None
-    if CLASS_AGNOSTIC:
-        return _enrich_nav(min(objs, key=_obj_dist))
     return _enrich_nav(min(objs, key=lambda o: _nav_lock_rank(o)))
 
 
@@ -729,21 +588,12 @@ def _same_nav_target(a: Optional[dict], b: Optional[dict], radius: float = TARGE
     return _world_xy_dist(a, b) < radius * 0.75
 
 
-def _strict_lock_match(
-    a: Optional[dict],
-    b: Optional[dict],
-    *,
-    id_only: bool = False,
-) -> bool:
+def _strict_lock_match(a: Optional[dict], b: Optional[dict]) -> bool:
     if a is None or b is None:
-        return False
-    aid, bid = a.get("id"), b.get("id")
-    if aid is not None and bid is not None and int(aid) == int(bid):
-        return True
-    if id_only:
         return False
     if a.get("class") and b.get("class") and a.get("class") != b.get("class"):
         return False
+    aid, bid = a.get("id"), b.get("id")
     if aid is not None and bid is not None:
         return int(aid) == int(bid)
     return _same_nav_target(a, b, radius=TARGET_MATCH_RADIUS * 0.65)
@@ -753,18 +603,10 @@ def _is_head_nav_unreliable(obj: dict) -> bool:
     """拒 coast/跳变/边缘假检/bbox-3D 横向不一致."""
     if obj.get("coast_frame"):
         return False
-    if _is_head_fallback_det(obj) and float(obj.get("depth_m") or 99.0) >= 1.0:
-        return False
     if obj.get("pos_jump_rejected"):
         return True
     if is_sky_phantom_bbox(obj):
         return True
-    try:
-        from rgbd_utils import is_upper_corner_phantom
-        if is_upper_corner_phantom(obj):
-            return True
-    except Exception:
-        pass
     if is_head_edge_phantom(obj):
         return True
     depth = float(obj.get("depth_m") or obj.get("nav_depth_m") or 99.0)
@@ -790,7 +632,7 @@ def _find_in_pool(
 ) -> Optional[dict]:
     if lock_id is not None:
         cands = [o for o in pool if int(o.get("id", -1)) == int(lock_id)]
-        if lock_class and not RGBD_SIMPLE and not CLASS_AGNOSTIC:
+        if lock_class:
             cands = [o for o in cands if o.get("class") == lock_class]
         if cands:
             if lock_world is not None:
@@ -801,12 +643,12 @@ def _find_in_pool(
                     return None
                 return best
             return cands[0]
-    if lock_class and lock_world is not None and not CLASS_AGNOSTIC:
+    if lock_class and lock_world is not None:
         cands = [o for o in pool if o.get("class") == lock_class]
         if cands:
             ref = {"pos_world": lock_world}
             return min(cands, key=lambda o: _world_xy_dist(o, ref))
-    if lock_class and not CLASS_AGNOSTIC:
+    if lock_class:
         cands = [o for o in pool if o.get("class") == lock_class]
         if cands:
             return min(cands, key=_obj_dist)
@@ -825,17 +667,6 @@ def _resolve_live_lock_hit(
         for pool in (head_objs, ee_objs):
             by_id = _find_in_pool_by_id(pool, lock_id)
             if by_id is not None:
-                if lock_world is not None and _world_xy_dist(by_id, {"pos_world": lock_world}) > NAV_LOCK_WORLD_STICK_M:
-                    continue
-                if (
-                    not CLASS_AGNOSTIC
-                    and lock_class
-                    and by_id.get("class")
-                    and by_id.get("class") != lock_class
-                    and lock_world is not None
-                    and _world_xy_dist(by_id, {"pos_world": lock_world}) > 0.75
-                ):
-                    continue
                 return by_id
     live = _find_in_pool(head_objs, lock_id, lock_class, None)
     if live is not None:
@@ -843,7 +674,7 @@ def _resolve_live_lock_hit(
     live = _find_in_pool(ee_objs, lock_id, lock_class, None)
     if live is not None:
         return live
-    if lock_class and lock_world is not None and not CLASS_AGNOSTIC:
+    if lock_class and lock_world is not None:
         ref = {"pos_world": lock_world}
         for pool in (head_objs, ee_objs):
             same = [o for o in pool if o.get("class") == lock_class]
@@ -852,16 +683,6 @@ def _resolve_live_lock_hit(
             near = [o for o in same if _world_xy_dist(o, ref) <= NAV_RELOCK_MAX_XY_M]
             if near:
                 return min(near, key=_obj_dist)
-    if CLASS_AGNOSTIC and lock_world is not None:
-        ref = {"pos_world": lock_world}
-        combined = list(head_objs) + list(ee_objs)
-        near = [
-            o for o in combined
-            if o.get("pos_world") is not None
-            and _world_xy_dist(o, ref) <= NAV_LOCK_WORLD_STICK_M
-        ]
-        if near:
-            return min(near, key=_obj_dist)
     return None
 
 
@@ -888,63 +709,19 @@ def _head_confirms_lock(
 ) -> bool:
     if lock_id is None or not head_objs:
         return False
-    if RGBD_SIMPLE or CLASS_AGNOSTIC:
-        return _find_in_pool_by_id(head_objs, lock_id) is not None
     return _find_in_pool(head_objs, lock_id, lock_class, None) is not None
 
 
-def _ee_nav_lock_quality_ok(seed: dict) -> bool:
-    """Reject thin edge / sparse EE nav blobs that cause premature crouch."""
-    relaxed = bool(seed.get("nav_relaxed"))
-    npts = int(seed.get("nav_point_count") or 0)
-    min_pts = 8 if relaxed else 6
-    if npts < min_pts:
-        return False
-    bbox = seed.get("bbox")
-    if bbox and len(bbox) == 4:
-        bw = float(bbox[2]) - float(bbox[0]) + 1.0
-        bh = float(bbox[3]) - float(bbox[1]) + 1.0
-        area = bw * bh
-        min_side = 7.0 if relaxed else 6.0
-        min_area = 220.0 if relaxed else 120.0
-        if min(bw, bh) < min_side or area < min_area:
-            return False
-        asp = max(bw / max(bh, 1.0), bh / max(bw, 1.0))
-        max_asp = 4.0 if relaxed else 5.0
-        if asp > max_asp:
-            return False
-    if _is_ee_sourced(seed) and not bool(seed.get("world_reliable", True)):
-        return False
-    return True
-
-
 def _can_acquire_nav_lock(seed: Optional[dict], head_objs: List[dict]) -> bool:
-    """首锁: EE 需足够 blob/深度点; head 仍允许较松."""
-    if seed is None:
+    """EE 导航: 有 3D 即可锁; head 可见时优先互证."""
+    if seed is None or seed.get("pos_world") is None:
         return False
-    if RGBD_SIMPLE or CLASS_AGNOSTIC:
-        if seed.get("pos_world") is not None or seed.get("pos_robot") is not None:
-            if _is_ee_sourced(seed) or str(seed.get("source") or "").startswith("ee_"):
-                return _ee_nav_lock_quality_ok(seed)
-            return True
-        return bool(head_objs)
     if not head_objs:
-        return False
+        return True
     if _head_confirms_lock(head_objs, seed.get("id"), seed.get("class")):
-        ho = _find_in_pool(head_objs, seed.get("id"), seed.get("class"), None)
-        if ho is not None and seed.get("pos_world") and ho.get("pos_world"):
-            return _world_xy_dist(ho, {"pos_world": seed.get("pos_world")}) <= EE_HEAD_SPATIAL_CONFIRM_M
         return True
     if _is_ee_sourced(seed):
-        same_cls = [o for o in head_objs if o.get("class") == seed.get("class")]
-        if not same_cls:
-            return False
-        pw = seed.get("pos_world")
-        if pw is None:
-            return False
-        ref = {"pos_world": pw}
-        near = min(same_cls, key=lambda o: _world_xy_dist(o, ref))
-        return _world_xy_dist(near, ref) <= EE_HEAD_SPATIAL_CONFIRM_M
+        return True
     return True
 
 
@@ -1002,7 +779,7 @@ def _acquire_nav_lock(
     prefer_class: Optional[str] = None,
     prefer_world: Optional[List[float]] = None,
 ) -> Optional[dict]:
-    """新锁：远距 EE；近距/多目标 head 选最近."""
+    """新锁：EE 优先导航；head 仅 fallback."""
 
     def _near_preferred(o: dict) -> bool:
         if prefer_world is None:
@@ -1011,47 +788,27 @@ def _acquire_nav_lock(
 
     def _eligible(o: dict, from_ee: bool) -> bool:
         if from_ee and _is_ee_phantom_near(o, head_objs):
-            if STATIC_TWO_STEP and not head_objs:
-                return True
             return False
         return True
 
-    head_cands = blob_nav_pool([o for o in head_objs if _eligible(o, False) and _near_preferred(o)])
-    ee_cands = blob_nav_pool([o for o in ee_objs if _eligible(o, True) and _near_preferred(o)])
+    ee_cands = [o for o in ee_objs if _eligible(o, True) and _near_preferred(o)]
+    if prefer_class and ee_cands:
+        same_cls = [o for o in ee_cands if o.get("class") == prefer_class]
+        if same_cls:
+            ee_cands = same_cls
+    if ee_cands:
+        best = min(ee_cands, key=lambda o: _obj_dist(o))
+        out = dict(best)
+        out["pos_confidence"] = float(best.get("pos_confidence") or 0.62)
+        return out
 
-    if STATIC_TWO_STEP and head_cands and prefer_world is None:
-        head_nearest_d = min(_obj_dist(o) for o in head_cands)
-        ee_nearest_d = min((_obj_dist(o) for o in ee_cands), default=999.0)
-        use_head_first = (
-            len(head_cands) >= 2
-            or head_nearest_d < NAV_EE_TO_HEAD_M + 0.30
-            or head_nearest_d + 0.22 < ee_nearest_d
-        )
-        if use_head_first:
-            if prefer_class:
-                same_cls = [o for o in head_cands if o.get("class") == prefer_class]
-                if same_cls:
-                    head_cands = same_cls
-            best = min(head_cands, key=_obj_dist)
-            out = dict(best)
-            out["pos_confidence"] = float(best.get("pos_confidence") or head_nav_pos_confidence(best))
-            out["pipeline_tier"] = 1 if is_blob_nav_det(best) else 3
-            return out
+    if prefer_world is not None:
+        return None
 
-    if STATIC_TWO_STEP:
-        if prefer_class and ee_cands:
-            same_cls = [o for o in ee_cands if o.get("class") == prefer_class]
-            if same_cls:
-                ee_cands = same_cls
-        if ee_cands:
-            best = min(ee_cands, key=lambda o: _obj_dist(o))
-            out = dict(best)
-            out["pos_confidence"] = float(best.get("pos_confidence") or 0.62)
-            out["pipeline_tier"] = 1
-            return out
-        if ee_nav is not None and _eligible(ee_nav, True):
-            return ee_nav
+    if ee_nav is not None and _eligible(ee_nav, True):
+        return ee_nav
 
+    head_cands = [o for o in head_objs if _eligible(o, False) and _near_preferred(o)]
     if prefer_class and head_cands:
         same_cls = [o for o in head_cands if o.get("class") == prefer_class]
         if same_cls:
@@ -1060,20 +817,10 @@ def _acquire_nav_lock(
         best = min(head_cands, key=lambda o: _nav_lock_rank(o))
         out = dict(best)
         out["pos_confidence"] = float(best.get("pos_confidence") or head_nav_pos_confidence(best))
-        out["pipeline_tier"] = 1 if is_blob_nav_det(best) else 3
         return out
 
-    if prefer_world is not None:
-        return None
-
-    if head_nav is not None and _eligible(head_nav, False) and (
-        TASKB_PIPELINE != "blob_gt_coast"
-        or is_blob_nav_det(head_nav)
-        or is_ransac_supplement(head_nav)
-    ):
+    if head_nav is not None and _eligible(head_nav, False):
         return head_nav
-    if STATIC_TWO_STEP and ee_nav is not None and _eligible(ee_nav, True):
-        return ee_nav
     return None
 
 
@@ -1106,26 +853,15 @@ def _resolve_authoritative_target(
     """
     primary = NAV_AUTHORITY[nav_stage]
     fallback = NAV_FALLBACK[nav_stage]
-    if STATIC_TWO_STEP:
-        if nav_stage == "near_head":
-            primary, fallback = "head", "ee"
-        else:
-            primary, fallback = "ee", "head"
     pools = {"head": head_objs, "ee": ee_objs}
     navs = {"head": head_nav, "ee": ee_nav}
     has_lock = lock_id is not None
 
     tgt = _find_in_pool(pools[primary], lock_id, lock_class, lock_world)
-    if tgt is None and not has_lock and pools[primary]:
-        tgt = min(pools[primary], key=_obj_dist)
     if tgt is None and not has_lock:
         tgt = navs[primary]
     if tgt is not None:
-        if (
-            primary == "ee"
-            and _is_ee_phantom_near(tgt, head_objs)
-            and not (STATIC_TWO_STEP and not head_objs)
-        ):
+        if primary == "ee" and _is_ee_phantom_near(tgt, head_objs):
             fb = _find_in_pool(pools["head"], lock_id, lock_class, lock_world)
             if fb is None and not has_lock:
                 fb = head_nav
@@ -1159,8 +895,7 @@ def _navigation_for_stage(
     grasp_tgt: Optional[dict],
 ) -> Tuple[str, List[dict], Optional[dict]]:
     if nav_stage == "grasp":
-        objs = ee_raw if grasp_tgt else ee_motion
-        return "ee", objs, grasp_tgt or auth_tgt
+        return "head", head_objs, grasp_tgt or auth_tgt
     if auth_cam == "head":
         return "head", head_objs, auth_tgt
     return "ee", ee_motion, auth_tgt
@@ -1169,8 +904,6 @@ def _navigation_for_stage(
 def _is_far_ee_nav_unreliable(obj: dict) -> bool:
     """侧视 EE 远距假检：depth>2m 且横向过大，易锁错目标导致只转不走."""
     if obj.get("nav_from_head") or obj.get("grasp_reliable"):
-        return False
-    if str(obj.get("source") or "") == "ee_yellow_nav" and obj.get("world_reliable"):
         return False
     depth = float(obj.get("nav_depth_m") or obj.get("depth_m") or 0.0)
     if depth > 3.20:
@@ -1266,48 +999,47 @@ def _export_ee_for_motion(
     authority_mode: str,
 ) -> List[dict]:
     """
-    motion approach 读 ee_objects / head_objects:
-    - 有 head → mirror 最近/锁定目标到 ee_objects
-    - 无 head → export 最佳 EE (仅 sky 过滤)
-    - grasp → EE 真检测 (grasp_reliable)
+    motion approach 读 ee_objects:
+    - approach → export 真实 EE 导航目标
+    - grasp → head 抓取点 mirror 到 ee_objects (solution_rl 接口兼容)
     """
     ee_objs = _drop_ee_class_conflict(ee_objs, head_objs)
 
     if nav_stage == "grasp":
-        if auth_tgt is None:
+        src = grasp_tgt or auth_tgt
+        if src is None:
             return []
-        ee_tgt = _find_in_pool(ee_objs, auth_tgt.get("id"), auth_tgt.get("class"))
-        if ee_tgt is None:
-            same = [o for o in ee_objs if o.get("class") == auth_tgt.get("class")]
-            if same:
-                ee_tgt = min(same, key=lambda o: (_bbox_center_penalty(o), _obj_dist(o)))
-        if ee_tgt is None:
-            ee_tgt = auth_tgt if auth_cam == "ee" else None
-        if ee_tgt is None:
-            return []
-        near_ok = _obj_dist(ee_tgt) < 1.35 and _bbox_center_penalty(ee_tgt) < 0.42
-        if not (
-            ee_tgt.get("grasp_reliable")
-            or ee_tgt.get("nav_from_head")
-            or near_ok
-        ):
-            return []
-        exp = _safe_ee_export(ee_tgt, head_objs, ee_objs)
-        return [exp] if exp is not None else []
+        exp = _make_head_mirror(src)
+        if isinstance(grasp_tgt, dict):
+            for k in (
+                "grasp_pos_robot", "grasp_pos_world", "grasp_quat_world",
+                "grasp_offset_robot", "grasp_reliable", "grasp_locked",
+            ):
+                if grasp_tgt.get(k) is not None:
+                    exp[k] = grasp_tgt[k]
+            exp["grasp_reliable"] = True
+        return [exp]
+
+    if auth_tgt is not None and auth_cam == "ee":
+        exp = _safe_ee_export(auth_tgt, head_objs, ee_objs)
+        if exp is not None:
+            return [exp]
+
+    if ee_objs:
+        pool = [o for o in ee_objs if not _is_ee_phantom_near(o, head_objs)]
+        if pool:
+            best = min(pool, key=_obj_dist)
+            exp = _safe_ee_export(best, head_objs, ee_objs)
+            if exp is not None:
+                return [exp]
+
+    if auth_tgt is not None and auth_cam == "head":
+        return [_make_head_mirror(auth_tgt)]
 
     if head_objs:
         best = auth_tgt if auth_tgt is not None else min(head_objs, key=lambda o: _nav_lock_rank(o))
         if best is not None:
             return [_make_head_mirror(best)]
-
-    if auth_tgt is not None and auth_cam == "head":
-        return [_make_head_mirror(auth_tgt)]
-
-    if auth_tgt is not None:
-        return [_make_head_mirror(auth_tgt)]
-
-    if ee_objs:
-        return list(ee_objs)
 
     return []
 
@@ -1322,32 +1054,31 @@ def _ensure_ee_motion_export(
     ee_objs: List[dict],
     nav_stage: str,
 ) -> List[dict]:
-    """solution_rl preferred=ee: 永不让 ee_objects 为空 (head 有目标时必须 mirror)."""
+    """solution_rl preferred=ee: approach 阶段优先 export EE 真检测."""
     if ee_motion:
         return ee_motion
-    if auth_tgt is not None:
-        if auth_cam == "head" or nav_stage in ("near_head", "far_ee"):
-            return [_make_head_mirror(auth_tgt)]
+    if auth_tgt is not None and auth_cam == "ee":
         exp = _safe_ee_export(auth_tgt, head_objs, ee_objs)
         if exp is not None:
             return [exp]
+    if ee_nav is not None:
+        exp = _safe_ee_export(ee_nav, head_objs, ee_objs)
+        if exp is not None:
+            return [exp]
+    if ee_objs:
+        pool = [o for o in ee_objs if not _is_ee_phantom_near(o, head_objs)]
+        if pool:
+            best = min(pool, key=_obj_dist)
+            exp = _safe_ee_export(best, head_objs, ee_objs)
+            if exp is not None:
+                return [exp]
+    if auth_tgt is not None and auth_cam == "head":
+        return [_make_head_mirror(auth_tgt)]
     if head_nav is not None:
         return [_make_head_mirror(head_nav)]
     if head_objs:
         best = min(head_objs, key=lambda o: _nav_lock_rank(o))
         return [_make_head_mirror(best)]
-    if nav_stage == "grasp":
-        if ee_nav is not None:
-            exp = _safe_ee_export(ee_nav, head_objs, ee_objs)
-            if exp is not None:
-                return [exp]
-        if ee_objs:
-            pool = [o for o in ee_objs if not _is_ee_phantom_near(o, head_objs)]
-            if pool:
-                best = min(pool, key=_obj_dist)
-                exp = _safe_ee_export(best, head_objs, ee_objs)
-                if exp is not None:
-                    return [exp]
     return []
 
 
@@ -1405,26 +1136,12 @@ def _suppress_far_ee_nav_target(
     nav_lock_id: Optional[int],
     nav_stage: str,
 ) -> Optional[dict]:
-    """无 head lock 时禁止 EE 3D 当 target_nav；STATIC_TWO_STEP 下 EE 可 3D 导航."""
+    """EE 主导导航: 保留 EE 3D target_nav (仅杀明显 phantom)."""
     if nav_tgt is None or nav_stage == "grasp":
-        return nav_tgt
-    if STATIC_TWO_STEP:
-        return nav_tgt
-    if nav_tgt.get("nav_coast") or str(nav_tgt.get("source_camera") or "") == "lock_coast":
         return nav_tgt
     if nav_tgt.get("nav_from_head"):
         return nav_tgt
-    if nav_lock_id is not None and _head_confirms_lock(head_objs, nav_lock_id, nav_tgt.get("class")):
-        return nav_tgt
-    src = str(nav_tgt.get("source_camera") or auth_cam or "")
-    ee_sourced = "ee" in src.lower() and not nav_tgt.get("nav_from_head")
-    if not ee_sourced and auth_cam != "ee":
-        return nav_tgt
-    if _head_has_nav_target(head_objs, None):
-        return nav_tgt
-    if _is_far_ee_nav_unreliable(nav_tgt) or _nav_dist_conservative(nav_tgt) > EE_BEARING_ONLY_MAX_M:
-        return None
-    if not head_objs and nav_lock_id is None:
+    if _is_far_ee_nav_unreliable(nav_tgt) and not head_objs:
         return None
     return nav_tgt
 
@@ -1433,23 +1150,16 @@ def _sync_lock_id_from_head(
     lock_id: Optional[int],
     lock_class: Optional[str],
     head_objs: List[dict],
-    lock_world: Optional[List[float]] = None,
 ) -> Optional[int]:
     """head/ee tracker id 不一致时以 head 为准 (log: lock=3 head id=0)."""
     if lock_id is None or not head_objs:
         return lock_id
-    hit = _find_in_pool(head_objs, lock_id, None if CLASS_AGNOSTIC else lock_class, None)
+    hit = _find_in_pool(head_objs, lock_id, lock_class, None)
     if hit is not None:
         return int(hit["id"])
-    if CLASS_AGNOSTIC and lock_world is not None:
-        ref = {"pos_world": lock_world}
-        near = [o for o in head_objs if _world_xy_dist(o, ref) <= NAV_RELOCK_MAX_XY_M]
-        if near:
-            return int(min(near, key=_obj_dist)["id"])
-    if lock_class and not CLASS_AGNOSTIC:
-        same = [o for o in head_objs if o.get("class") == lock_class]
-        if same:
-            return int(min(same, key=_obj_dist)["id"])
+    same = [o for o in head_objs if o.get("class") == lock_class]
+    if same:
+        return int(min(same, key=_obj_dist)["id"])
     return lock_id
 
 
@@ -1471,21 +1181,12 @@ class RgbdPureDualPipeline:
         self._nav_lock_miss = 0
         self._nav_lock_ee_only = False
         self._nav_lock_ee_only_frames = 0
-        self._nav_lock_reject_until = 0
         self._last_ee_motion: List[dict] = []
         self._last_head_objs: List[dict] = []
-        self._ransac = RansacClusterDetector("ee") if RansacClusterDetector is not None else None
-        if STATIC_TWO_STEP:
-            mode = "two-step: ee-far-nav → crouch → static-ee-grasp"
-        elif RGBD_SIMPLE:
-            mode = "depth-cluster"
-        else:
-            mode = "legacy-fusion"
         print(
-            f"[RgbdPureDual] pipeline=two_step | {mode} | "
-            f"EE-far-nav→crouch→EE-grasp | "
-            f"depth_cluster={_DEPTH_CLUSTER_BUILD} | "
-            f"ransac={'ok' if self._ransac is not None else 'MISSING'}"
+            "[RgbdPureDual] ee-nav | head-grasp | "
+            f"coast={DETECTION_COAST_FRAMES}f | "
+            f"perc_debug={'on' if PERC_DEBUG else 'off'}"
         )
 
     def reset(self):
@@ -1502,24 +1203,11 @@ class RgbdPureDualPipeline:
         self._nav_lock_miss = 0
         self._nav_lock_ee_only = False
         self._nav_lock_ee_only_frames = 0
-        self._nav_lock_reject_until = 0
         self._last_ee_motion = []
         self._last_head_objs = []
         self.frame_count = 0
         self.robot_pos = ROBOT_INIT_POS.copy().astype(np.float32)
         self.robot_yaw = float(ROBOT_INIT_YAW)
-
-    def clear_nav_lock(self, reason: str = "", cooldown_frames: int = 50) -> None:
-        """motion 层 phantom unlock 时同步清感知 lock，避免转圈↔停住振荡."""
-        self._nav_lock_id = None
-        self._nav_lock_class = None
-        self._nav_lock_world = None
-        self._nav_lock_miss = 0
-        self._nav_lock_ee_only = False
-        self._nav_lock_ee_only_frames = 0
-        self._nav_lock_reject_until = self.frame_count + max(1, int(cooldown_frames))
-        if reason:
-            print(f"[RgbdPureDual] nav_lock cleared: {reason}")
 
     def _refresh_coast_obj(self, obj: dict, robot_pos, robot_yaw) -> dict:
         out = dict(obj)
@@ -1614,58 +1302,49 @@ class RgbdPureDualPipeline:
         self.ee.set_projected_gravity(grav)
 
         h_rgb, h_depth = parse_head_rgbd(obs)
-        head_objs, _, head_meta = self.head.process_frame(h_rgb, h_depth, rp, ry)
+        head_objs_raw, _, head_meta = self.head.process_frame(h_rgb, h_depth, rp, ry)
 
-        ee_objs: List[dict] = []
+        ee_objs_raw: List[dict] = []
         ee_meta: dict = {}
         ee_stats: dict = {}
-        if STATIC_TWO_STEP:
-            e_rgb, e_depth = parse_ee_rgbd(obs)
-            if e_rgb is not None and e_depth is not None:
-                raw_ee, _, ee_meta = self.ee.process_frame(e_rgb, e_depth, rp, ry)
-                ee_objs = list(raw_ee)
-                ee_stats = ee_meta.get("depth_stats") or depth_stats(e_depth)
-        else:
-            e_rgb, e_depth = parse_ee_rgbd(obs)
-            if e_rgb is not None and e_depth is not None:
-                ee_objs, _, ee_meta = self.ee.process_frame(e_rgb, e_depth, rp, ry)
-                ee_stats = ee_meta.get("depth_stats") or depth_stats(e_depth)
+        e_rgb, e_depth = parse_ee_rgbd(obs)
+        if e_rgb is not None and e_depth is not None:
+            ee_objs_raw, _, ee_meta = self.ee.process_frame(e_rgb, e_depth, rp, ry)
+            ee_stats = ee_meta.get("depth_stats") or depth_stats(e_depth)
 
-        head_objs = [_as_head_nav(o) for o in head_objs]
-        if not RGBD_SIMPLE:
-            ee_objs = self._class_stable.apply(ee_objs, "ee")
-            head_objs = self._class_stable.apply(head_objs, "head")
-            head_objs = self._temporal.apply(head_objs, "head", rp, ry, motion)
-            ee_objs = self._temporal.apply(ee_objs, "ee", rp, ry, motion)
+        head_objs = [_as_head_nav(o) for o in head_objs_raw]
+        ee_objs = list(ee_objs_raw)
+        ee_objs = self._class_stable.apply(ee_objs, "ee")
+        head_objs = self._class_stable.apply(head_objs, "head")
+        head_objs = self._temporal.apply(head_objs, "head", rp, ry, motion)
+        ee_objs = self._temporal.apply(ee_objs, "ee", rp, ry, motion)
         head_objs = [_finalize_head(o, rp, ry, grav) for o in head_objs]
-        head_objs = [apply_class_agnostic(o) for o in head_objs]
         ee_objs = [_finalize_ee(o, rp, ry, arm_q) for o in ee_objs]
-        ee_objs = [apply_class_agnostic(o) for o in ee_objs]
-        if not RGBD_SIMPLE:
-            head_objs = [self._pos_gate.apply(o, "head", rp, ry) for o in head_objs]
-            ee_objs = [self._pos_gate.apply(o, "ee", rp, ry) for o in ee_objs]
-        elif STATIC_TWO_STEP and ee_objs:
-            ee_objs = self._temporal.apply(ee_objs, "ee", rp, ry, motion)
+        head_objs = [self._pos_gate.apply(o, "head", rp, ry) for o in head_objs]
+        ee_objs = [self._pos_gate.apply(o, "ee", rp, ry) for o in ee_objs]
 
         ee_objs = filter_plausible_objects(ee_objs, "ee")
-        ee_objs = _filter_phantom_ee(ee_objs, head_objs)
-        ee_near = _obj_dist(_best_nav_target(ee_objs) or _best_ee_grasp(ee_objs))
+        ee_after_phantom = _filter_phantom_ee(ee_objs, head_objs)
+        ee_near = _obj_dist(_best_nav_target(ee_after_phantom) or _best_ee_grasp(ee_after_phantom))
         head_objs = filter_plausible_objects(head_objs, "head", ee_near_m=ee_near)
-        if not RGBD_SIMPLE:
-            ee_objs = _drop_ee_class_conflict(ee_objs, head_objs)
+        ee_objs = _drop_ee_class_conflict(ee_after_phantom, head_objs)
 
-        if (not RGBD_SIMPLE or STATIC_TWO_STEP) and not head_objs and self._last_head_objs:
-            head_objs = []
-            for o in self._last_head_objs[:4]:
-                c = self._refresh_coast_obj(o, rp, ry)
-                c["nav_coast"] = True
-                c["visible"] = False
-                head_objs.append(c)
-        if not RGBD_SIMPLE:
-            if not ee_objs and self._last_ee_motion:
-                ee_objs = [
-                    self._refresh_coast_obj(o, rp, ry) for o in self._last_ee_motion
-                ]
+        if PERC_DEBUG and self.frame_count % PERC_DEBUG_EVERY == 0:
+            print(
+                f"[PERC-DBG] f={self.frame_count} "
+                f"raw ee={len(ee_objs_raw)} head={len(head_objs_raw)} "
+                f"filt ee={len(ee_objs)} head={len(head_objs)} "
+                f"lock={self._nav_lock_id}"
+            )
+
+        if not head_objs and self._last_head_objs:
+            head_objs = [
+                self._refresh_coast_obj(o, rp, ry) for o in self._last_head_objs
+            ]
+        if not ee_objs and self._last_ee_motion:
+            ee_objs = [
+                self._refresh_coast_obj(o, rp, ry) for o in self._last_ee_motion
+            ]
 
         head_objs.sort(key=_obj_dist)
         ee_objs.sort(key=_obj_dist)
@@ -1674,8 +1353,7 @@ class RgbdPureDualPipeline:
             ee_objs, self._nav_lock_id, self._nav_lock_class, self._nav_lock_world,
         )
         head_nav = _best_nav_target(
-            blob_nav_pool(head_objs) if TASKB_PIPELINE == "blob_gt_coast" else head_objs,
-            self._nav_lock_id, self._nav_lock_class, self._nav_lock_world,
+            head_objs, self._nav_lock_id, self._nav_lock_class, self._nav_lock_world,
         )
 
         lock_ref = _find_locked_target(
@@ -1686,12 +1364,10 @@ class RgbdPureDualPipeline:
         ee_grasp = _best_ee_grasp(ee_objs, lock_ref or head_nav or ee_nav)
         ee_d = _obj_dist(ee_grasp or ee_nav)
         head_d = _obj_dist(head_nav)
-        prox_dist = min(head_d, ee_d)
-        close_prox = prox_dist < NAV_LOCK_CLOSE_DIST_M
 
-        if self._nav_lock_id is not None and head_objs and not close_prox:
+        if self._nav_lock_id is not None and head_objs:
             synced = _sync_lock_id_from_head(
-                self._nav_lock_id, self._nav_lock_class, head_objs, self._nav_lock_world,
+                self._nav_lock_id, self._nav_lock_class, head_objs,
             )
             if synced is not None and int(synced) != int(self._nav_lock_id):
                 self._nav_lock_id = int(synced)
@@ -1703,53 +1379,21 @@ class RgbdPureDualPipeline:
                 self._nav_lock_id, self._nav_lock_class, self._nav_lock_world,
             )
             if live is not None and live.get("pos_world") is not None:
-                stick_m = NAV_LOCK_CLOSE_STICK_M if close_prox else NAV_LOCK_WORLD_STICK_M
-                if (
-                    self._nav_lock_world is not None
-                    and _world_xy_dist(live, {"pos_world": self._nav_lock_world}) > stick_m
-                ):
-                    live = None
-                elif (
-                    close_prox
-                    and int(live.get("id", -1)) != int(self._nav_lock_id)
-                    and self._nav_lock_world is not None
-                    and _world_xy_dist(live, {"pos_world": self._nav_lock_world}) > 0.22
-                ):
-                    live = None
-                new_cls = live.get("class") if live is not None else None
-                if live is not None and (
-                    not CLASS_AGNOSTIC
-                    and self._nav_lock_class
-                    and new_cls
-                    and new_cls != self._nav_lock_class
-                ):
-                    same_cls = _find_in_pool(
-                        head_objs, self._nav_lock_id, self._nav_lock_class, self._nav_lock_world,
-                    )
-                    if same_cls is not None:
-                        live = same_cls
-                    elif _world_xy_dist(live, {"pos_world": self._nav_lock_world or live["pos_world"]}) > 0.55:
-                        live = None
-                if live is not None:
-                    self._nav_lock_id = int(live["id"])
-                    if not CLASS_AGNOSTIC and live.get("class") and (
-                        self._nav_lock_class is None or live.get("class") == self._nav_lock_class
-                    ):
-                        self._nav_lock_class = live.get("class")
-                    pw = live.get("pos_world")
-                    if pw is not None:
-                        self._nav_lock_world = _smooth_lock_world(self._nav_lock_world, list(pw))
-                    self._nav_lock_miss = 0
-                    locked = live
-                    lock_ref = live
+                self._nav_lock_id = int(live["id"])
+                if live.get("class"):
+                    self._nav_lock_class = live.get("class")
+                self._nav_lock_world = list(live["pos_world"])
+                self._nav_lock_miss = 0
+                locked = live
+                lock_ref = live
 
-        if locked is None and self._nav_lock_id is None and self.frame_count >= self._nav_lock_reject_until:
+        if locked is None and self._nav_lock_id is None:
             seed = _acquire_nav_lock(head_objs, ee_objs, head_nav, ee_nav, head_d, ee_d)
             if seed is not None and not _can_acquire_nav_lock(seed, head_objs):
                 seed = None
             if seed is not None and _can_acquire_nav_lock(seed, head_objs):
                 self._nav_lock_id = int(seed["id"])
-                self._nav_lock_class = None if CLASS_AGNOSTIC else seed.get("class")
+                self._nav_lock_class = seed.get("class")
                 pw = seed.get("pos_world")
                 self._nav_lock_world = list(pw) if pw is not None else None
                 self._nav_lock_ee_only = (
@@ -1758,17 +1402,6 @@ class RgbdPureDualPipeline:
                 )
                 self._nav_lock_ee_only_frames = 0
                 locked = seed
-            elif STATIC_TWO_STEP and ee_objs:
-                seed = min(ee_objs, key=_obj_dist)
-                pw = seed.get("pos_world")
-                if pw is not None and _ee_nav_lock_quality_ok(seed):
-                    self._nav_lock_id = int(seed["id"])
-                    self._nav_lock_class = None if CLASS_AGNOSTIC else seed.get("class")
-                    self._nav_lock_world = list(pw)
-                    self._nav_lock_ee_only = True
-                    self._nav_lock_ee_only_frames = 0
-                    self._nav_lock_miss = 0
-                    locked = seed
 
         if self._nav_lock_id is not None:
             if _head_confirms_lock(head_objs, self._nav_lock_id, self._nav_lock_class):
@@ -1780,7 +1413,7 @@ class RgbdPureDualPipeline:
                 self._nav_lock_ee_only = True
                 self._nav_lock_ee_only_frames = 0
 
-        nav_dist = _stage_dist(locked or head_nav or ee_nav)
+        nav_dist = _nav_dist_conservative(locked or head_nav or ee_nav)
         lock_ref_obj = locked or head_nav or ee_nav
         close_d = min(
             _close_dist(locked),
@@ -1788,9 +1421,7 @@ class RgbdPureDualPipeline:
             _close_dist(ee_grasp),
             _close_dist(ee_nav),
         )
-        ee_grasp_nav = ee_grasp if _strict_lock_match(
-            ee_grasp, lock_ref_obj, id_only=RGBD_SIMPLE,
-        ) else None
+        ee_grasp_nav = ee_grasp if _strict_lock_match(ee_grasp, lock_ref_obj) else None
         ee_grasp_ok = ee_grasp_nav is not None and bool(ee_grasp_nav.get("grasp_reliable"))
         head_lock_hit = _resolve_live_lock_hit(
             head_objs, ee_objs,
@@ -1798,12 +1429,18 @@ class RgbdPureDualPipeline:
         )
         head_close = (
             head_lock_hit is not None
-            and _head_confirms_lock(
-                head_objs, head_lock_hit.get("id"), head_lock_hit.get("class"),
+            and (
+                _head_confirms_lock(
+                    head_objs, head_lock_hit.get("id"), head_lock_hit.get("class"),
+                )
+                or (
+                    self._nav_lock_id is not None
+                    and int(head_lock_hit.get("id", -1)) == int(self._nav_lock_id)
+                )
             )
-            and _stage_dist(head_lock_hit) < GRASP_APPROACH_DIST_M
+            and _nav_dist_conservative(head_lock_hit) < GRASP_APPROACH_DIST_M + 0.06
         )
-        lock_dist = _stage_dist(locked or lock_ref_obj)
+        lock_dist = _nav_dist_conservative(locked or lock_ref_obj)
         want_grasp = (
             self._nav_lock_id is not None
             and head_close
@@ -1811,51 +1448,24 @@ class RgbdPureDualPipeline:
             and lock_dist < GRASP_APPROACH_DIST_M + 0.08
             and lock_ref_obj is not None
             and _strict_lock_match(
-                lock_ref_obj,
-                {"id": self._nav_lock_id, "class": self._nav_lock_class},
-                id_only=RGBD_SIMPLE,
+                lock_ref_obj, {"id": self._nav_lock_id, "class": self._nav_lock_class},
             )
             and self._nav_lock_miss == 0
         )
-        if STATIC_TWO_STEP:
-            want_grasp = False
 
         nav_stage = _resolve_nav_stage(nav_dist, want_grasp, self._nav_stage)
         self._nav_stage = nav_stage
         phase = "grasp" if nav_stage == "grasp" else "approach"
-        if STATIC_TWO_STEP:
-            phase = "approach"
-            nav_stage = "near_head" if nav_dist < NAV_EE_TO_HEAD_M else "far_ee"
-            self._nav_stage = nav_stage
 
         auth_tgt, auth_cam, auth_mode = _resolve_authoritative_target(
             nav_stage, head_objs, ee_objs, head_nav, ee_nav,
             self._nav_lock_id, self._nav_lock_class, self._nav_lock_world,
         )
         if auth_tgt is not None and self._nav_lock_id is not None:
-            id_mismatch = int(auth_tgt.get("id", -1)) != int(self._nav_lock_id)
-            if id_mismatch:
-                if (
-                    CLASS_AGNOSTIC
-                    and self._nav_lock_world is not None
-                    and _world_xy_dist(auth_tgt, {"pos_world": self._nav_lock_world}) <= NAV_RELOCK_MAX_XY_M
-                ):
-                    auth_tgt = dict(auth_tgt)
-                    auth_tgt["id"] = int(self._nav_lock_id)
-                else:
-                    auth_tgt = None
-            elif (
-                self._nav_lock_class
-                and auth_tgt.get("class")
-                and auth_tgt.get("class") != self._nav_lock_class
-            ):
-                same_cls = _find_in_pool(
-                    head_objs, self._nav_lock_id, self._nav_lock_class, self._nav_lock_world,
-                )
-                if same_cls is not None:
-                    auth_tgt = same_cls
-                else:
-                    auth_tgt = None
+            if int(auth_tgt.get("id", -1)) != int(self._nav_lock_id):
+                auth_tgt = None
+            elif self._nav_lock_class and auth_tgt.get("class") != self._nav_lock_class:
+                auth_tgt = None
 
         if auth_tgt is not None:
             nav_dist = _nav_dist_conservative(auth_tgt)
@@ -1878,65 +1488,75 @@ class RgbdPureDualPipeline:
         else:
             self._nav_lock_miss += 1
 
-        lock_miss_max = NAV_LOCK_MISS_MAX_STATIC if STATIC_TWO_STEP else NAV_LOCK_MISS_MAX
-        if self._nav_lock_miss >= lock_miss_max:
-            if self.frame_count < self._nav_lock_reject_until:
+        if self._nav_lock_miss >= NAV_LOCK_MISS_MAX:
+            prev_class = self._nav_lock_class
+            prev_world = list(self._nav_lock_world) if self._nav_lock_world is not None else None
+            prev_id = self._nav_lock_id
+            self._nav_lock_id = None
+            self._nav_lock_class = None
+            self._nav_lock_world = None
+            self._nav_lock_miss = 0
+            seed = _acquire_nav_lock(
+                head_objs, ee_objs, head_nav, ee_nav, head_d, ee_d,
+                prefer_class=prev_class, prefer_world=prev_world,
+            )
+            if seed is not None and _can_acquire_nav_lock(seed, head_objs):
+                self._nav_lock_id = int(seed["id"])
+                self._nav_lock_class = seed.get("class")
+                pw = seed.get("pos_world")
+                self._nav_lock_world = list(pw) if pw is not None else None
+            elif prev_id is not None and prev_world is not None:
+                self._nav_lock_id = int(prev_id)
+                self._nav_lock_class = prev_class
+                self._nav_lock_world = prev_world
                 self._nav_lock_miss = NAV_LOCK_MISS_MAX // 2
-            else:
-                prev_class = self._nav_lock_class
-                prev_world = list(self._nav_lock_world) if self._nav_lock_world is not None else None
-                prev_id = self._nav_lock_id
-                self._nav_lock_id = None
-                self._nav_lock_class = None
-                self._nav_lock_world = None
-                self._nav_lock_miss = 0
-                seed = _acquire_nav_lock(
-                    head_objs, ee_objs, head_nav, ee_nav, head_d, ee_d,
-                    prefer_class=prev_class, prefer_world=prev_world,
-                )
-                if seed is not None and _can_acquire_nav_lock(seed, head_objs):
-                    self._nav_lock_id = int(seed["id"])
-                    self._nav_lock_class = None if CLASS_AGNOSTIC else seed.get("class")
-                    pw = seed.get("pos_world")
-                    self._nav_lock_world = list(pw) if pw is not None else None
-                elif prev_id is not None and prev_world is not None:
-                    self._nav_lock_id = int(prev_id)
-                    self._nav_lock_class = prev_class
-                    self._nav_lock_world = prev_world
-                    self._nav_lock_miss = lock_miss_max // 2
 
-        grasp_src = ee_grasp_nav if _same_nav_target(ee_grasp_nav, auth_tgt) else None
-        if grasp_src is None and auth_tgt is not None:
-            grasp_src = _find_in_pool(ee_objs, auth_tgt.get("id"), auth_tgt.get("class"))
-        live_visible = bool(head_objs or ee_objs)
-        head_confirms = _head_confirms_lock(
-            head_objs, self._nav_lock_id, self._nav_lock_class,
-        )
-        grasp_tgt = self._update_grasp_lock(
-            grasp_src,
-            _obj_dist(grasp_src or auth_tgt),
-            rp,
-            ry,
-            arm_q,
-            force_recalc=(nav_stage == "grasp"),
-            head_confirms=head_confirms,
-            live_visible=live_visible,
-        )
-        if want_grasp and nav_stage == "grasp" and grasp_tgt is None and head_lock_hit is not None:
-            grasp_tgt = _synthesize_grasp_from_head(head_lock_hit, rp, ry, arm_q)
+        grasp_tgt = None
+        if want_grasp and nav_stage == "grasp":
+            head_src = head_lock_hit
+            if head_src is None and auth_tgt is not None and auth_cam == "head":
+                head_src = auth_tgt
+            if head_src is None and locked is not None and _is_head_sourced(locked):
+                head_src = locked
+            if head_src is None and self._nav_lock_world is not None and self._nav_lock_id is not None:
+                head_src = _coast_nav_from_lock(
+                    self._nav_lock_id,
+                    self._nav_lock_class,
+                    self._nav_lock_world,
+                    rp,
+                    ry,
+                )
+            if head_src is not None:
+                grasp_tgt = _synthesize_grasp_from_head(head_src, rp, ry, arm_q)
+                if grasp_tgt is not None:
+                    self._frozen_grasp = dict(grasp_tgt)
         elif not want_grasp:
-            grasp_tgt = None
-        if STATIC_TWO_STEP:
             grasp_tgt = None
 
         if nav_stage == "grasp" and ee_near < HEAD_DISABLE_DIST_M:
             pass  # 保留 head_objects 供 motion fallback
 
+        ee_objs_raw = list(ee_objs)
+        ee_motion = _export_ee_for_motion(
+            ee_objs, head_objs, auth_tgt, auth_cam, nav_stage, auth_mode,
+        )
+        ee_motion = _ensure_ee_motion_export(
+            ee_motion, auth_tgt, auth_cam, head_nav, ee_nav,
+            head_objs, ee_objs_raw, nav_stage,
+        )
+
+        if head_objs:
+            self._last_head_objs = [dict(o) for o in head_objs]
+        if ee_motion:
+            self._last_ee_motion = [dict(o) for o in ee_motion]
+
+        ee_objs = ee_motion
+
         if (
             auth_tgt is None
             and self._nav_lock_id is not None
             and self._nav_lock_world is not None
-            and self._nav_lock_miss < lock_miss_max
+            and self._nav_lock_miss < NAV_LOCK_MISS_MAX
         ):
             auth_tgt = _coast_nav_from_lock(
                 self._nav_lock_id,
@@ -1947,24 +1567,6 @@ class RgbdPureDualPipeline:
             )
             auth_cam = "lock_coast"
             auth_mode = "coast"
-
-        ee_objs_raw = list(ee_objs)
-        ee_motion = _export_ee_for_motion(
-            ee_objs, head_objs, auth_tgt, auth_cam, nav_stage, auth_mode,
-        )
-        ee_motion = _ensure_ee_motion_export(
-            ee_motion, auth_tgt, auth_cam, head_nav, ee_nav,
-            head_objs, ee_objs_raw, nav_stage,
-        )
-        if not ee_motion and auth_tgt is not None:
-            ee_motion = [_make_head_mirror(auth_tgt)]
-
-        if head_objs:
-            self._last_head_objs = [dict(o) for o in head_objs]
-        if ee_motion:
-            self._last_ee_motion = [dict(o) for o in ee_motion]
-
-        ee_objs = ee_motion
 
         nav_cam, nav_objs, nav_tgt = _navigation_for_stage(
             nav_stage, auth_tgt, auth_cam, ee_motion, ee_objs_raw, head_objs, grasp_tgt,
@@ -1995,36 +1597,25 @@ class RgbdPureDualPipeline:
             ) is None:
                 auth_tgt = None
 
-        if nav_tgt is None and STATIC_TWO_STEP:
-            if ee_nav is not None:
-                nav_tgt = ee_nav
-            elif head_nav is not None:
-                nav_tgt = head_nav
-            elif head_objs:
-                nav_tgt = _best_nav_target(head_objs)
-
         use_grasp = want_grasp and nav_stage == "grasp" and grasp_tgt is not None
-        grasp_objs = ee_objs_raw
-        if auth_tgt is not None:
-            g0 = _find_in_pool(ee_objs_raw, auth_tgt.get("id"), auth_tgt.get("class"))
-            grasp_objs = [g0] if g0 is not None else []
+        grasp_objs = head_objs
+        if grasp_tgt is not None:
+            grasp_objs = [grasp_tgt]
+        elif auth_tgt is not None and auth_cam == "head":
+            grasp_objs = [auth_tgt]
         ee_list = [_object_summary(o, "ee") for o in ee_objs]
         head_list = [_object_summary(o, "head") for o in head_objs]
         ee_search_hint = _build_ee_search_hint(
-            head_objs,
-            ee_objs_raw,
-            head_nav=head_nav,
-            nav_lock_id=self._nav_lock_id,
+            head_objs, ee_objs_raw, head_nav=head_nav, nav_lock_id=self._nav_lock_id,
         )
 
         return {
-            "roles": {"ee": "far-nav", "head": "near-nav-primary"},
+            "roles": {"ee": "nav", "head": "grasp"},
             "nav_stage": nav_stage,
             "nav_authority": auth_cam,
             "nav_authority_mode": auth_mode,
             "nav_lock_id": self._nav_lock_id,
             "nav_lock_class": self._nav_lock_class,
-            "nav_lock_world": list(self._nav_lock_world) if self._nav_lock_world is not None else None,
             "nav_lock_ee_only": self._nav_lock_ee_only,
             "nav_lock_stable": self._nav_lock_id is not None and self._nav_lock_miss == 0,
             "nav_pos_confidence": None if nav_tgt is None else nav_tgt.get("pos_confidence"),
@@ -2034,31 +1625,26 @@ class RgbdPureDualPipeline:
             "objects_nav": nav_objs,
             "ee_objects": ee_objs,
             "ee_objects_list": ee_list,
-            "grasp": {"camera": "ee", "target": grasp_tgt, "objects_detailed": grasp_objs},
+            "grasp": {"camera": "head", "target": grasp_tgt, "objects_detailed": grasp_objs},
             "target_grasp": grasp_tgt,
             "objects_grasp": grasp_objs,
             "head_objects": head_objs,
             "head_objects_list": head_list,
             "target": grasp_tgt if use_grasp else nav_tgt,
             "objects_remaining": ee_list + head_list,
-            "active_camera": nav_cam if nav_tgt is not None else ("head" if nav_stage == "near_head" else auth_cam),
+            "active_camera": "head" if use_grasp else "ee",
             "phase": phase,
             "grasp_reliable": bool(grasp_tgt and grasp_tgt.get("grasp_reliable")),
             "grasp_locked": bool(grasp_tgt and grasp_tgt.get("grasp_locked")),
             "head_dist_m": _obj_dist(head_nav),
             "ee_dist_m": ee_d,
             "head_count_raw": len(head_objs),
-            "head_ransac": head_meta.get("ransac") or {},
             "ee_count_raw": len(ee_objs_raw),
             "nav_depth_m": None if nav_tgt is None else nav_tgt.get("nav_depth_m"),
             "nav_yaw_rel": None if nav_tgt is None else nav_tgt.get("nav_yaw_rel"),
             "world_reliable": bool(nav_tgt and nav_tgt.get("world_reliable")),
             "motion_level": motion,
             "depth_stats": head_meta.get("depth_stats") or depth_stats(h_depth),
-            "ransac_stats": {
-                "head": head_meta.get("ransac"),
-                "build": _DEPTH_CLUSTER_BUILD,
-            },
             "ee_depth_stats": ee_stats,
             "bin": {
                 "center_world": BIN_CENTER.tolist(),
@@ -2067,123 +1653,6 @@ class RgbdPureDualPipeline:
             },
             "gripper": {"is_holding": False, "width": 0.04},
             "progress": {"total": TOTAL_OBJECTS, "inside_bin": 0, "remaining": TOTAL_OBJECTS},
-            "robot": {"pos_world": self.robot_pos.tolist(), "yaw": self.robot_yaw},
-        }
-
-    def process_static_grasp(
-        self,
-        obs,
-        nav_hint: Optional[dict] = None,
-        gt_robot_pos=None,
-        gt_robot_yaw=None,
-    ) -> dict:
-        """停稳/趴下后: EE RGB黄物 (主) + RANSAC (备) → 抓取点."""
-        if gt_robot_pos is not None and gt_robot_yaw is not None:
-            self.robot_pos = np.asarray(gt_robot_pos, dtype=np.float32).copy()
-            self.robot_yaw = float(gt_robot_yaw)
-        rp, ry = self.robot_pos, self.robot_yaw
-        arm_q = _read_arm_joints(obs)
-        if self._ransac is None:
-            raise ImportError(
-                "静态抓取需要 depth_ransac_cluster.py，请与 rgbd_utils.py 一起同步"
-            )
-        self._ransac.set_arm_joints(arm_q)
-        from rgbd_utils import compute_dynamic_ee_cam_pos
-        from yellow_detect import detect_ee_yellow
-
-        e_rgb, e_depth = parse_ee_rgbd(obs)
-        ee_objs_raw: List[dict] = []
-        ee_stats: dict = {}
-        cam_pos = compute_dynamic_ee_cam_pos(arm_q)
-
-        if e_rgb is not None and e_depth is not None:
-            ee_stats = depth_stats(e_depth)
-            raw_yellow = detect_ee_yellow(e_rgb, e_depth, rp, ry, cam_pos)
-            for i, o in enumerate(raw_yellow):
-                o["id"] = i
-                ee_objs_raw.append(_finalize_ee(o, rp, ry, arm_q))
-            ee_objs_raw = filter_plausible_objects(ee_objs_raw, "ee")
-            ee_objs_raw = [apply_class_agnostic(o) for o in ee_objs_raw]
-
-        ransac_raw: List[dict] = []
-        if e_depth is not None:
-            raw = self._ransac.detect(e_depth, rp, ry, nav_hint=nav_hint)
-            ransac_raw = [_finalize_ee(o, rp, ry, arm_q) for o in (raw or [])]
-            ransac_raw = filter_plausible_objects(ransac_raw, "ee")
-            ransac_raw = [apply_class_agnostic(o) for o in ransac_raw]
-
-        if ransac_raw:
-            if not ee_objs_raw:
-                ee_objs_raw = ransac_raw
-            else:
-                merged = list(ee_objs_raw)
-                for ro in ransac_raw:
-                    dup = False
-                    rw = ro.get("pos_world")
-                    if rw is None:
-                        continue
-                    for eo in ee_objs_raw:
-                        ew = eo.get("pos_world")
-                        if ew is not None and _world_xy_dist(ro, {"pos_world": ew}) < 0.22:
-                            dup = True
-                            break
-                    if not dup:
-                        ro["id"] = len(merged)
-                        merged.append(ro)
-                ee_objs_raw = merged
-            if e_depth is not None and not ee_stats:
-                ee_stats = depth_stats(e_depth)
-
-        if not ee_objs_raw and e_depth is not None and not ee_stats:
-            ee_stats = depth_stats(e_depth)
-
-        grasp_tgt = ee_objs_raw[0] if ee_objs_raw else None
-        if grasp_tgt is not None and nav_hint is not None:
-            hint_w = nav_hint.get("pos_world")
-            if hint_w is not None and ee_objs_raw:
-                ref = {"pos_world": hint_w}
-                grasp_tgt = min(ee_objs_raw, key=lambda o: _world_xy_dist(o, ref))
-            elif not CLASS_AGNOSTIC:
-                hint_cls = nav_hint.get("class")
-                if hint_cls:
-                    same = [o for o in ee_objs_raw if o.get("class") == hint_cls]
-                    if same:
-                        grasp_tgt = same[0]
-
-        ee_list = [_object_summary(o, "ee") for o in ee_objs_raw]
-        return {
-            "mode": "static_grasp",
-            "roles": {"ee": "ee_yellow_grasp", "head": "idle"},
-            "nav_stage": "grasp",
-            "nav_authority": "ee",
-            "nav_authority_mode": "static",
-            "nav_lock_id": nav_hint.get("id") if nav_hint else None,
-            "nav_lock_class": nav_hint.get("class") if nav_hint else None,
-            "nav_lock_ee_only": False,
-            "nav_lock_stable": grasp_tgt is not None,
-            "navigation": {"camera": "ee", "target": grasp_tgt, "objects_detailed": ee_objs_raw},
-            "target_nav": nav_hint,
-            "objects_nav": ee_objs_raw,
-            "ee_objects": ee_objs_raw,
-            "ee_objects_list": ee_list,
-            "grasp": {"camera": "ee", "target": grasp_tgt, "objects_detailed": ee_objs_raw},
-            "target_grasp": grasp_tgt,
-            "objects_grasp": ee_objs_raw,
-            "head_objects": [],
-            "head_objects_list": [],
-            "target": grasp_tgt,
-            "objects_remaining": ee_list,
-            "active_camera": "ee",
-            "phase": "grasp",
-            "grasp_reliable": grasp_tgt is not None,
-            "grasp_locked": False,
-            "head_dist_m": None,
-            "ee_dist_m": _obj_dist(grasp_tgt),
-            "head_count_raw": 0,
-            "ee_count_raw": len(ee_objs_raw),
-            "static_perceive": True,
-            "ee_depth_stats": ee_stats,
-            "ee_ransac_stats": self._ransac.last_stats if self._ransac is not None else {},
             "robot": {"pos_world": self.robot_pos.tolist(), "yaw": self.robot_yaw},
         }
 

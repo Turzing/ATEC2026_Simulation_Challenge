@@ -8,27 +8,13 @@ Isaac Lab Camera depth:
 
 from __future__ import annotations
 
-import os
 from typing import Any, Dict, Optional, Tuple
 
 import cv2
 import numpy as np
 
-# 默认: 纯 depth 聚类 (ATEC_RGBD_SIMPLE=0 才走旧 fusion 管线)
-RGBD_SIMPLE = os.getenv("ATEC_RGBD_SIMPLE", "1").strip().lower() not in ("0", "false", "no")
-# 两步走: 粗导航(head depth) → 停稳趴下 → 静态 EE RANSAC 抓取
-STATIC_TWO_STEP = os.getenv("ATEC_TASKB_STATIC_TWO_STEP", "1").strip().lower() not in ("0", "false", "no")
-# 推荐管线: HSV blob → GT 校正 3D → RANSAC 小簇补充 → lock coast → EE 多帧 grasp
-TASKB_PIPELINE = os.getenv("ATEC_TASKB_PIPELINE", "blob_gt_coast").strip().lower()
-RANSAC_SUPPLEMENT_MAX_PX = int(os.getenv("ATEC_TASKB_RANSAC_SUPPLEMENT_PX", "72"))
-# 不细分 banana/mustard/bottle：黄物统一，锁 id+位置，抓准 3D 点即可
-CLASS_AGNOSTIC = os.getenv("ATEC_TASKB_CLASS_AGNOSTIC", "1").strip().lower() not in ("0", "false", "no")
-GENERIC_YELLOW_CLASS = "mustard_bottle"
-GENERIC_NEUTRAL_CLASS = "sugar_box"
-
 from config import (
     BBOX_LATERAL_TOL,
-    CLASS_NAME_TO_ID,
     DEFAULT_ARM_JOINTS,
     EE_CAM,
     EE_CAM_POS_ROBOT,
@@ -254,94 +240,6 @@ def is_head_edge_phantom(obj: dict, *, img_w: int = IMG_W) -> bool:
     return False
 
 
-def classify_taskb_simple(
-    hue_mean: float,
-    sat_mean: float,
-    val_mean: float,
-    aspect: float,
-    z_extent: float = 0.08,
-) -> Tuple[str, float]:
-    """
-    类名无关: 黄物统一 → mustard_bottle (竖直/top-down 抓); 低饱和浅色 → sugar_box.
-    不区分 banana / mustard_bottle.
-    """
-    yellow = 14.0 <= float(hue_mean) <= 46.0 and float(sat_mean) >= 20.0
-    if float(sat_mean) < 30.0 and float(val_mean) > 62.0 and float(aspect) < 1.55:
-        return GENERIC_NEUTRAL_CLASS, 0.82
-    if yellow or float(sat_mean) >= 18.0:
-        return GENERIC_YELLOW_CLASS, 0.88
-    if float(z_extent) < 0.10 and float(aspect) < 1.40:
-        return GENERIC_NEUTRAL_CLASS, 0.74
-    return GENERIC_YELLOW_CLASS, 0.78
-
-
-def apply_class_agnostic(obj: dict) -> dict:
-    """统一 class 标签，避免 lock 在 banana↔mustard 间乱跳."""
-    if not CLASS_AGNOSTIC or not isinstance(obj, dict):
-        return obj
-    out = dict(obj)
-    sm = float(out.get("blob_sat_mean") or 0.0)
-    hm = float(out.get("blob_hue_mean") or 0.0)
-    vm = float(out.get("blob_val_mean") or 128.0)
-    bbox = out.get("bbox") or [0, 0, 1, 1]
-    bw = max(1, int(bbox[2]) - int(bbox[0]) + 1)
-    bh = max(1, int(bbox[3]) - int(bbox[1]) + 1)
-    aspect = float(bw) / float(bh)
-    z_ext = float(out.get("geom_z_extent") or out.get("geom_extent", [0, 0, 0.08])[2] if isinstance(out.get("geom_extent"), (list, tuple)) else 0.08)
-    cls, conf = classify_taskb_simple(hm, sm, vm, aspect, z_ext)
-    out["class"] = cls
-    out["class_id"] = CLASS_NAME_TO_ID.get(cls, 1)
-    out["class_conf"] = conf
-    out["class_agnostic"] = True
-    return out
-
-
-def is_blob_nav_det(obj: dict) -> bool:
-    """Tier-1: HSV 黄/白盒 + relief blob (主导 class 与 2D 区域)."""
-    if obj.get("head_far_fallback") or obj.get("head_depth_fallback") or obj.get("head_neutral_fallback"):
-        return True
-    src = str(obj.get("source") or "")
-    return src in ("rgbd_nav_head", "yellow_detect")
-
-
-def is_ransac_supplement(obj: dict, *, max_px: int = RANSAC_SUPPLEMENT_MAX_PX) -> bool:
-    """Tier-3: 小簇 RANSAC 仅作补充."""
-    if str(obj.get("source") or "") != "ransac_cluster":
-        return False
-    return int(obj.get("cluster_pixels") or 0) <= int(max_px)
-
-
-def blob_nav_pool(objects: list) -> list:
-    """导航候选池 — 类无关模式下不过滤来源."""
-    if CLASS_AGNOSTIC or RGBD_SIMPLE:
-        return list(objects)
-    blobs = [o for o in objects if is_blob_nav_det(o)]
-    if blobs:
-        return blobs
-    return [o for o in objects if is_ransac_supplement(o)]
-
-
-def is_upper_corner_phantom(obj: dict, *, img_h: int = IMG_H, img_w: int = IMG_W) -> bool:
-    """画面右上角/上沿小框 → 地平线假检 (截图红框打天)."""
-    bbox = obj.get("bbox")
-    if not bbox or len(bbox) != 4:
-        return False
-    x1, y1, x2, y2 = map(float, bbox)
-    cx = 0.5 * (x1 + x2)
-    cy = 0.5 * (y1 + y2)
-    bw = max(x2 - x1, 1.0)
-    bh = max(y2 - y1, 1.0)
-    area = bw * bh
-    img_area = float(img_h * img_w)
-    if cy < img_h * 0.38 and cx > img_w * 0.62 and area < img_area * 0.012:
-        return True
-    if y2 < img_h * 0.42 and cx > img_w * 0.70 and bh < img_h * 0.22:
-        return True
-    if cy < img_h * 0.28 and area < img_area * 0.008:
-        return True
-    return False
-
-
 def is_sky_phantom_bbox(obj: dict, *, img_h: int = IMG_H) -> bool:
     """物体在地面: bbox 底边应在画面下半区; 否则是天空/地平线假检 (截图红框打天)."""
     bbox = obj.get("bbox")
@@ -353,107 +251,6 @@ def is_sky_phantom_bbox(obj: dict, *, img_h: int = IMG_H) -> bool:
     cy = 0.5 * (y1 + y2)
     bh = max(y2 - y1, 1.0)
     if cy < img_h * 0.36 and bh > img_h * 0.10:
-        return True
-    return False
-
-
-def is_head_floor_phantom(obj: dict, *, img_h: int = IMG_H, img_w: int = IMG_W) -> bool:
-    """Head 地砖/近地板大面积假检 (截图: 下半屏巨框 → 假 banana)."""
-    bbox = obj.get("bbox")
-    if not bbox or len(bbox) != 4:
-        return False
-    x1, y1, x2, y2 = map(float, bbox)
-    area = (x2 - x1 + 1) * (y2 - y1 + 1)
-    img_area = float(img_h * img_w)
-    cy = 0.5 * (y1 + y2)
-    depth = float(obj.get("depth_m") or obj.get("nav_depth_m") or 99.0)
-    pixels = int(obj.get("cluster_pixels") or 0)
-    if cy > img_h * 0.56 and area > img_area * 0.10:
-        return True
-    if y1 > img_h * 0.40 and area > img_area * 0.16:
-        return True
-    if depth < 1.20 and cy > img_h * 0.48 and area > img_area * 0.07:
-        return True
-    if pixels > 1500 and cy > img_h * 0.50:
-        return True
-    return False
-
-
-def is_ee_gripper_phantom(obj: dict, *, img_h: int = IMG_H, img_w: int = IMG_W) -> bool:
-    """EE/head 画面底部夹爪/机械臂误检为黄物."""
-    if obj.get("grasp_reliable"):
-        return False
-    bbox = obj.get("bbox")
-    if not bbox or len(bbox) != 4:
-        return False
-    y1, y2 = float(bbox[1]), float(bbox[3])
-    cy = 0.5 * (y1 + y2)
-    depth = float(obj.get("depth_m") or obj.get("nav_depth_m") or 99.0)
-    sm = float(obj.get("blob_sat_mean") or 0.0)
-    src = str(obj.get("source") or "")
-    if src in ("yellow_detect", "ee_yellow_nav") and sm >= 16:
-        return False
-    if src == "ransac_cluster" and depth >= 0.50:
-        return False
-    if y2 >= img_h * 0.78 and depth < 2.4 and sm < 42:
-        return True
-    if cy >= img_h * 0.70 and depth < 1.8:
-        if sm < 55:
-            return True
-    pr = obj.get("pos_robot")
-    if pr is not None and depth < 1.6:
-        try:
-            px = float(pr[0])
-        except (TypeError, ValueError, IndexError):
-            px = 99.0
-        if px < 1.35 and y2 >= img_h * 0.68 and sm < 48:
-            return True
-    return False
-
-
-def is_head_body_phantom(obj: dict, *, img_h: int = IMG_H, img_w: int = IMG_W) -> bool:
-    """head 画面底部可见的本体/夹爪误检 — 勿杀近距地面真目标."""
-    if is_ee_gripper_phantom(obj, img_h=img_h, img_w=img_w):
-        return True
-    bbox = obj.get("bbox")
-    if not bbox or len(bbox) != 4:
-        return False
-    y2 = float(bbox[3])
-    depth = float(obj.get("depth_m") or obj.get("nav_depth_m") or 99.0)
-    sm = float(obj.get("blob_sat_mean") or 0.0)
-    vm = float(obj.get("blob_val_mean") or 0.0)
-    src = str(obj.get("source") or "")
-    # 近距地面黄物常在画面最下方 — 旧逻辑 y2>=0.80 & depth<2.5 会全杀
-    if depth >= 0.45:
-        if sm >= 14 or src in ("yellow_detect", "ransac_cluster"):
-            return False
-        if src == "ransac_cluster" and y2 >= img_h * 0.42:
-            return False
-    if y2 >= img_h * 0.88 and depth < 0.40 and sm < 30 and vm < 130:
-        return True
-    if y2 >= img_h * 0.94 and depth < 0.55 and sm < 22:
-        return True
-    return False
-
-
-def is_ee_floor_phantom(obj: dict, *, img_h: int = IMG_H, img_w: int = IMG_W) -> bool:
-    """EE 地砖/空地板假 mustard (log: 0.94 conf 框内无物, pos_w≈[-9,-9.87])."""
-    if obj.get("grasp_reliable"):
-        return False
-    depth = float(obj.get("depth_m") or obj.get("nav_depth_m") or 99.0)
-    if depth > 1.20 or depth < 0.50:
-        return False
-    sm = float(obj.get("blob_sat_mean") or 0.0)
-    vm = float(obj.get("blob_val_mean") or 0.0)
-    bbox = obj.get("bbox")
-    if not bbox or len(bbox) != 4:
-        return False
-    x1, y1, x2, y2 = bbox
-    area = int((x2 - x1 + 1) * (y2 - y1 + 1))
-    cy = 0.5 * (float(y1) + float(y2))
-    if depth < 1.05 and sm < 34 and vm > 115 and area < 3200:
-        return True
-    if depth < 0.90 and sm < 42 and cy > img_h * 0.38 and area < 2800:
         return True
     return False
 
@@ -481,147 +278,6 @@ def is_ee_sky_blob(obj: dict, *, img_h: int = IMG_H, img_w: int = IMG_W) -> bool
     return False
 
 
-def _is_head_fallback_det(obj: dict) -> bool:
-    return bool(
-        obj.get("head_far_fallback")
-        or obj.get("head_depth_fallback")
-        or obj.get("head_neutral_fallback")
-    )
-
-
-def is_head_sky_phantom(obj: dict, *, img_h: int = IMG_H, img_w: int = IMG_W) -> bool:
-    """
-    天空/地平线假黄: robot_z 过高 或 bbox 整体在画面上部.
-    远距真物体 bbox 底边仍应低于 MIN_GROUND 线; 仅用 y 不用 z 会误杀远距.
-    """
-    pr = obj.get("pos_robot")
-    depth = float(obj.get("depth_m") or obj.get("nav_depth_m") or 99.0)
-    bbox = obj.get("bbox")
-    y2 = float(bbox[3]) if bbox and len(bbox) == 4 else 0.0
-    near_ground = depth < 2.6 and y2 > img_h * 0.42
-    if pr is not None:
-        try:
-            pz = float(pr[2])
-        except (TypeError, ValueError, IndexError):
-            pz = 0.0
-        z_hi = 0.22 if near_ground else -0.06
-        if pz > z_hi:
-            return True
-    bbox = obj.get("bbox")
-    if not bbox or len(bbox) != 4:
-        return False
-    y1, y2 = float(bbox[1]), float(bbox[3])
-    cy = 0.5 * (y1 + y2)
-    cx = 0.5 * (float(bbox[0]) + float(bbox[2]))
-    depth = float(obj.get("depth_m") or obj.get("nav_depth_m") or 99.0)
-    if y2 < img_h * 0.36 and depth < 1.35:
-        return True
-    if cy < img_h * 0.34 and cx > img_w * 0.48:
-        return True
-    if y1 < img_h * 0.12 and (y2 - y1) < img_h * 0.18:
-        return True
-    return False
-
-
-def is_valid_taskb_ground_det(obj: dict, *, img_h: int = IMG_H) -> bool:
-    """Task B 地面物体 — 类无关/简化模式下仅做基本 3D 范围检查."""
-    if CLASS_AGNOSTIC or RGBD_SIMPLE:
-        pr = obj.get("pos_robot")
-        if pr is None:
-            dm = obj.get("depth_m") or obj.get("nav_depth_m")
-            return dm is not None and 0.08 < float(dm) < 9.5
-        try:
-            px, py, pz = float(pr[0]), float(pr[1]), float(pr[2])
-        except (TypeError, ValueError, IndexError):
-            return False
-        if px < 0.04:
-            return False
-        if pz < -1.15 or pz > 0.55:
-            return False
-        if is_head_sky_phantom(obj, img_h=img_h):
-            return False
-        return True
-
-    pr = obj.get("pos_robot")
-    if pr is None:
-        return False
-    try:
-        px, py, pz = float(pr[0]), float(pr[1]), float(pr[2])
-    except (TypeError, ValueError, IndexError):
-        return False
-    if px < 0.22 or px > 8.5:
-        return False
-    z_hi = 0.08 if _is_head_fallback_det(obj) else -0.04
-    if pz < -0.88 or pz > z_hi:
-        return False
-    if float(np.hypot(px, py)) < 0.10:
-        return False
-
-    if obj.get("head_far_fallback") or obj.get("head_depth_fallback") or obj.get("head_neutral_fallback"):
-        return True
-
-    src = str(obj.get("source") or "")
-    if src == "ransac_cluster":
-        pixels = int(obj.get("cluster_pixels") or 0)
-        extent = obj.get("geom_extent")
-        max_ext = float(max(extent)) if isinstance(extent, (list, tuple)) and extent else 0.0
-        if pz > -0.10:
-            return False
-        if pixels > 520 or max_ext > 1.05:
-            return False
-        return True
-
-    if is_sky_phantom_bbox(obj, img_h=img_h) and pz > -0.30:
-        return False
-    if is_upper_corner_phantom(obj, img_h=img_h):
-        return False
-    return True
-
-
-def is_head_ransac_phantom(obj: dict, *, img_h: int = IMG_H, img_w: int = IMG_W) -> bool:
-    """RANSAC head 假检: 仅杀悬空/超大簇 (不杀远距地面上方像素)."""
-    if str(obj.get("source") or "") != "ransac_cluster":
-        return False
-    return not is_valid_taskb_ground_det(obj, img_h=img_h)
-
-
-def _filter_minimal(objects: list, camera: str) -> list:
-    """最小过滤: 只杀明显无效坐标，不做 phantom/天空/边缘限制."""
-    out = []
-    for o in objects:
-        pr = o.get("pos_robot")
-        if pr is None:
-            dm = o.get("depth_m") or o.get("nav_depth_m")
-            if dm is not None and 0.06 < float(dm) < 9.5:
-                out.append(o)
-            continue
-        try:
-            px, py, pz = float(pr[0]), float(pr[1]), float(pr[2])
-        except (TypeError, ValueError, IndexError):
-            continue
-        if px < 0.04:
-            continue
-        if pz < -1.20 or pz > 0.55:
-            continue
-        if float(np.hypot(px, py)) < 0.05 and abs(py) < 0.10:
-            continue
-        if camera == "head" and is_head_sky_phantom(o):
-            continue
-        if camera == "head" and is_head_body_phantom(o):
-            continue
-        if camera == "ee" and is_ee_gripper_phantom(o):
-            continue
-        if camera == "ee" and is_ee_floor_phantom(o):
-            continue
-        out.append(o)
-    return out
-
-
-def _filter_plausible_simple(objects: list, camera: str) -> list:
-    """简化模式: 使用最小过滤，废弃旧 phantom 链."""
-    return _filter_minimal(objects, camera)
-
-
 def filter_plausible_objects(
     objects: list,
     camera: str,
@@ -629,8 +285,6 @@ def filter_plausible_objects(
     ee_near_m: float = 999.0,
 ) -> list:
     """剔除机器人本体误检、地下/悬空坐标"""
-    if RGBD_SIMPLE:
-        return _filter_plausible_simple(objects, camera)
     out = []
     for o in objects:
         pr = o.get("pos_robot")
@@ -649,23 +303,13 @@ def filter_plausible_objects(
         vm = float(o.get("blob_val_mean") or 0.0)
         bbox = o.get("bbox")
         if camera == "head":
-            if _is_head_fallback_det(o) and 0.75 <= depth <= 6.5:
-                bbox = o.get("bbox")
-                if bbox and len(bbox) == 4 and depth < 1.15:
-                    area = int((bbox[2] - bbox[0] + 1) * (bbox[3] - bbox[1] + 1))
-                    if area < 480 and sm < 14 and vm > 145:
-                        continue
-                if is_sky_phantom_bbox(o):
-                    continue
-                out.append(o)
-                continue
             if is_sky_phantom_bbox(o):
                 continue
-            if is_head_edge_phantom(o) and not (depth >= 1.35 and _is_head_fallback_det(o)):
+            if is_head_edge_phantom(o):
                 continue
-            if depth < 2.5 and not _is_head_fallback_det(o) and not bbox_lateral_consistent(o):
+            if depth < 2.5 and not bbox_lateral_consistent(o):
                 continue
-            if depth < 1.05 and sm < 46:
+            if depth < 1.05 and sm < 38:
                 continue
             if depth < 0.80 and sm < 54:
                 continue
@@ -680,8 +324,6 @@ def filter_plausible_objects(
             if depth < 0.35 and sm < 40:
                 continue
             if is_ee_sky_blob(o):
-                continue
-            if is_ee_floor_phantom(o):
                 continue
         out.append(o)
     return out
@@ -938,21 +580,9 @@ def refresh_head_object_pose(
     if out.get("pos_from_pointcloud") and out.get("pos_robot") is not None:
         pc_r = np.asarray(out["pos_robot"], dtype=np.float32)
         n = int(out.get("nav_point_count") or 0)
-        src = str(out.get("source") or "")
-        if src == "rgbd_nav_head":
-            w_pc = min(0.90, 0.68 + n / 55.0)
-            pos_r = (w_pc * pc_r + (1.0 - w_pc) * anchor_r).astype(np.float32)
-            pos_r[2] = float(pc_r[2])
-        elif src == "ransac_cluster" and n <= 72:
-            w_pc = min(0.72, 0.48 + n / 90.0)
-            pos_r = (w_pc * pc_r + (1.0 - w_pc) * anchor_r).astype(np.float32)
-            pos_r[2] = float(pc_r[2])
-        elif src == "ransac_cluster" or n >= 18:
-            pos_r = pc_r.copy()
-        else:
-            w_pc = min(0.82, 0.55 + n / 80.0)
-            pos_r = (w_pc * pc_r + (1.0 - w_pc) * anchor_r).astype(np.float32)
-            pos_r[2] = pc_r[2]
+        w_pc = min(0.82, 0.55 + n / 80.0)
+        pos_r = (w_pc * pc_r + (1.0 - w_pc) * anchor_r).astype(np.float32)
+        pos_r[2] = pc_r[2]
     else:
         pos_r = anchor_r.astype(np.float32)
 
