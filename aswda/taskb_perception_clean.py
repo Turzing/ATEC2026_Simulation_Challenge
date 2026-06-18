@@ -173,6 +173,13 @@ def _plausible_ee_nav(obj: dict) -> bool:
     return True
 
 
+def _plausible_obj(obj: dict, camera: str) -> bool:
+    """按相机角色分发 plausibility 检查."""
+    if camera == "ee":
+        return _plausible_ee_nav(obj)
+    return _plausible_head_grasp(obj)
+
+
 def _plausible_head_grasp(obj: dict) -> bool:
     """head 抓取: 最严, 坐标不可靠的直接丢弃."""
     pr = obj.get("pos_robot")
